@@ -1,0 +1,192 @@
+"""Application Service — resolve_profile + compile_plan → refs (ADR-0199 P1-07).
+
+Wraps the K1 (resolve_profile) and K2 (compile_plan) steps into one
+Application Service so the RuntimeFacade (P1-09) and the wire adapters
+(P1-08) have a single, testable seam. Per ADR-0199 I-HPC-2 the
+CompiledRunPlan returned is treated as immutable; per I-HPC-3 the
+returned refs are stable identifiers used to derive activation_ref.
+"""
+
+from __future__ import annotations
+
+import threading
+from collections.abc import Callable
+from dataclasses import dataclass, replace
+from pathlib import Path
+
+from lca.contracts.models.assistant.plan_overlay import PlanOverlay
+from lca.contracts.models.assistant.spec import AssistantSpec
+from lca.contracts.protocols.state.plan import CompiledRunPlan
+from lca.harness.plan import compiled_run_plan_ref, declarative_plan_hash
+from lca.harness.profile.resolve.resolve import (
+    ResolvedProfile,
+    resolve_profile,
+)
+from lca.harness.profile.validate.errors import ProfileResolveError
+from lca_kernel.plan.plan_compile import (
+    CompileOptions,
+    PlanCompilerError,
+    compile_plan,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class PlanResolutionResult:
+    """Immutable result of PlanResolutionService.resolve_refs.
+
+    Per ADR-0199 I-HPC-2 the CompiledRunPlan is a read-only reference;
+    callers MUST NOT mutate it. The three refs (plan_ref / graph_ref /
+    plugin_set_ref) are stable identifiers per ADR-0199 I-HPC-3 — they
+    feed ``compute_activation_ref`` together with the session_id.
+
+    ``cached`` 标记本次结果是否命中 ``(assistant_id, manifest_digest)``
+    缓存（ADR-0242 D10 / I-B10）；测试据此断言缓存键行为。
+    """
+
+    plan_ref: str
+    graph_ref: str
+    plugin_set_ref: str
+    compiled_plan: CompiledRunPlan
+    cached: bool = False
+
+
+class PlanResolutionError(RuntimeError):
+    """Raised when resolve_profile or compile_plan fails.
+
+    Wraps the underlying PlanCompilerError / ProfileResolveError so the
+    facade can map them to a stable error contract (DOC-* codes). The
+    original cause is preserved via ``raise ... from``.
+    """
+
+
+class PlanResolutionService:
+    """Application Service that resolves a profile path to refs + plan.
+
+    This service is the SINGLE entry point for converting a profile path
+    into a CompiledRunPlan plus its three SSOT identifiers
+    (``plan_ref`` / ``graph_ref`` / ``plugin_set_ref``). It does NOT
+    boot a cordis Context, spawn a fiber, or call Session.append —
+    those happen in the facade (P1-09) or the coordinator (existing
+    RunLifecycleCoordinator).
+    """
+
+    def __init__(
+        self,
+        *,
+        compile_options: CompileOptions | None = None,
+        assistant_spec_provider: Callable[[str], AssistantSpec | None] | None = None,
+    ) -> None:
+        # ``CompileOptions`` is itself frozen; storing the reference is
+        # enough to guarantee it is never mutated by callers.
+        self._compile_options = compile_options
+        # 可选 seam：composition root 注入 assistant catalog 解析器后，
+        # facade/CLI 路径可以按 assistant_id 取 manifest_digest + plan_overlay
+        # 走 per-agent 编译缓存（ADR-0242 D10）。None = 不启用。
+        self._assistant_spec_provider = assistant_spec_provider
+        # ``(assistant_id, manifest_digest)`` → 已编译结果（ADR-0242 I-B10）。
+        # 每个 assistant 的编译产物独立缓存；plan.yaml 变更 ⇒ digest 变化 ⇒
+        # 下一 run 重新编译，其他 assistant 缓存不受影响。
+        self._cache: dict[tuple[str, str], PlanResolutionResult] = {}
+        self._cache_lock = threading.Lock()
+
+    def resolve_refs(
+        self,
+        profile_path: str | Path,
+        *,
+        session_id: str | None = None,
+        assistant_id: str = "",
+        manifest_digest: str = "",
+        plan_overlay: PlanOverlay | None = None,
+    ) -> PlanResolutionResult:
+        """Resolve a profile path → ResolvedProfile → CompiledRunPlan.
+
+        Per ADR-0199 P1-07 spec: returns the three SSOT refs plus the
+        immutable plan. ``session_id`` is accepted (not yet used;
+        reserved for future profile variants that key on session) but
+        MUST NOT affect determinism of the refs (C8): the same
+        ``profile_path`` yields the same ``plan_ref`` / ``graph_ref`` /
+        ``plugin_set_ref`` regardless of ``session_id``.
+
+        ``assistant_id`` / ``manifest_digest`` / ``plan_overlay``
+        （ADR-0242 D10）：非空时把 per-agent ``plan.yaml`` 覆盖合并进编译，
+        并以 ``(assistant_id, manifest_digest)`` 为键缓存。三者均为空时
+        行为与启用前完全一致（I-B8 无 assistant 路径 byte-identical）。
+        """
+        del session_id  # accepted for future use; not consumed by K1+K2
+
+        # 经 composition root 注入的 catalog 解析器：按 assistant_id 补全
+        # manifest_digest + plan_overlay（facade/CLI 路径）。
+        if assistant_id and not manifest_digest and self._assistant_spec_provider is not None:
+            spec = self._assistant_spec_provider(assistant_id)
+            if spec is not None:
+                manifest_digest = spec.manifest_digest
+                plan_overlay = plan_overlay or spec.plan_overlay
+
+        use_cache = bool(assistant_id and manifest_digest and plan_overlay is not None)
+        cache_key = (assistant_id, manifest_digest)
+        if use_cache:
+            with self._cache_lock:
+                cached = self._cache.get(cache_key)
+            if cached is not None:
+                return replace(cached, cached=True)
+
+        path = Path(profile_path)
+        if not path.is_file():
+            candidate = Path("profiles") / f"{profile_path}.yaml"
+            if candidate.is_file():
+                path = candidate
+            elif not str(profile_path).endswith((".yaml", ".yml")):
+                candidate2 = Path(f"{profile_path}.yaml")
+                if candidate2.is_file():
+                    path = candidate2
+        try:
+            resolved: ResolvedProfile = resolve_profile(path)
+            plan: CompiledRunPlan = compile_plan(
+                resolved,
+                options=self._compile_options,
+                overlay=plan_overlay,
+            )
+        except PlanCompilerError as exc:
+            raise PlanResolutionError(f"plan compile failed: {exc}") from exc
+        except ProfileResolveError as exc:
+            raise PlanResolutionError(f"resolve_profile failed: {exc}") from exc
+        except (FileNotFoundError, ValueError, TypeError) as exc:
+            # resolve_profile surfaces file/value/type errors directly
+            # when adapters mis-format input; wrap them so the facade has
+            # one stable error contract.
+            raise PlanResolutionError(f"resolve_profile failed: {exc}") from exc
+
+        plan_ref = compiled_run_plan_ref(plan)
+        # graph_ref / plugin_set_ref are derived from immutable plan
+        # regions; both are stable hashes over canonical JSON (I-HPC-2:
+        # the plan is read-only so the hashes are stable across reads).
+        # ADR-0221 P3: in the v2 path, ``compile_plan`` returns a
+        # ``V2ExecutablePlan`` wrapper whose ``.inner`` is the immutable
+        # ``CompiledRunPlan`` (no ``phase_graph`` region); the v2 graph
+        # spec travels under ``.graph_spec``. Unwrap uniformly so the
+        # three SSOT refs remain deterministic across v1/v2.
+        inner = getattr(plan, "inner", plan)
+        graph_input = getattr(plan, "graph_spec", None)
+        if graph_input is None:
+            graph_input = getattr(inner, "phase_graph", None)
+        plugin_input = getattr(inner, "plugin_specs", ())
+        graph_ref = declarative_plan_hash(graph_input)
+        plugin_set_ref = declarative_plan_hash(plugin_input)
+
+        result = PlanResolutionResult(
+            plan_ref=plan_ref,
+            graph_ref=graph_ref,
+            plugin_set_ref=plugin_set_ref,
+            compiled_plan=plan,
+        )
+        if use_cache:
+            with self._cache_lock:
+                self._cache[cache_key] = result
+        return result
+
+
+__all__ = (
+    "PlanResolutionError",
+    "PlanResolutionResult",
+    "PlanResolutionService",
+)

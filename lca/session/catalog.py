@@ -1,0 +1,45 @@
+"""Session event catalog public API (ADR-0195 P1-04).
+
+Known-type closure and read-path fail-closed validation.
+"""
+
+from __future__ import annotations
+
+from lca.contracts.harness.tasks.session import event_registry
+from lca_kernel.events.fold.fold import SURFACE_EVENT_TYPES
+from lca_kernel.events.payloads.spine import SPINE_EVENT_CATEGORIES, SPINE_EXECUTION_POINTS
+
+__all__ = [
+    "UnknownSessionEventTypeError",
+    "known_session_event_types",
+    "validate_event_type_for_read",
+]
+
+
+class UnknownSessionEventTypeError(ValueError):
+    """未知且非 ignorable 的 session event type —— 读路径 fail-closed。"""
+
+    def __init__(self, event_type: str) -> None:
+        super().__init__(
+            f"unknown session event type={event_type!r} and not ignorable; refusing to open log"
+        )
+        self.event_type = event_type
+
+
+def known_session_event_types() -> frozenset[str]:
+    """本构建理解的 session event type 闭集（yaml/decorator 注册 + surface + spine EP）。"""
+    types = set(event_registry().keys())
+    types.update(SURFACE_EVENT_TYPES)
+    types.update(SPINE_EXECUTION_POINTS)
+    types.update(SPINE_EVENT_CATEGORIES)
+    # RunSessionWriter 使用的 DSH 对齐 surface 词表（ADR-0268 §6）。
+    types.add("surface/developer_message")
+    return frozenset(types)
+
+
+def validate_event_type_for_read(event_type: str, *, ignorable: bool = False) -> None:
+    """读路径 type 校验:未知且非 ignorable → 抛错;ignorable → 放行。"""
+    if ignorable:
+        return
+    if event_type not in known_session_event_types():
+        raise UnknownSessionEventTypeError(event_type)

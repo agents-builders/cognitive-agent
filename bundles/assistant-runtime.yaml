@@ -1,0 +1,110 @@
+# bundles/assistant-runtime.yaml — Assistant domain opt-in bundle (ADR-0187 §3 D6 + §7 PR-4).
+
+entries:
+  - id: lca.plugins.assistant.catalog.catalog
+    name: lca_plugins_assistant_catalog
+    $module: lca.plugins.domain.assistant.catalog.plugin
+    config:
+      assistants_root:
+        from_env: LCA_ASSISTANTS_ROOT
+        required: false
+
+  - id: lca.plugins.assistant.ownership
+    name: lca_plugins_assistant_ownership
+    $module: lca.plugins.assistant.ownership.plugin
+    config:
+      database_url:
+        from_env: LCA_DATABASE_URL
+        required: false
+      dev_mode: true
+
+  - id: lca.plugins.assistant.bootstrap.bootstrap
+    name: lca_plugins_assistant_bootstrap
+    $module: lca.plugins.assistant.bootstrap.bootstrap
+    config: {}
+
+  - id: lca.plugins.assistant.profile.profile
+    name: lca_plugins_assistant_profile
+    $module: lca.plugins.assistant.profile.profile
+    config: {}
+
+  - id: lca.plugins.assistant.workspace.workspace
+    name: lca_plugins_assistant_workspace
+    $module: lca.plugins.assistant.workspace.workspace
+    config: {}
+
+  - id: lca.plugins.assistant.skill.overlay
+    name: lca_plugins_assistant_skill_overlay
+    $module: lca.plugins.assistant.skill.overlay
+    config: {}
+
+  - id: lca.plugins.assistant.tool.overlay
+    name: lca_plugins_assistant_tool_overlay
+    $module: lca.plugins.assistant.tool.overlay
+    config: {}
+
+  - id: lca.plugins.assistant.webserver.bridge
+    name: lca_plugins_assistant_webserver_bridge
+    $module: lca.plugins.assistant.webserver.bridge
+    config:
+      lobehub_url:
+        from_env: LCA_LOBEHUB_URL
+        required: false
+
+  - id: lca.plugins.transport.webserver.routes_1.routes_assistants
+    name: lca_webserver_routes_assistants
+    $module: lca.plugins.transport.webserver.routes_1.routes_assistants
+    config: {}
+
+  - id: lca.plugins.transport.webserver.routes_1.routes_role_cards
+    name: lca_webserver_routes_role_cards
+    $module: lca.plugins.transport.webserver.routes_1.routes_role_cards
+    config: {}
+
+  - id: lca.plugins.transport.webserver.routes_1.routes_onboarding
+    name: lca_webserver_routes_onboarding
+    $module: lca.plugins.transport.webserver.routes_1.routes_onboarding
+    config: {}
+
+  - id: lca.plugins.assistant.tools.tools
+    name: lca_plugins_assistant_tools
+    $module: lca.plugins.domain.tools.assistant_tools.plugin
+    config: {}
+
+  - id: lca.plugins.domain.tools.cron
+    name: lca_plugins_domain_tools_cron
+    $module: lca.plugins.domain.tools.cron.plugin
+    config: {}
+
+  - id: lca-assistant-curator
+    name: lca_plugins_assistant_curator
+    $module: lca.plugins.assistant.curator.curator
+    config: {}
+
+  - id: lca-avatar
+    name: lca_plugins_avatar
+    $module: lca.plugins.avatar.plugin
+    config:
+      assistants_root:
+        from_env: LCA_ASSISTANTS_ROOT
+        required: false
+      api_key:
+        from_env: AVATAR_IMAGE_API_KEY
+        required: false
+      base_url:
+        from_env: AVATAR_IMAGE_BASE_URL
+        required: false
+      model:
+        from_env: AVATAR_IMAGE_MODEL
+        required: false
+      edit_model:
+        from_env: AVATAR_IMAGE_EDIT_MODEL
+        required: false
+      video_model:
+        from_env: AVATAR_VIDEO_MODEL
+        required: false
+
+  - id: lca-tool-avatar
+    name: lca_plugins_avatar_tools
+    $module: lca.plugins.avatar.tools
+    config: {}

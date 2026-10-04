@@ -1,0 +1,396 @@
+"""Session 事件 SSOT 架构不变量 —— ADR-0186 §4。
+
+不变量（ADR-0186 §4）:
+
+- I-SESSION-1: SessionProtocol / Session.append 是事件生产公开入口。
+- I-SESSION-2: fold 模块纯函数，无文件系统 I/O / print / logging / datetime.now。
+- I-SESSION-3: cognition / runtime / agent 禁直写 spine 落盘 API。
+- I-SESSION-4: 持久化以 SessionObserver 形态存在；spine.jsonl 物理写方唯一。
+- I-SESSION-5: deriver 走 fold；禁止新挂 EventSpine._subscribers 派生主路径。
+
+长期回归锁；delete-when:N/A。
+"""
+
+from __future__ import annotations
+
+import ast
+import shutil
+import subprocess
+from pathlib import Path
+
+import pytest
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_FOLD_PACKAGE = _REPO_ROOT / "lca_kernel" / "events" / "fold"
+_SESSION_PACKAGE = _REPO_ROOT / "lca_kernel" / "events" / "session"
+
+
+def _have_ripgrep() -> bool:
+    return shutil.which("rg") is not None
+
+
+def _rg(pattern: str, root: Path) -> list[str]:
+    """Run ripgrep; empty list = no matches."""
+    if not root.exists():
+        return []
+    if _have_ripgrep():
+        result = subprocess.run(  # noqa: S603
+            [  # noqa: S607
+                "rg",
+                "--line-number",
+                "--no-heading",
+                "--color",
+                "never",
+                pattern,
+                str(root),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 1:
+            return []
+        return [line for line in result.stdout.splitlines() if line.strip()]
+    out: list[str] = []
+    for path in root.rglob("*.py"):
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        for lineno, line in enumerate(text.splitlines(), start=1):
+            if pattern in line:
+                rel = path.relative_to(_REPO_ROOT)
+                out.append(f"{rel}:{lineno}:{line}")
+    return out
+
+
+# ── I-SESSION-1 ─────────────────────────────────────────────────────────
+
+
+class TestISession1:
+    """I-SESSION-1: SessionProtocol 存在；append 为公开生产入口（无条件，无 xfail）。"""
+
+    def test_i_session_1_session_protocol_exists(self) -> None:
+        """SessionProtocol / SessionObserver / SessionEvent 可从 session 模块导入。"""
+        assert (_SESSION_PACKAGE / "session.py").exists(), "lca_kernel/events/session/ 包缺 session.py"
+        from lca_kernel.events.session.session import (
+            SessionEvent,
+            SessionObserver,
+            SessionProtocol,
+        )
+
+        assert SessionProtocol is not None
+        assert SessionObserver is not None
+        assert SessionEvent is not None
+
+
+# ── I-SESSION-2 ─────────────────────────────────────────────────────────
+
+
+class TestISession2:
+    """I-SESSION-2: fold 模块无 I/O / 副作用。"""
+
+    def test_i_session_2_fold_no_io(self) -> None:
+        """fold 包逐文件不得 open / pathlib.Path / read|write / print / logging / datetime.now。
+
+        fold.py 已拆为 lca_kernel/events/fold/ 包(B-083 搬家);守卫意图诚实
+        扩展到包内全部模块。
+        """
+        files = sorted(_FOLD_PACKAGE.glob("*.py"))
+        assert files, "lca_kernel/events/fold/ 包为空"
+        for fold_file in files:
+            source = fold_file.read_text(encoding="utf-8")
+            tree = ast.parse(source)
+            label = fold_file.name
+
+            assert "open(" not in source, f"I-SESSION-2: {label} must not call open()"
+
+            for pattern in (
+                ".read(",
+                ".read_text(",
+                ".read_bytes(",
+                ".write(",
+                ".write_text(",
+                ".write_bytes(",
+            ):
+                assert pattern not in source, (
+                    f"I-SESSION-2: {label} must not contain {pattern!r}"
+                )
+
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom) and node.module == "pathlib":
+                    names = [alias.name for alias in node.names]
+                    assert "Path" not in names, (
+                        f"I-SESSION-2: {label} must not import pathlib.Path"
+                    )
+                if isinstance(node, ast.Import):
+                    for alias in node.names:
+                        assert alias.name != "pathlib", (
+                            f"I-SESSION-2: {label} must not import pathlib"
+                        )
+                        assert alias.name != "logging", (
+                            f"I-SESSION-2: {label} must not import logging"
+                        )
+                if isinstance(node, ast.ImportFrom) and node.module == "logging":
+                    pytest.fail(f"I-SESSION-2: {label} must not import from logging")
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                    assert node.func.id != "print", (
+                        f"I-SESSION-2: {label} must not call print()"
+                    )
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id in {"datetime", "dt"}
+                    and node.func.attr == "now"
+                ):
+                    pytest.fail(f"I-SESSION-2: {label} must not call datetime.now()")
+
+
+# ── I-SESSION-3 ─────────────────────────────────────────────────────────
+
+
+class TestISession3:
+    """I-SESSION-3: 业务层禁直写 spine 落盘 API。"""
+
+    def test_i_session_3_no_business_direct_spine_write(self) -> None:
+        """cognition / runtime / agent 不得 event_spine.append / spine_port_append。
+
+        承接 ADR-0183 I-FW-BUS-1 业务侧；Session.append 收口后本断言保持。
+        """
+        matches: list[str] = []
+        for sub in ("cognition", "runtime", "agent"):
+            root = _REPO_ROOT / "lca" / sub
+            if not root.exists():
+                continue
+            matches.extend(_rg(r"event_spine\.append\(", root))
+            matches.extend(_rg(r"spine_port_append\(", root))
+        assert not matches, "I-SESSION-3 违规:业务层仍直写 spine\n" + "\n".join(matches[:8])
+
+
+# ── I-SESSION-4 ─────────────────────────────────────────────────────────
+
+
+class TestISession4:
+    """I-SESSION-4: 持久化是 SessionObserver；禁止平行 PersistenceWorker 主路径。"""
+
+    def test_i_session_4_persistence_is_observer(self) -> None:
+        """生产路径应暴露 PersistenceObserver，而非 PersistenceWorker 主写。"""
+        persistence = _REPO_ROOT / "lca_kernel" / "events" / "persistence" / "persistence.py"
+        assert persistence.exists(), "lca_kernel/events/persistence/ 包缺 persistence.py"
+
+        text = persistence.read_text(encoding="utf-8")
+        has_observer = "PersistenceObserver" in text or "class PersistenceObserver" in text
+        worker_hits = _rg(r"\bPersistenceWorker\b", _REPO_ROOT / "lca")
+        worker_hits += _rg(r"\bPersistenceWorker\b", _REPO_ROOT / "lca_kernel" / "events")
+        # 翻正条件:Observer 类型存在，且 PersistenceWorker 生产引用清零（测试/COMPAT 除外）
+        assert has_observer, "PersistenceObserver type not defined"
+        production = [
+            line
+            for line in worker_hits
+            if "/tests/" not in line.split(":", 1)[0]
+            and "COMPAT" not in line
+            and "delete-when" not in line
+        ]
+        assert not production, "I-SESSION-4: PersistenceWorker 仍在生产路径\n" + "\n".join(
+            production[:8]
+        )
+
+
+# ── I-SESSION-5 ─────────────────────────────────────────────────────────
+
+
+class TestISession5:
+    """I-SESSION-5: deriver 走 fold，不新挂 EventSpine._subscribers 派生主路径。"""
+
+    def test_i_session_5_deriver_uses_fold(self) -> None:
+        """生产 step_tree 走 fold；builder 不得 EventSpine.subscribe 作为派生主路径.
+
+        ``live_tail.subscribe`` 是 SSE carrier fan-out(透传 LiveTail),不在本
+        不变量的 fold 派生主路径范围内。
+        """
+        builder = (
+            _REPO_ROOT
+            / "lca"
+            / "plugins"
+            / "transport"
+            / "webserver"
+            / "handlers"
+            / "runs"
+            / "session"
+            / "builder"
+            / "builder.py"
+        )
+        assert builder.exists(), "RunSessionBuilder missing"
+        builder_text = builder.read_text(encoding="utf-8")
+        assert "StepTreeFoldDeriver" in builder_text, (
+            "I-SESSION-5: production builder must assemble StepTreeFoldDeriver"
+        )
+        assert "event_spine.subscribe" not in builder_text, (
+            "I-SESSION-5 违规:builder 仍挂 EventSpine.subscribe 作为 step_tree 主路径"
+        )
+        assert "StepTreeFoldDeriver(" in builder_text, (
+            "I-SESSION-5 违规:builder 未装配 StepTreeFoldDeriver (ADR-0212)"
+        )
+
+        fold_root = _REPO_ROOT / "lca" / "plugins" / "session" / "derivers" / "step_tree"
+        matches: list[str] = []
+        if fold_root.exists():
+            matches.extend(_rg(r"\.subscribe\(", fold_root))
+            matches.extend(_rg(r"_subscribers", fold_root))
+        assert not matches, "I-SESSION-5 违规:fold deriver 仍挂 in-memory subscribe\n" + "\n".join(
+            matches[:8]
+        )
+
+        live_tail = (
+            _REPO_ROOT
+            / "lca"
+            / "infrastructure"
+            / "observability"
+            / "spine"
+            / "derivers"
+            / "live"
+            / "tail.py"
+        )
+        assert live_tail.exists(), "live_tail deriver module missing"
+        live_tail_text = live_tail.read_text(encoding="utf-8")
+        assert "SSE carrier" in live_tail_text or "carrier fan-out" in live_tail_text, (
+            "I-SESSION-5: live_tail.subscribe must be documented as SSE carrier, not fold"
+        )
+        assert (
+            "EventSpine.subscribe"
+            not in live_tail_text.split("def subscribe", 1)[-1].split("def ", 1)[0]
+        ), "I-SESSION-5 违规:LiveTailDeriver.subscribe body must not call EventSpine.subscribe"
+
+
+# ── ADR-0186 PR-3f delete-when locks ─────────────────────────────────────
+
+
+def test_pipeline_loader_has_no_mount_sink() -> None:
+    """ADR-0186 PR-3f: pipeline_loader 不得 bus.mount_sink / .mount_sink。"""
+    path = _REPO_ROOT / "lca" / "harness" / "profile" / "resolve" / "pipeline_loader.py"
+    assert path.exists(), "pipeline_loader.py missing"
+    text = path.read_text(encoding="utf-8")
+    assert "bus.mount_sink(" not in text, (
+        "ADR-0186 PR-3f: pipeline_loader still calls bus.mount_sink("
+    )
+    assert ".mount_sink(" not in text, "ADR-0186 PR-3f: pipeline_loader still calls .mount_sink("
+
+
+def test_event_session_has_no_eventbus_dual_write() -> None:
+    """ADR-0186 PR-3f: Bridge.append 不得 EventBus.default().publish 双写。
+
+    RunEventSessionBridge 已迁入 lca.session.lifecycle.bind(旧 event_session.py
+    仅剩 COMPAT re-export);断言跟随生产位置。
+    """
+    path = _REPO_ROOT / "lca" / "session" / "lifecycle" / "bind.py"
+    assert path.exists(), "lca/session/lifecycle/bind.py missing"
+    text = path.read_text(encoding="utf-8")
+    assert "EventBus.default().publish" not in text, (
+        "ADR-0186 PR-3f: event_session still dual-writes via EventBus.default().publish"
+    )
+
+
+def test_session_publish_has_no_eventbus_fallback() -> None:
+    """ADR-0186 hard closure: _session_publish 不得 EventBus.default().publish。"""
+    path = _REPO_ROOT / "lca" / "plugins" / "events" / "publishers" / "_session_publish.py"
+    assert path.exists(), "_session_publish.py missing"
+    text = path.read_text(encoding="utf-8")
+    assert "EventBus.default().publish" not in text, (
+        "ADR-0186: _session_publish still falls back to EventBus.default().publish"
+    )
+
+
+def test_pipeline_loader_has_no_bus_subscribe() -> None:
+    """ADR-0186 hard closure: pipeline_loader 不得 bus.subscribe / .subscribe(。"""
+    path = _REPO_ROOT / "lca" / "harness" / "profile" / "resolve" / "pipeline_loader.py"
+    assert path.exists(), "pipeline_loader.py missing"
+    text = path.read_text(encoding="utf-8")
+    assert "bus.subscribe(" not in text, "ADR-0186: pipeline_loader still calls bus.subscribe("
+    assert ".subscribe(" not in text, "ADR-0186: pipeline_loader still calls .subscribe("
+
+
+def test_builder_has_no_legacy_spine_write_port_fallback() -> None:
+    """ADR-0186: production builder 不得再引用 SpineWritePortAdapter 回退。"""
+    path = (
+        _REPO_ROOT
+        / "lca"
+        / "plugins"
+        / "transport"
+        / "webserver"
+        / "handlers"
+        / "runs"
+        / "session"
+        / "builder"
+        / "builder.py"
+    )
+    text = path.read_text(encoding="utf-8")
+    assert "SpineWritePortAdapter" not in text
+
+
+def test_field_producer_merge_lives_in_spine_enrich() -> None:
+    """ADR-0186 wave-2 / ADR-0194 P2-06: FieldProducer merge in spine_enrich + gateway."""
+    gateway_path = _REPO_ROOT / "lca" / "loop" / "fact_gateway.py"
+    enrich_path = (
+        _REPO_ROOT
+        / "lca"
+        / "infrastructure"
+        / "observability"
+        / "spine"
+        / "spine"
+        / "enrich.py"
+    )
+    hook_path = (
+        _REPO_ROOT / "lca" / "plugins" / "session" / "runtime" / "spine" / "hook.py"
+    )
+    assert enrich_path.exists()
+    enrich_text = enrich_path.read_text(encoding="utf-8")
+    assert "producer.produce" in enrich_text
+    gateway_text = gateway_path.read_text(encoding="utf-8")
+    assert "enrich_spine_payload" in gateway_text
+    assert "get_active_field_producers" in gateway_text
+    emit_path = _REPO_ROOT / "lca" / "plugins" / "observability" / "spine" / "emit_pipeline.py"
+    emit_text = emit_path.read_text(encoding="utf-8")
+    assert "producer.produce" not in emit_text
+    hook_text = hook_path.read_text(encoding="utf-8")
+    assert "enrich_spine_payload" in hook_text
+
+
+def test_anomaly_runs_via_session_observer_not_emit_pipeline_when_hooked() -> None:
+    """ADR-0186 wave-3: hook 路径下 EmitPipeline 不得调用 anomaly.on_event。"""
+    emit_path = _REPO_ROOT / "lca" / "plugins" / "observability" / "spine" / "emit_pipeline.py"
+    emit_text = emit_path.read_text(encoding="utf-8")
+    assert "is_session_ssot_hook_active()" in emit_text
+    assert "self._anomaly.on_event" in emit_text
+    anomaly_plugin = (
+        _REPO_ROOT / "lca" / "plugins" / "session" / "spine_anomaly" / "spine_anomaly.py"
+    )
+    assert anomaly_plugin.exists()
+    assert "session_event_to_event_record" in anomaly_plugin.read_text(encoding="utf-8")
+
+
+def test_wrap_bypasses_emit_pipeline_when_session_ssot_hook() -> None:
+    """ADR-0186 wave-4 / ADR-0194 P2-07: SSOT hook 活跃时 wrap 不得经 EmitPipeline。"""
+    events_path = (
+        _REPO_ROOT / "lca" / "harness" / "declarative" / "compile" / "instrument" / "events.py"
+    )
+    hooks_path = _REPO_ROOT / "lca" / "plugins" / "observability" / "spine" / "runtime_hooks.py"
+    events_text = events_path.read_text(encoding="utf-8")
+    hooks_text = hooks_path.read_text(encoding="utf-8")
+    assert "is_session_ssot_hook_active()" in events_text
+    assert "_emit_via_pipeline" not in hooks_text
+    assert "resolve_active_pipeline" not in hooks_text
+    safe_body = events_text[events_text.index("def _safe_append(") :]
+    ssot_idx = safe_body.index("is_session_ssot_hook_active()")
+    pipeline_idx = safe_body.index("_resolve_pipeline()")
+    assert ssot_idx < pipeline_idx
+
+
+def test_emit_pipeline_setup_does_not_install_pipeline_accessor() -> None:
+    """ADR-0186 wave-5: production setup wires enricher only, not wrap accessor."""
+    emit_path = _REPO_ROOT / "lca" / "plugins" / "observability" / "spine" / "emit_pipeline.py"
+    emit_text = emit_path.read_text(encoding="utf-8")
+    setup_body = emit_text[emit_text.index("async def setup(") :]
+    assert "set_active_spine_enricher" in setup_body
+    assert "set_active_field_producers" in setup_body
+    assert "set_active_pipeline_accessor" not in setup_body

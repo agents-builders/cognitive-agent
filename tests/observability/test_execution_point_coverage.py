@@ -1,0 +1,294 @@
+"""EXECUTION_POINT coverage: ``prompt_assembler.assemble.start`` / ``.end``
+must be emitted by the reasoner spine envelope with the ADR-0175 payload
+extensions.
+
+Per ADR-0165 I8, every entry in ``EXECUTION_POINTS`` must have at least
+one emitter wired in production. This test pins the wiring for the
+two prompt_assembler EPs (which previously had emitters but no callers).
+
+The test captures via a minimal spine stub (mirrors the protocol surface
+of :class:`EventSpine`) so it doesn't pull the full EventRecord
+validator chain (which requires SpinesContext.get_run() to be set).
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+import pytest
+
+from lca.cognition.brain.reasoner.reasoner import PromptReasoner
+from lca.contracts.models.cognition.prompt_assembly import (
+    PromptTemplate,
+    PromptTemplateProvider,
+    PromptTemplateSelector,
+    SectionKind,
+    SectionReference,
+)
+from lca.contracts.models.core.conversation.llm import LLMResponse
+from lca.contracts.models.core.state.state import AgentState
+from lca.contracts.models.team.role.team import RoleProfile
+from lca.contracts.protocols import LLMAdapter
+from lca.infrastructure.session.emit.cognitive_emit import (
+    run_reasoner_generate_thoughts_with_spine_facts,
+)
+from lca_kernel.events.bus.bus import EventBus
+from lca_kernel.events.test.catalog import build_test_bus
+
+
+@pytest.fixture(autouse=True)
+def _bound_publish_session():
+    """emit_* 走 publish_via_session:无绑定 Session fail-loud(ADR-0186)。
+
+    fake session 把 append 委托给当前 default EventBus —— 测试用
+    ``_CapturingBus`` 覆盖 default 时仍可捕获 emit(与
+    publishers/conftest.py 的 FakePublishSession 同形)。
+    """
+    from lca.plugins.events.publishers._session_publish import (
+        reset_publish_session,
+        set_publish_session,
+    )
+
+    class _FakePublishSession:
+        def append(self, payload: Any, *, producer: Any = None) -> Any:
+            return EventBus.default().publish(payload, producer=producer)
+
+    bus = build_test_bus()
+    EventBus.set_default(bus)
+    token = set_publish_session(_FakePublishSession())
+    try:
+        yield
+    finally:
+        reset_publish_session(token)
+        EventBus.set_default(None)
+
+
+class _AllowAllRegistry:
+    """S1 鉴权 stub:publish_via_session 的 _authorize_producer 只读 registry。"""
+
+    def can_publish(self, producer: Any, category: Any) -> bool:
+        del producer, category
+        return True
+
+
+class _CapturingBus:
+    """Stub matching ``EventBus.publish(...)`` keyword surface (ADR-0183 §3.1)."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+        self.registry = _AllowAllRegistry()
+
+    def publish(self, payload, *, producer, trace_id=None):
+        self.calls.append(
+            {
+                "execution_point": payload.execution_point,
+                "channel": payload.channel,
+                "payload": dict(payload.payload),
+            }
+        )
+        return object()
+
+    def register_sink(self, **kwargs):  # pragma: no cover
+        return None
+
+    def subscribe(self, **kwargs):  # pragma: no cover
+        return None
+
+
+class _StubProvider(PromptTemplateProvider):
+    def __init__(self, template: PromptTemplate) -> None:
+        self._template = template
+
+    def get_template(self, template_id: str):
+        return self._template
+
+    def list_templates(self):
+        return (("react_prompt", self._template),)
+
+
+class _StubRegistry:
+    def __init__(self, sections: dict[tuple[str, SectionKind], object]) -> None:
+        self._sections = sections
+
+    def register(self, section, *, kind, name):
+        pass
+
+    def resolve(self, *, kind, name):
+        return self._sections.get((name, kind))
+
+    def list_sections(self):
+        return ()
+
+
+class _StaticPure:
+    name = "role"
+
+    def render(self, *, role_profile, tools):
+        from lca.contracts.models.cognition.prompt_assembly import SectionOutput
+
+        return SectionOutput(text="hello-world")
+
+
+class _StubStaticSelector(PromptTemplateSelector):
+    def select(self, *, state):
+        return ("react_prompt", "profile_default")
+
+
+class _NoopLLM(LLMAdapter):
+    async def complete(self, prompt: str, **kwargs: Any) -> LLMResponse:
+        return LLMResponse(text="ok", model="test")
+
+    def stream(self, prompt: str, **kwargs: Any):
+        async def _gen():
+            if False:
+                yield None
+            return
+
+        return _gen()
+
+
+def _build_state() -> AgentState:
+    from lca.contracts.models.core.state.lifecycle import TaskStatus
+    from lca.contracts.models.core.state.state import Budget
+
+    return AgentState(
+        trace_id="t-001",
+        task="hello",
+        budget=Budget(),
+        step=0,
+        activated_skills=[],
+        status=TaskStatus.WORKING,
+    )
+
+
+def _make_assembler(template: PromptTemplate, registry):
+    from lca.cognition.brain.sections.assembler import (
+        SectionManifestPromptAssembler,
+    )
+
+    impl = SectionManifestPromptAssembler(
+        registry=registry,
+        template_provider=_StubProvider(template),
+        strip_empty_fields=True,
+    )
+
+    class _Wrapper:
+        template_provider = impl.template_provider
+
+        def render(self, **kwargs):
+            return impl.render(**kwargs)
+
+    return _Wrapper()
+
+
+async def test_prompt_assembler_eps_emitted_with_payload():
+    from lca.contracts.models.team.role.team import (
+        ToolPermissionManifest,
+    )
+    from lca.plugins.events.publishers._session_publish import (
+        reset_publish_session,
+        set_publish_session,
+    )
+    from lca.session.append import Session
+
+    session = Session("prompt-assembler-eps")
+    token = set_publish_session(session)
+    try:
+        template = PromptTemplate(
+            id="react_prompt",
+            variant="react",
+            sections=(SectionReference(name="role", kind="pure"),),
+        )
+        registry = _StubRegistry({("role", "pure"): _StaticPure()})
+        role_profile = RoleProfile(
+            role="r",
+            goal="g",
+            backstory="b",
+            tool_permission_manifest=ToolPermissionManifest(allowed_tools=[]),
+        )
+        reasoner = PromptReasoner(
+            llm=_NoopLLM(),
+            template_provider=_StubProvider(template),
+            section_registry=registry,
+        )
+        # NOTE: the (deprecated) spine-facts seam requires reasoner.role_profile
+        # to build the typed RoleSnapshot DTO (reflection_events.py:290).
+        reasoner.role_profile = role_profile
+        # NOTE: render_turn needs a selector (or template_id); the stub pins the
+        # template the test asserts on.
+        class _StubSelector:
+            def select(self, *, state):
+                return ("react_prompt", "profile_default")
+
+        reasoner.selector = _StubSelector()
+        await run_reasoner_generate_thoughts_with_spine_facts(reasoner, _build_state())
+    finally:
+        reset_publish_session(token)
+
+    events = session.snapshot_events()
+    starts = [e for e in events if e.type == "spine.cognition.prompt_assembler.assemble.start"]
+    ends = [e for e in events if e.type == "spine.cognition.prompt_assembler.assemble.end"]
+    assert len(starts) == 1, f"start EP must be emitted exactly once per render (got {events})"
+    assert len(ends) == 1, f"end EP must be emitted exactly once per render (got {events})"
+    start = starts[0].data["payload"]
+    end = ends[0].data["payload"]
+    assert start["template_id"] == "react_prompt"
+    assert start["decision_path"] == "profile_default"
+    assert start["sections"] == ["role"]
+    assert end["section_count"] == 1
+    outputs = end["section_outputs"]
+    assert isinstance(outputs, list) and len(outputs) == 1
+    assert outputs[0]["name"] == "role"
+    assert outputs[0]["kind"] == "pure"
+    assert outputs[0]["text_chars"] == len("hello-world")
+    assert isinstance(end["total_chars"], int)
+    assert end["total_chars"] > 0
+
+
+def test_skill_router_route_emits_decision_path():
+    import asyncio
+
+    from lca.cognition.brain.prompt.skill_router import KeywordSkillRouter
+    from lca.plugins.events.publishers._session_publish import (
+        reset_publish_session,
+        set_publish_session,
+    )
+    from lca.session.append import Session
+
+    session = Session("skill-router-eps")
+    token = set_publish_session(session)
+    try:
+        router = KeywordSkillRouter(
+            rules={"research_prompt": ["hello"]},
+            default_template="react_prompt",
+        )
+        result = asyncio.run(router.route(_build_state()))
+    finally:
+        reset_publish_session(token)
+
+    assert result == "research_prompt"
+    skill_eps = [
+        event
+        for event in session.snapshot_events()
+        if event.type == "spine.cognition.skill_router.route"
+    ]
+    assert len(skill_eps) == 1
+    payload = skill_eps[0].data["payload"]
+    assert payload["template"] == "research_prompt"
+    assert payload["decision_path"] == "keyword_match"
+
+
+def test_selector_returns_decision_path_tuple():
+    from lca.plugins.prompts.selector import TeamAwarenessTemplateSelector
+
+    selector = TeamAwarenessTemplateSelector(default_template="react_prompt")
+    state = _build_state()
+    template_id, decision_path = selector.select(state=state)
+    assert template_id == "react_prompt"
+    assert decision_path in {
+        "active_template_override",
+        "consult_duty",
+        "team_awareness_routing",
+        "profile_default",
+        "legacy",
+    }

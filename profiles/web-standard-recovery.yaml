@@ -1,0 +1,87 @@
+# web-standard-recovery profile — same outer SSOT as web-standard.
+# ADR-0075 / M1 Issue #14: bounded reflect→think recovery lives on
+# ``bundles/outer/phase_main.yaml`` (admit_recovery + loop.maxIterations=1).
+# This profile no longer loads ``declarative-recovery`` / ``declarative-phase-graph``
+# as edge sources — plugins only produce routing hints.
+#
+# Recovery behavior (outer-owned):
+# - Reflect admit_recovery sets routing.next_hint = admit_recovery on failure
+# - Outer edge reflect.main → think.main fires when that hint is set
+# - Edge loop obligation bounds re-entry (LoopGuard=1 semantics)
+#
+# ADR-0174 PR-7.3 / S7.3: loop_cursor.spine_* + observability五缝与 web-standard 对齐。
+#
+# ADR-0173 §D4 recovery-aware 装配:本 profile 是 halt 可恢复的 opt-in profile;
+# halt_close_policy_override + cursor_factory.resume_protocol 块当前不在
+# ``lca/harness/profile/resolve.py`` 已校验的 Profile 字段白名单中(I-RESUME-6
+# 钉死只有 recovery profile 才 halt 可恢复)。PR-5/S5 实施期会扩 Profile schema,
+# 删除条件 = Profile schema 接受 ``halt_close_policy_override`` 后,以下 TODO
+# 块替换为正式字段并由 resolve 校验。
+
+# TODO(ADR-0173 §D4, delete-when: Profile schema 接受以下字段):
+#   runtime:
+#     halt_close_policy_override:
+#       user_stop: "halt"
+#       loop_guard: "halt"
+#       approval_pending: "halt"
+#     cursor_factory:
+#       resume_protocol:
+#         iteration_reason_default: "checkpoint_resume"
+#         enable_user_replay: true
+#         approval_resume:
+#           approval_token_validator: "lca.harness.approval.validate"
+#           retry_on_invalid: false
+#
+#   persist:
+#     spine_sink: { path: traces/runs/$RUN_ID/<run_id>.spine.jsonl, best_effort_window_ms: 0 }
+#     restore_handler: "lca.infrastructure.persistence.checkpoint_restore"
+#
+#   host:
+#     initial: [step_tree, narrative, graph, cost, live_tail]
+
+observability:
+  loop_cursor:
+    implementation: std
+    spine_default: loop_cursor.spine_default
+  projection_host:
+    initial: [step_tree, narrative, graph, cost]
+  persistence:
+    coalescer: default
+    sink: routing_file
+  model_visible:
+    enabled: true
+  close_barrier:
+    enabled: true
+  plan_ref: web-standard-recovery
+
+bundles:
+  - bundles/base.yaml
+  - bundles/observability-default.yaml
+  - bundles/observation-9module.yaml
+  - bundles/web-app.yaml
+  - bundles/scenario-cordis-creator.yaml
+  - bundles/loop_cursor.spine_default.yaml
+  - bundles/session-runtime.yaml
+  - bundles/event-bus-components.yaml
+  - bundles/outer/phase_main.yaml
+  - bundles/think/think_subgraph.yaml
+  - bundles/act/act_subgraph.yaml
+  - bundles/perceive/perceive_subgraph.yaml
+  - bundles/reflect/reflect_subgraph.yaml
+  - bundles/remember/remember_subgraph.yaml
+
+patch:
+  - id: spine.sink.file
+    config:
+      boot_path: .lca/spine/boot-spine.jsonl
+      runs_root: traces/runs
+
+  - id: spine.sink.console
+    config:
+      format: graph_timeline
+
+  - id: lca-llm-resolver
+    # NOTE(round-0358): Config 自 506b7630d 起为空(extra=forbid),adapter 改由
+    # phase.think.reasoner.credentials 经 composition root 绑定;旧 default_model /
+    # load_dotenv 键已无法通过校验,此处对齐 bundles/base.yaml 的空配置。
+    config: {}

@@ -1,0 +1,385 @@
+"""phase.concept.tool.fork.dispatch — typed concept.tool.fork boundary.
+
+concept.tool.fork 图唯一节点 plugin:把 ``BindingsView`` typed boundary
+转成 ``ForkedTools`` typed boundary(ADR-0220 §4.1 + §7.3)。
+
+实现策略:typed dispatch 调 ``ToolsService.fork_for_run``(typed signature
+cc55b547 已落),不调 primitive 节点(避免在 P2 阶段引入 graph-of-graph
+调度复杂度,留待 P3+ 真实跨图时收敛)。typed boundary 不变 — 同一份
+``ForkedTools`` 输出可以被 primitive 和 concept 两个图各自生产,边界
+contract 一致。
+
+ADR-0220 P7: ``bindings`` 端口缺省时,从
+``lca.infrastructure.runtime_plane.capability_bindings.current_bindings_view()``
+读 typed boundary。这条 fallback 路径替代了 history 上 ``reasoner.py``
+的反射读 ``AgentState`` 私有 seam-ref 字段(ADR §2.2 表同一根因
+收敛点);若 fallback 也未绑定 → fail loud,要求 runtime 在每 turn
+显式 set ``BindingsViewBuilder``,禁止悄悄构造空 BindingsView。
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import cast
+
+import structlog
+
+from lca.contracts.atoms.control.slot import ControlSlot
+from lca.contracts.atoms.functional.group import FunctionalGroup
+from lca.contracts.atoms.scope.scope import Scope
+from lca.contracts.harness.composition.plugin_contract import (
+    ArchitectureContract,
+    AuthorityContract,
+    EvidenceContract,
+    LifecycleContract,
+    PluginContract,
+    PluginIdentity,
+)
+from lca.contracts.models.cognition.boundary import (
+    BindingsView,
+    ForkedTools,
+)
+from lca.contracts.protocols import Tool
+from lca.contracts.protocols.declarative.declarative_1.node_executor import (
+    NodeContext,
+    NodeInput,
+    NodeOutput,
+)
+from lca.contracts.protocols.declarative.declarative_1.ports import PortName
+from lca.contracts.protocols.declarative.declarative_2.declarative_plugin import (
+    OwnershipDeclaration,
+)
+from lca.harness.plugin_api import PluginContext, PluginKind, plugin
+
+_FORKED_BINDING_KEYS: frozenset[str] = frozenset(
+    {
+        "file_store",
+        "bindings",
+        "sandbox",
+        "search",
+        "skill_store",
+        "machine_resolver",
+        "box_accessor",
+    }
+)
+
+_log = structlog.get_logger(__name__)
+
+
+def _bindings_from_runtime_plane() -> BindingsView | None:
+    """Pull the typed ``BindingsView`` from the runtime plane seam.
+
+    ADR-0220 §7.3: replaces the legacy ``reasoner.py:300-305`` reflection
+    reads on ``AgentState._xxx_ref`` private attrs. Returns ``None``
+    when the runtime entry point did not bind a
+    ``BindingsViewBuilder`` for the current turn — the caller
+    (this node) treats that as a hard fail.
+    """
+    from lca.infrastructure.runtime_plane.capability_bindings import (
+        current_bindings_view,
+    )
+
+    return current_bindings_view()
+
+
+# NOTE (2026-10-02): v1 sandbox used runCommand/executeCode; the GATED
+# box path wires box_run_command/sandbox_execute instead. Accept either
+# naming scheme per group — the fork must surface command execution AND
+# code execution, in one form or the other.
+_SANDBOX_TOOL_APIS: frozenset[frozenset[str]] = frozenset(
+    {
+        frozenset({"runCommand", "box_run_command"}),
+        frozenset({"executeCode", "sandbox_execute"}),
+    }
+)
+
+
+def _filter_solo_creator_tools(items: tuple[Tool, ...]) -> tuple[Tool, ...]:
+    """Drop Creator host-CWD primitives — single source of truth in solo mode.
+
+    Delegates to ``filter_solo_tools`` in ``lca.plugins.collaboration.modes.solo``
+    so the dispatch node never owns its own copy of the host-tool allowlist.
+    Adding a new Creator host-CWD tool only requires editing the solo mode
+    module; this dispatch gate picks the change up automatically.
+    """
+    from lca.plugins.collaboration.modes.solo import filter_solo_tools
+
+    return tuple(filter_solo_tools(items))
+
+
+def _tool_api_name(tool: object) -> str:
+    name = getattr(tool, "name", "") or ""
+    if ":" in name:
+        return name.rsplit(":", 1)[-1]
+    return name
+
+
+def _assert_sandbox_tools_visible(bindings: BindingsView, items: tuple[Tool, ...]) -> None:
+    """Fail loud when Profile→Bindings declare sandbox but fork omitted APIs."""
+    sandbox_expected = bindings.sandbox is not None
+    if not sandbox_expected:
+        plane_bindings = bindings.bindings
+        for attr in ("primary", "secondary"):
+            plane = getattr(plane_bindings, attr, None) if plane_bindings is not None else None
+            kind = getattr(plane, "kind", None)
+            kind_name = getattr(kind, "name", None) or str(kind or "")
+            if (
+                kind_name == "SANDBOX"
+                or str(kind_name).endswith("SANDBOX")
+                or str(kind) == "sandbox"
+            ):
+                sandbox_expected = True
+                break
+    if not sandbox_expected:
+        return
+    present = {_tool_api_name(tool) for tool in items}
+    missing = sorted(
+        f"one of {sorted(group)}" for group in _SANDBOX_TOOL_APIS if not (group & present)
+    )
+    if missing:
+        raise RuntimeError(
+            "tool.fork.dispatch: BindingsView declares sandbox but forked "
+            f"tools missing {missing}; got {sorted(present)}. "
+            "Profile → Bindings → ForkedTools must surface command/code "
+            "execution tools (eng/retire-v1-reasoner-sandbox)."
+        )
+
+
+def _custom_tools_from_home(home_path: str, items: tuple[Tool, ...]) -> tuple:
+    """Load assistant custom tools from ``{home}/tools/`` (ADR-0243 D5).
+
+    返回含 ``AssistantCustomTool``（动态工具，成员为实例属性，与 ``Tool``
+    协议的 ClassVar 成员静态不兼容——裁定项 B-059），故返回类型不参数化。
+
+    Only ``builtin_preset`` tools whose backing builtin is present in the
+    filtered run tool set are materialized; a preset wrapping a denied or
+    unavailable builtin is skipped to avoid dead tools.
+    """
+    from pathlib import Path
+
+    from lca.contracts.models.assistant.tool_spec import ToolSpec
+    from lca.infrastructure.tools.assistant.custom_tool import AssistantCustomTool
+
+    tools_root = Path(home_path) / "tools"
+    if not tools_root.is_dir():
+        return ()
+    by_name = {str(getattr(tool, "name", "")): tool for tool in items}
+
+    def resolve_builtin(name: str) -> Tool | None:
+        return by_name.get(name)
+
+    out: list[AssistantCustomTool] = []
+    for child in sorted(tools_root.iterdir()):
+        if not child.is_dir() or child.name.startswith("."):
+            continue
+        spec_path = child / "tool.json"
+        if not spec_path.is_file():
+            continue
+        try:
+            spec = ToolSpec.model_validate_json(spec_path.read_text(encoding="utf-8"))
+        except Exception:
+            _log.warning(
+                "tool.fork.dispatch.skip_bad_custom_tool",
+                home=str(tools_root),
+                tool_id=child.name,
+            )
+            continue
+        if spec.handler.kind == "builtin_preset" and (spec.handler.builtin or "") not in by_name:
+            continue
+        out.append(
+            AssistantCustomTool(
+                spec,
+                builtin_resolver=resolve_builtin,
+            )
+        )
+    return tuple(out)
+
+
+@dataclass(frozen=True, slots=True)
+class ToolForkDispatchExecutor:
+    """concept.tool.fork 节点:typed BindingsView → ForkedTools."""
+
+    semantic_name: str = "tool.fork.dispatch"
+    region: str = "concept"
+    # ADR-0219 §5.5: typed port contract declared on the plugin.
+    declared_inputs: tuple[PortName, ...] = (PortName("bindings"), PortName("tools"))
+    declared_outputs: tuple[PortName, ...] = (PortName("forked_tools"),)
+
+    async def node_execute(
+        self,
+        context: NodeContext,
+        input: NodeInput,
+    ) -> NodeOutput:
+        """tool.fork.dispatch 入口。
+
+        inputs 端口(yaml):bindings (BindingsView), tools (ToolsService)
+        outputs 端口(yaml):forked_tools (ForkedTools)
+
+        ADR-0220 P7 fallback 路径:bindings 端口未传 → 读
+        ``RuntimePlane.current_bindings()`` typed seam,不再反射 state。
+        两路都空 → fail loud,要求运行时显式 set
+        ``BindingsViewBuilder``。
+        """
+        bindings = input.port_values.get(PortName("bindings"))
+        if bindings is None:
+            bindings = _bindings_from_runtime_plane()
+        if not isinstance(bindings, BindingsView):
+            raise TypeError(
+                "tool.fork.dispatch: 'bindings' port must be a BindingsView "
+                f"instance, got {type(bindings).__name__}"
+            )
+
+        tools_service = input.port_values.get(PortName("tools"))
+        if tools_service is None:
+            raise RuntimeError("tool.fork.dispatch: 'tools' typed port missing from input ports")
+
+        forked = tools_service.fork_for_run(bindings)
+        items: tuple[Tool, ...] = tuple(forked.list_tools())
+        # Drop Creator host-CWD primitives when the active mode is solo —
+        # the solo Adapter (build_solo_agent) applies the same filter to
+        # Agent.tools at composition time; tool_fork.dispatch is the second
+        # gate and must stay in sync. Keyed on ``mode`` (the typed policy
+        # signal carried on BindingsView), NOT on ``sandbox is not None``
+        # — sandbox plane = isolation, not creator/tool visibility policy.
+        if getattr(bindings, "mode", "solo") == "solo":
+            items = _filter_solo_creator_tools(items)
+        # ADR-0242 D4 / I-B3: assistant-bound runs see only the Home-filtered
+        # tool set, matching the permission manifest built from the same
+        # tools.yaml / grants.yaml policy (the assembler filters
+        # Agent.tools; this is the second gate and must stay in sync).
+        if bindings.assistant_id and bindings.home_path:
+            from lca.infrastructure.tools.assistant.filter import (
+                filter_tools_by_assistant,
+            )
+
+            items = filter_tools_by_assistant(items, bindings.home_path)
+            items = items + _custom_tools_from_home(bindings.home_path, items)
+        # ── ADR-0248 运行时总装：声带追加 / 子代理禁声 / AutoReview 包装 ──
+        from lca.infrastructure.auto_review.wrapped_tool import (
+            AutoReviewWrappedTool,
+        )
+        from lca.infrastructure.vocal.tool_filter import VocalToolFilter
+
+        origin = getattr(bindings, "origin", "user")
+        vocal_mode = getattr(bindings, "vocal_mode", "direct")
+        vocal_gate = getattr(bindings, "vocal_gate", None)
+        auto_review_mode = getattr(bindings, "auto_review_mode", "off")
+        auto_review_gate = getattr(bindings, "auto_review_gate", None)
+
+        # ADR-0268 §4：lca.nothing_to_do 只在 handoff 轮可用。用户轮 wire
+        # 不放该工具；模型发出调用由 unexposed_tool_block_observation 回注
+        # 错误（§14.1、§14.2 结构保证）。
+        from lca.infrastructure.tools.lca import filter_handoff_only_tools
+
+        items = filter_handoff_only_tools(items, origin)
+
+        # 子代理物理禁声：send_message 绝不进入子代理工具集（ADR-0248 §5.3）。
+        if origin == "subagent":
+            items = tuple(VocalToolFilter().filter_tool_objects(items, origin="subagent"))
+        # gated 模式主协调者追加 send_message 唯一声带工具。若组合期工厂已
+        # 物化（assistant profile 路径），跳过，避免重复 schema。
+        elif (
+            vocal_mode == "gated"
+            and vocal_gate is not None
+            and not any(getattr(tool, "name", "") == "send_message" for tool in items)
+        ):
+            from lca.contracts.protocols.vocal.protocol import VocalGateProtocol
+            from lca.infrastructure.vocal.tool_adapter import SendMessageVocalTool
+
+            items = (*items, SendMessageVocalTool(cast("VocalGateProtocol", vocal_gate)))
+
+        # ADR-0248 §3.2 / §3.5：gated 模式挂载员工机工具与人闸，让
+        # BoxAccessor 被真实消费。子代理只拿员工机文件工具，不拿
+        # request_box_help（子代理无声道，交还桌面由父进程负责）。
+        if vocal_mode == "gated":
+            from lca.infrastructure.computer.box_accessor import BoxAccessor
+            from lca.infrastructure.tools.box import build_box_help_tools, build_box_tools
+
+            existing_names = {getattr(tool, "name", "") for tool in items}
+            if bindings.box_accessor is not None:
+                # 员工机 Shell 只在 Auto-Review 开启时暴露（ADR-0248 切片 4）。
+                include_shell = auto_review_mode != "off"
+                box_tools = [
+                    t
+                    for t in build_box_tools(
+                        cast("BoxAccessor", bindings.box_accessor),
+                        include_shell=include_shell,
+                    )
+                    if getattr(t, "name", "") not in existing_names
+                ]
+                items = (*items, *box_tools)
+            if origin != "subagent":
+                help_tools = [
+                    t
+                    for t in build_box_help_tools()
+                    if getattr(t, "name", "") not in existing_names
+                ]
+                items = (*items, *help_tools)
+
+        # AutoReview 三态硬闸：非 off 时所有工具包一层 AutoReviewWrappedTool。
+        if auto_review_mode != "off" and auto_review_gate is not None:
+            from lca.infrastructure.auto_review.gate import AutoReviewGate
+
+            gate = cast("AutoReviewGate", auto_review_gate)
+            items = tuple(AutoReviewWrappedTool(tool, gate) for tool in items)
+
+        # ADR-0248 §6 工作面梯子：gated 模式按梯子稳定排序（低阶在前）。
+        if vocal_mode == "gated":
+            from lca.infrastructure.work_surface.ladder import order_tools_by_ladder
+
+            items = tuple(order_tools_by_ladder(items))
+        # Defer-tool seam (Muse L1 alignment): refresh this turn's
+        # namespace view on the run-scoped session.  Without a session
+        # (tests / legacy run entries) the downstream assembler falls back
+        # to full-schema projection — behavior unchanged.
+        from lca.infrastructure.tool_defer.session import current_defer_session
+
+        _defer_session = current_defer_session()
+        if _defer_session is not None:
+            _defer_session.update_turn(items)
+        _assert_sandbox_tools_visible(bindings, items)
+        forked_tools = ForkedTools(
+            items=items,
+            binding_keys=_FORKED_BINDING_KEYS,
+        )
+        return NodeOutput(port_values={PortName("forked_tools"): forked_tools})
+
+
+@plugin(
+    id="phase.concept.tool.fork.dispatch",
+    Config=None,
+    provides=("concept::tool.fork.dispatch",),
+    requires=(),
+    layer="L2",
+    kind=PluginKind.PRIMITIVE,
+    effects="none",
+    contract=PluginContract(
+        identity=PluginIdentity(version="v1"),
+        architecture=ArchitectureContract(
+            group=FunctionalGroup.G7_EXECUTION,
+            control_slots=(ControlSlot.OBSERVE_WILDCARD,),
+        ),
+        lifecycle=LifecycleContract(allowed_scopes=(Scope.RUN,)),
+        authority=AuthorityContract(grants=("plugin.serve",)),
+        observability=EvidenceContract(
+            descriptors=(
+                "phase_concept_tool_fork_dispatch.checked",
+                "phase_concept_tool_fork_dispatch.served",
+            )
+        ),
+    ),
+    ownership=OwnershipDeclaration(
+        reads=("plugin.serve",),
+        emits=("plugin.served",),
+        state_mutation="forbidden",
+    ),
+)
+async def setup(ctx: PluginContext, config=None) -> None:
+    """Composite-key 注册:``{region}::{semantic_name}``。"""
+    del config
+    executor = ToolForkDispatchExecutor()
+    composite_key = f"{executor.region}::{executor.semantic_name}"
+    ctx.provide(composite_key, executor)
+
+
+__all__ = ["ToolForkDispatchExecutor", "setup"]

@@ -1,0 +1,159 @@
+"""Think-cluster assembly helpers for plan-bound graph composition."""
+
+from __future__ import annotations
+
+from typing import Any
+
+from lca.cognition.brain.reasoner.reasoner import PromptReasoner
+from lca.contracts.capabilities import (
+    BRAIN_PROMPT_CATALOG_FACTORY,
+    BRAINS,
+    PROMPT_TEMPLATE_PROVIDER,
+)
+from lca.contracts.mechanisms import consume
+from lca.contracts.mechanisms.capability.capability import require_capability
+from lca.contracts.protocols import (
+    Brain,
+    BrainPromptCatalog,
+    BrainPromptCatalogFactory,
+    LLMAdapter,
+)
+from lca.contracts.protocols.journal.spec.spec import AgentSpec
+from lca.infrastructure.observability.adapters import (
+    TelemetryLLMAdapter,
+)
+from lca.infrastructure.session.emit.lifecycle_emit import session_append_for_thinking
+from lca.loop.emit.cognitive import llm as llm_spine_emit
+from lca.plugins.composer.composition.skill_store import active_skill_store
+
+_MODEL_VISIBLE_HOOK_KEY = "llm.adapter.hook.model_visible"
+
+
+def instrument_llm(
+    llm: LLMAdapter,
+    *,
+    ctx: object | None = None,
+) -> LLMAdapter:
+    """Wrap ``llm`` with model-visible + telemetry decorators (composition root helper).
+
+    Layering (outer → inner):
+        ModelVisibleHookAdapter → TelemetryLLMAdapter → inner
+
+    ADR-0185 PR-4 收口:当 ``ctx`` 非 None 且能从
+    ``ctx.soft_get("llm.adapter.hook.model_visible")`` 拿到
+    :class:`ModelVisibleHook` 实例,用
+    :class:`ModelVisibleHookAdapter` 包边界,把 model-visible 真值落
+    ``<run_id>.spine.jsonl`` 两条 model-visible spine event
+    (``spine.llm.request.header`` + ``spine.llm.request.header.assistant``)。
+
+    ctx 缺失 / hook 未挂载 / 不支持软查 ⇒ 只包 telemetry,
+    model-visible 透明缺席(测试 + 离 boot 路径不写 spine event)。
+
+    - LLM 调用前 hook ``capture_pre_llm`` fold 优化 + publish
+      ``spine.llm.request.header``(ADR-0185 §3.5)
+    - LLM 调用后 hook ``capture_post_llm`` publish
+      ``spine.llm.request.header.assistant``
+    - 任何 hook 缺席 / publish 抛错 ⇒ 透明透传(不落 EP、业务继续)
+
+    Telemetry 部分:
+
+    - LLM 调用前后 TelemetryLLMAdapter 记 LlmCallCompleted / Otel projection /
+      token usage(ADR-0169 §C7 控制/观察分离)
+    """
+
+    # 已有 TelemetryLLMAdapter 时,复用之;否则用 llm 自身
+    existing_telemetry = llm._inner if isinstance(llm, TelemetryLLMAdapter) else llm
+    instrumented = TelemetryLLMAdapter(
+        existing_telemetry,
+        session_append=session_append_for_thinking(),
+        spine_emit=llm_spine_emit,
+    )
+
+    hook = _resolve_model_visible_hook(ctx)
+    if hook is not None:
+        from lca.plugins.events.hooks.model_visible.adapter import (
+            ModelVisibleHookAdapter,
+        )
+
+        return ModelVisibleHookAdapter(instrumented, hook)
+
+    return instrumented
+
+
+def _resolve_model_visible_hook(ctx: object | None) -> Any:
+    """从 ``ctx`` 软查 :class:`ModelVisibleHook` 实例,无则返回 ``None``。
+
+    兼容三种 ctx 形态(按优先级):
+    1. :class:`AuditedPluginContext` / 任何实现 ``soft_get(str) -> Any | None``
+       的 wrapper —— 首选(plugin setup 路径用)。
+    2. cordis :class:`Context`(Composer 装配路径收到 scope 即 cordis Context)
+       —— 走 :func:`collect_context_bindings` 沿 ``own_bindings`` + ``parent``
+       链查;子 scope 找不到时上溯到父 scope(对齐 :meth:`Context.inject` 解析
+       顺序)。
+    3. ``None`` / 其它 —— 直接返回 ``None``,由 caller 走旧 wiring。
+    """
+    if ctx is None:
+        return None
+    soft_get = getattr(ctx, "soft_get", None)
+    if callable(soft_get):
+        try:
+            return soft_get(_MODEL_VISIBLE_HOOK_KEY)
+        except Exception:  # INTENTIONAL: ctx 软查失败不挡装配
+            return None
+    own_bindings = getattr(ctx, "own_bindings", None)
+    if own_bindings is not None:
+        from lca.harness.plugin.context import collect_context_bindings
+
+        return collect_context_bindings(ctx).get(_MODEL_VISIBLE_HOOK_KEY)
+    return None
+
+
+def resolve_brain(spec: AgentSpec, llm: LLMAdapter, *, scope: object) -> Brain:
+    """Build the selected Brain with its model-visible prompt catalog.
+
+    The active skill provider is resolved only for this Think-cluster
+    concern, keeping skill discovery and prompt rendering out of
+    unrelated graph composers.
+    """
+
+    if not isinstance(spec.brain, str):
+        return spec.brain
+
+    brains = require_capability(scope, BRAINS.key)
+    try:
+        factory = brains.resolve(spec.brain)
+    except KeyError as exc:
+        raise ValueError(f"Unknown brain: {spec.brain!r}. Available: {brains.names()}") from exc
+
+    prompt_catalog_factory = require_capability(scope, BRAIN_PROMPT_CATALOG_FACTORY.key)
+    if not isinstance(prompt_catalog_factory, BrainPromptCatalogFactory):
+        raise TypeError(
+            "brain_prompt_catalog_factory must implement BrainPromptCatalogFactory, "
+            f"got {type(prompt_catalog_factory).__name__}"
+        )
+    prompt_catalog = prompt_catalog_factory.create(
+        skill_store=active_skill_store(scope),
+        tools=spec.tools,
+    )
+    if not isinstance(prompt_catalog, BrainPromptCatalog):
+        raise TypeError(
+            "brain_prompt_catalog_factory.create must return BrainPromptCatalog, "
+            f"got {type(prompt_catalog).__name__}"
+        )
+    # Get template_provider from scope (provided by web-app bundle).
+    template_provider = require_capability(scope, PROMPT_TEMPLATE_PROVIDER.key)
+    brain = factory(
+        consume("llm", llm, PromptReasoner),
+        spec.profile,
+        prompt_catalog,
+        tools=list(spec.tools),
+        template_provider=template_provider,
+    )
+    if not isinstance(brain, Brain):
+        raise TypeError(
+            f"brain factory {spec.brain!r} produced {type(brain).__name__}, expected Brain"
+        )
+    return brain
+
+
+__all__ = ["instrument_llm", "resolve_brain"]

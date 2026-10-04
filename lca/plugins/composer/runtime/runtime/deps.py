@@ -1,0 +1,102 @@
+"""Explicit production runtime dependency closure.
+
+This module owns the dependency value that crosses from graph composition into
+runtime binding. It deliberately does not assemble a runtime or resolve scope
+capabilities; those responsibilities belong to the neighboring composition
+modules.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from dataclasses import dataclass
+
+from lca.contracts.mechanisms import HookRegistry
+from lca.contracts.models.team.role.team import ToolPermissionManifest
+from lca.contracts.protocols import (
+    ArtifactClosure,
+    Body,
+    Brain,
+    LLMAdapter,
+    MemorySystem,
+    PerceiveHub,
+    Reducer,
+    StateStore,
+)
+from lca.contracts.protocols.act.effect.handler import EffectHandlerRegistry
+from lca.contracts.protocols.declarative.declarative_1.node_executor import NodeExecutor
+from lca.contracts.protocols.journal.idempotency.idempotency import IdempotencyStore
+from lca.contracts.protocols.runtime.runtime.composition import (
+    CheckpointStateResolverFactory,
+    DeclarativeInterpreterFactory,
+    DeltaReducerFactory,
+    EffectDispatcherFactory,
+    ResultFinalizerFactory,
+    RuntimeJournalFactory,
+)
+from lca.contracts.protocols.runtime.runtime.lifecycle import RuntimeLifecyclePublisher
+from lca.contracts.protocols.session.resume.input import ResumeInputAdapter
+from lca.contracts.protocols.state.delta_handler import DeltaHandlerRegistry
+from lca.contracts.protocols.state.plan import CompiledRunPlan
+from lca.harness.declarative.lifecycle.phase_observation import PhaseObserver
+from lca.runtime.projection.phase_capabilities import (
+    RuntimePhaseCapabilities,
+    project_runtime_phase_capabilities,
+)
+
+
+@dataclass(frozen=True)
+class ProductionRuntimeDeps:
+    """The complete, explicit closure accepted by production runtime binding.
+
+    Cognitive facts are canonical inputs. The phase capability map may contain
+    them for callers that already assembled a graph, but conflicting duplicates
+    are rejected by the canonical projection below.
+    """
+
+    brain: Brain
+    body: Body
+    memory: MemorySystem
+    hooks: HookRegistry
+    state_store: StateStore
+    perceive_hub: PerceiveHub
+    llm: LLMAdapter
+    reducer: Reducer
+    compiled_plan: CompiledRunPlan
+    node_executors: Mapping[str, NodeExecutor]
+    phase_capabilities: Mapping[str, object]
+    effect_handler_registry: EffectHandlerRegistry
+    delta_handler_registry: DeltaHandlerRegistry
+    artifact_closure: ArtifactClosure
+    idempotency_store: IdempotencyStore
+    resume_input_adapter: ResumeInputAdapter
+    effect_dispatcher_factory: EffectDispatcherFactory
+    delta_reducer_factory: DeltaReducerFactory
+    journal_factory: RuntimeJournalFactory
+    interpreter_factory: DeclarativeInterpreterFactory
+    checkpoint_state_resolver_factory: CheckpointStateResolverFactory
+    result_finalizer_factory: ResultFinalizerFactory
+    phase_observer: PhaseObserver
+    lifecycle_publisher: RuntimeLifecyclePublisher | None = None
+    permission_manifest: ToolPermissionManifest | None = None
+    # ADR-0246 PR-7: assistant 域可选注入（bootstrap 投影服务 + 当前 run 的
+    # assistant_id），供 perceive.observe 合并 Home 配置面。
+    assistant_bootstrap: object | None = None
+    assistant_id: str = ""
+
+    def runtime_phase_capabilities(self) -> RuntimePhaseCapabilities:
+        """Project one frozen phase view from the canonical graph facts."""
+        return project_runtime_phase_capabilities(
+            phase_capabilities=self.phase_capabilities,
+            brain=self.brain,
+            body=self.body,
+            memory=self.memory,
+            perceive_hub=self.perceive_hub,
+            llm=self.llm,
+            permission_manifest=self.permission_manifest,
+            assistant_bootstrap=self.assistant_bootstrap,
+            assistant_id=self.assistant_id,
+        )
+
+
+__all__ = ["ProductionRuntimeDeps"]

@@ -1,0 +1,73 @@
+# bundles/scenario-self-improving.yaml — self-improving scenario bundle.
+# Per spec §13.6: 4 层闭环 (Skill 习得 + 失败分析 + A/B + 能力扩展).
+
+entries:
+  # Skill acquisition (same as Voyager).
+  - id: lca-skill-auto-acquire
+    name: lca_skill_auto_acquire
+    $module: lca.plugins.skill.auto_acquire
+    config:
+      enabled: true
+      min_confidence: 0.7
+      min_evidence: 3
+
+  # Durable ticket persistence is distinct from lifecycle subscription. It owns
+  # only references, idempotency and leases; it cannot read evidence or promote skills.
+  - id: lca-learning-review-ticket-store
+    name: lca_learning_review_ticket_store
+    $module: lca.plugins.learning.review_ticket_store
+    config:
+      database_path: .lca/learning-review.db
+
+  # Hermes-style post-turn review bridge. It receives only terminal lifecycle
+  # references, then exposes candidate-only assessment APIs to an external worker.
+  - id: lca-learning-review-lifecycle-subscriber
+    name: lca_learning_review_lifecycle_subscriber
+    $module: lca.plugins.learning.review_lifecycle
+    config:
+      enabled: true
+      statuses: [completed, failed, partial]
+      max_pending: 64
+      lease_seconds: 300
+      priority: 50
+
+  # Failure analysis — records failed traces + emits retrospective insights.
+  - id: lca-failure-analyzer
+    name: lca_failure_analyzer
+    $module: lca.plugins.insight.failure_analyzer
+    config:
+      enabled: true
+      trigger:
+        - max_retries_reached
+        - budget_exceeded
+
+  # Profile evolution — A/B testing + commit/rollback.
+  - id: lca-profile-evolver
+    name: lca_profile_evolver
+    $module: lca.plugins.profile.evolver
+    config:
+      enabled: true
+      ab_test_size: 20
+      commit_threshold: 0.05
+      rollback_on_regression: true
+
+  # Capability grant — composer.mount + composer.unmount tools.
+  - id: lca-tool-cordis-control
+    name: lca_tool_cordis_control
+    $module: lca.plugins.tools.cordis_control
+    config:
+      caller_grant:
+        - cordis_control.mount
+        - cordis_control.unmount
+
+  - id: lca-tool-profile-diff
+    name: lca_tool_profile_diff
+    $module: lca.plugins.tools.profile_diff
+    config:
+      allowed: true
+
+  - id: lca-tool-profile-apply
+    name: lca_tool_profile_apply
+    $module: lca.plugins.tools.profile_apply
+    config:
+      allowed: true

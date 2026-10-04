@@ -1,0 +1,1267 @@
+# spine 事件 SSOT（ADR-0181 D3 / ADR-0183 PR-6）
+#
+# consumer_rules：subscriber 鉴权按前缀规则声明。某 category 的授权 =
+# 命中的所有规则的 subscribers 并集；更细前缀的规则为子树追加订阅者。
+# 删-when（PR-9）：lca/infrastructure/observability/spine/manifest.py
+# 全量迁完后 rg "EXECUTION_POINTS" lca/ = 0
+consumer_rules:
+  - prefix: "spine."
+    subscribers:
+      - lca.plugins.events.sinks.spine_file_sink.sink.SpineFileSink
+
+events:
+  # ── Cognition（试点 + PR-2 一次性全迁，删-when：cognition reflector 旧
+  # lca/plugins/observability/spine/reflectors/cognition.py 删 + rg
+  # "emit_brain_\|emit_critic_\|emit_reasoner_\|emit_prompt_assembler_\|emit_synthesizer_\|emit_skill_router_\|emit_memory_" lca/ = 0）
+  - category: spine.cognition.brain.perceive.start
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      state_id: str
+      activation_ref: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.cognition.brain.perceive.end
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      state_id: str
+      outcome: str
+      activation_ref: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.cognition.brain.think.start
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      state_id: str
+      activation_ref: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.cognition.brain.think.end
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      state_id: str
+      outcome: str
+      activation_ref: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.cognition.think.gate.start
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      state_id: str
+      activation_ref: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.cognition.think.gate.end
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      state_id: str
+      outcome: str
+      activation_ref: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.cognition.critic.eval.start
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      state_id: str
+      activation_ref: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.cognition.critic.eval.end
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      state_id: str
+      outcome: str
+      activation_ref: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.cognition.reasoner.reason.start
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      state_id: str
+      activation_ref: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.cognition.reasoner.reason.end
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      state_id: str
+      outcome: str
+      activation_ref: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.cognition.prompt_assembler.assemble.start
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      state_id: str
+      template_id: str
+      variant: str
+      activation_ref: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.cognition.prompt_assembler.assemble.end
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      state_id: str
+      template_id: str
+      section_count: int
+      variant: str
+      activation_ref: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.cognition.synthesizer.merge
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      state_id: str
+      activation_ref: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.cognition.skill_router.route
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      state_id: str
+      decision_path: str
+      activation_ref: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.cognition.memory.read
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      state_id: str
+      outcome: str
+      activation_ref: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.cognition.memory.write
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      state_id: str
+      outcome: str
+      activation_ref: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  # ── Body（PR-3）─────────────────────────────────────────────
+  - category: spine.body.tool.execute.start
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      tool_name: str
+      invocation_id: str
+      attempt: int
+      activation_ref: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.body.tool.execute.end
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      tool_name: str
+      invocation_id: str
+      attempt: int
+      outcome: str
+      activation_ref: str
+      # 工具结果成败(由 commit_body_tool_execute_end 在 outcome=failure 时写入)。
+      # 第一性原则:成败字段不允许默认值,fold binding 据此与
+      # step.tool_result.record 互相对账,避免 journal.tool_result.ok
+      # 与 phase.tool.call.end.ok 出现矛盾。
+      ok: bool
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.body.tool.retry
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      tool_name: str
+      invocation_id: str
+      attempt: int
+      reason: str
+      activation_ref: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.body.sandbox.enter
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      invocation_id: str
+      tool_name: str
+      activation_ref: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.body.sandbox.exit
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      invocation_id: str
+      tool_name: str
+      outcome: str
+      activation_ref: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  # ── Lifecycle normalization（PR-3，ADR-0166 S5）───────────────
+  - category: spine.lifecycle.finally
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      boundary: str
+      trace_id: str
+      activation_ref: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  # ── LLM（PR-3）──────────────────────────────────────────────
+  - category: spine.llm.call.start
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      model: str
+      stream: bool
+      prompt_preview: str
+      activation_ref: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.llm.call.end
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      model: str
+      stream: bool
+      outcome: str
+      activation_ref: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.llm.stream.token
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      model: str
+      text_delta: str
+      seq: int
+      channel_kind: str
+      activation_ref: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.llm.stream.stall
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      model: str
+      idle_ms: int
+      seq: int
+      activation_ref: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.llm.tool_call.streaming
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      model: str
+      tool_name: str
+      invocation_id: str
+      activation_ref: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.llm.request.header
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.model_visible.SpineLlmRequestHeaderPayload
+    fields:
+      step_id: str
+      incarnation: int
+      config: json
+      system: str
+      tools: json
+      messages: json
+      manifest: json
+      reason: str
+      previous_header_digest: str
+    publishers:
+      - events.model_visible.publisher
+
+  - category: spine.llm.request.header.assistant
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.model_visible.SpineLlmRequestHeaderAssistantPayload
+    fields:
+      step_id: str
+      incarnation: int
+      assistant_content: str
+      tool_calls: json
+      finish_reason: str
+      usage: json
+      header_digest: str
+    publishers:
+      - events.model_visible.publisher
+
+  # ── Exception（PR-3）─────────────────────────────────────────
+  - category: spine.exception.caught
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      boundary: str
+      exc_type: str
+      message: str
+      trace_id: str
+      activation_ref: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.exception.finally
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      boundary: str
+      trace_id: str
+      outcome: str
+      activation_ref: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  # ── Runtime observed（PR-3 与 exception 一起迁，PR-6 新加 runtime.observed 类别）──
+  - category: spine.runtime.reducer.apply
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      method: str
+      phase: str
+      outcome: str
+      activation_ref: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.runtime.checkpoint.create
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      plan_ref: str
+      state_ref: str
+      node_id: str
+      outcome: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.runtime.resume.start
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      plan_ref: str
+      state_ref: str
+      node_id: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.runtime.resume.end
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      plan_ref: str
+      state_ref: str
+      node_id: str
+      outcome: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.runtime.event_publisher.publish
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      event_type: str
+      trace_id: str
+      outcome: str
+      activation_ref: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  # ── Transport（PR-4）─────────────────────────────────────────────
+  - category: spine.transport.route.enter
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      path: str
+      method: str
+      run_id: str
+      activation_ref: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.transport.route.exit
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      path: str
+      method: str
+      run_id: str
+      outcome: str
+      activation_ref: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.transport.sse.publish
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      path: str
+      run_id: str
+      activation_ref: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  # ── Kernel lifecycle（PR-4）─────────────────────────────────────
+  - category: spine.kernel.boot.start
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      profile: str
+      activation_ref: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.kernel.boot.completed
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      profile: str
+      outcome: str
+      activation_ref: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.kernel.run.start
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      run_id: str
+      trace_id: str
+      activation_ref: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.kernel.run.stop
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      run_id: str
+      trace_id: str
+      outcome: str
+      activation_ref: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.kernel.run.cancelled
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      run_id: str
+      trace_id: str
+      activation_ref: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  # ── Agent loop + agent + loop fork（PR-4）─────────────────────────
+  - category: spine.agent_loop.iteration.start
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      trace_id: str
+      role: str
+      iteration_kind: str
+      activation_ref: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.agent_loop.iteration.end
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      trace_id: str
+      role: str
+      iteration_kind: str
+      outcome: str
+      activation_ref: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.loop.fork
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      child_role: str
+      parent_step: int
+      activation_ref: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.agent.spawn
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      trace_id: str
+      role: str
+      agent_id: str
+      activation_ref: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.agent.iteration
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      trace_id: str
+      role: str
+      agent_id: str
+      iteration: int
+      activation_ref: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.agent.final
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      trace_id: str
+      role: str
+      agent_id: str
+      outcome: str
+      activation_ref: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  # ── Writable matrix（PR-5）───────────────────────────────────────
+  - category: spine.writable.step.start
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      step: int
+      run_id: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.writable.step.end
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      step: int
+      run_id: str
+      outcome: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.writable.segment.start
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      segment: int
+      step: int
+      run_id: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.writable.segment.end
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      segment: int
+      step: int
+      run_id: str
+      outcome: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.writable.iteration.halt
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      run_id: str
+      reason: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.writable.iteration.closing
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      run_id: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.writable.iteration.close
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      run_id: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  # ── Loop cursor record_*（ADR-0167 D2 / ADR-0181 PR-10）──────────
+  - category: spine.step.thinking.record
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      run_id: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.step.tool_call.record
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      run_id: str
+      tool_name: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.step.tool_result.record
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      run_id: str
+      tool_name: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.step.reflect.record
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      run_id: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.step.span.record
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      run_id: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.i17.rejected
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      attempted_ep: str
+      activation_ref: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.producer.failure
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      producer_name: str
+      key: str
+      activation_ref: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  # ── Phase（PR-5）────────────────────────────────────────────────
+  - category: spine.perceive.phase.fold
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      step: int
+      run_id: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.phase.perceive.fold
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      step: int
+      run_id: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.phase.think.fold
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      step: int
+      run_id: str
+      decision_path: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.phase.remember.fold
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      step: int
+      run_id: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.phase.stop.fold
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      step: int
+      run_id: str
+      outcome: str
+
+  - category: spine.terminal.commit
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      run_id: str
+      outcome: str
+      reason: str
+      final_output: str
+
+  - category: spine.body.deterministic_fail
+    plane: lca.contracts.event.Plane.STRUCTURAL
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      run_id: str
+      tool_name: str
+      error: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.phase.reflect.fold
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      step: int
+      run_id: str
+      lessons: int
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.phase.act.fold.start
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      step: int
+      run_id: str
+      tool_name: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.phase.act.fold.end
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      step: int
+      run_id: str
+      tool_name: str
+      outcome: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.phase.act.fold
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      step: int
+      run_id: str
+      tool_name: str
+      outcome: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.phase.tool.call.start
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      step: int
+      run_id: str
+      tool_name: str
+      invocation_id: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.phase.tool.call.end
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      step: int
+      run_id: str
+      tool_name: str
+      invocation_id: str
+      outcome: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.phase.tool.denied
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      step: int
+      run_id: str
+      tool_name: str
+      reason: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  # ── Phase graph（PR-5）──────────────────────────────────────────
+  - category: spine.phase_graph.node.start
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      node_id: str
+      run_id: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.phase_graph.node.end
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      node_id: str
+      run_id: str
+      outcome: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.phase_graph.edge.transit
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      from_node: str
+      to_node: str
+      run_id: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.phase_graph.subgraph.enter
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      plan_ref: str
+      entry_node: str
+      binding_edge: str
+      depth: int
+      outer_node_id: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.phase_graph.subgraph.exit
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      plan_ref: str
+      entry_node: str
+      outcome: str
+      depth: int
+      outer_node_id: str
+      error: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.phase_graph.instrument.coverage
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      covered_nodes: int
+      total_nodes: int
+      run_id: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  # ── Team（PR-6 新加）─────────────────────────────────────────
+  - category: spine.team.casting.started
+    plane: lca.contracts.event.Plane.STRUCTURAL
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      team_id: str
+      requested_roles: str
+      run_id: str
+      activation_ref: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.team.casting.completed
+    plane: lca.contracts.event.Plane.STRUCTURAL
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      team_id: str
+      selected_roles: str
+      run_id: str
+      activation_ref: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.team.casting.failed
+    plane: lca.contracts.event.Plane.STRUCTURAL
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      team_id: str
+      reason: str
+      run_id: str
+      activation_ref: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.team.delegation.issued
+    plane: lca.contracts.event.Plane.STRUCTURAL
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      team_id: str
+      callee_role: str
+      subtask: str
+      run_id: str
+      activation_ref: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.team.delegation.completed
+    plane: lca.contracts.event.Plane.STRUCTURAL
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      team_id: str
+      callee_role: str
+      subtask: str
+      outcome: str
+      run_id: str
+      activation_ref: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.team.delegation.cache_hit
+    plane: lca.contracts.event.Plane.STRUCTURAL
+    payload_class: lca_kernel.events.payloads.TeamDelegationCacheHit
+    fields:
+      callee_role: str
+      subtask: str
+      step: int
+      activation_ref: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.team.message.published
+    plane: lca.contracts.event.Plane.STRUCTURAL
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      team_id: str
+      sender: str
+      recipient: str
+      run_id: str
+      activation_ref: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  # ── Perception（PR-6）────────────────────────────────────────
+  - category: spine.perception.observe
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      run_id: str
+      source: str
+      activation_ref: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.perception.attention.focus
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      run_id: str
+      target: str
+      activation_ref: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.perception.attention.blur
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      run_id: str
+      target: str
+      activation_ref: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.perception.signal.detected
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      run_id: str
+      signal_kind: str
+      score: float
+      activation_ref: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.perception.fused
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      run_id: str
+      artifact_id: str
+      sources: str
+      activation_ref: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.perception.artifact.built
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      run_id: str
+      artifact_id: str
+      size_bytes: int
+      activation_ref: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  # ── Control（PR-6）──────────────────────────────────────────
+  - category: spine.control.dispatch
+    plane: lca.contracts.event.Plane.STRUCTURAL
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      run_id: str
+      target: str
+      intent: str
+      activation_ref: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.control.invoke
+    plane: lca.contracts.event.Plane.STRUCTURAL
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      run_id: str
+      target: str
+      activation_ref: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.control.signal
+    plane: lca.contracts.event.Plane.STRUCTURAL
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      run_id: str
+      name: str
+      activation_ref: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.control.approve.request
+    plane: lca.contracts.event.Plane.STRUCTURAL
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      run_id: str
+      request_id: str
+      intent: str
+      activation_ref: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.control.approve.response
+    plane: lca.contracts.event.Plane.STRUCTURAL
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      run_id: str
+      request_id: str
+      verdict: str
+      actor: str
+      activation_ref: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.control.deny
+    plane: lca.contracts.event.Plane.STRUCTURAL
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      run_id: str
+      request_id: str
+      reason: str
+      activation_ref: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.control.revoke
+    plane: lca.contracts.event.Plane.STRUCTURAL
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      run_id: str
+      target: str
+      activation_ref: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.control.pause
+    plane: lca.contracts.event.Plane.STRUCTURAL
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      run_id: str
+      reason: str
+      activation_ref: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.control.resume
+    plane: lca.contracts.event.Plane.STRUCTURAL
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      run_id: str
+      activation_ref: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.control.stop
+    plane: lca.contracts.event.Plane.STRUCTURAL
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      run_id: str
+      outcome: str
+      activation_ref: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.control.accept
+    plane: lca.contracts.event.Plane.STRUCTURAL
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      run_id: str
+      request_id: str
+      activation_ref: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  # ── Boot（PR-6）─────────────────────────────────────────────
+  - category: spine.boot.profile.resolved
+    plane: lca.contracts.event.Plane.STRUCTURAL
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      profile: str
+      plugins: int
+      activation_ref: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.boot.plugin.fiber.spawned
+    plane: lca.contracts.event.Plane.STRUCTURAL
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      plugin_id: str
+      layer: str
+      activation_ref: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.boot.observability.assembled
+    plane: lca.contracts.event.Plane.STRUCTURAL
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      sinks: int
+      derivers: int
+      activation_ref: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  # ── Runtime observed（PR-6）──────────────────────────────────
+  - category: spine.runtime.observed
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      observed_at: str
+      detail: str
+      run_id: str
+      activation_ref: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.runtime.diagnostic
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      category: str
+      operation: str
+      plugin: str
+      status: str
+      attributes: dict
+      output: dict
+      activation_ref: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  # ── Fact plane（ADR-0192）──────────────────────────────────────
+  - category: spine.phase.fact
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      plan_ref: str
+      node_ref: str
+      fact_id: str
+      kind: str
+      payload: dict
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.phase.evidence
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      plan_ref: str
+      evidence_ref: str
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway
+
+  - category: spine.effect.receipt
+    plane: lca.contracts.event.Plane.OBSERVABILITY
+    payload_class: lca_kernel.events.payloads.spine.SpineEventPayload
+    fields:
+      plan_ref: str
+      observation_type: str
+      observation: dict
+    publishers:
+      - lca.loop.fact_gateway.DefaultFactGateway

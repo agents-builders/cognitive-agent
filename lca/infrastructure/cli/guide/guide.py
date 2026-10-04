@@ -1,0 +1,259 @@
+"""CLI banner — printed by ``lca-ops`` with no subcommand and as ``--help``.
+
+Single source of truth for the operator-facing quick reference. Lives
+outside :mod:`lca.infrastructure.cli.cli` so the entry module stays small
+(register commands + typer wiring only) and so other surfaces (e.g.
+docs, scripts) can import the banner text without pulling typer.
+"""
+
+from __future__ import annotations
+
+GUIDE = """\
+LCA 开发平台编排  ./scripts/lca-ops
+
+日常只记三句
+  ./scripts/lca-ops status     看现在怎样
+  ./scripts/lca-ops heal       有问题就修，不用再拆命令
+  ./scripts/lca-ops logs       跟 journal 事实流
+
+────────────────────────────────
+全站
+────────────────────────────────
+status
+  看 kernel_serve / infra / lobehub / daemon / onlyboxes。异常会写出原因。
+  onlyboxes 未钉 LCA terminal 镜像时会提示 configure-terminal-runtime。
+  kernel_serve 是 LCA 后端进程 (lca_kernel serve :8765)。
+  本地便捷入口只有一个: lca-ops kernel-restart(自动跑 boot check + fiber 报告 + health probe)。
+  ./scripts/lca-ops status
+  ./scripts/lca-ops status --json          给 agent 用
+
+heal
+  自己把不健康的服务拉起来（复用已有容器、重启过期 lobehub、连 daemon）。
+  ./scripts/lca-ops heal
+
+────────────────────────────────
+日志  journal logs
+────────────────────────────────
+  ./scripts/lca-ops journal logs              tail 最新 run 的 spine ledger
+  ./scripts/lca-ops journal logs -v           + 完整 payload + offloaded sidecar traceback
+  ./scripts/lca-ops journal logs -r <run_id>  离线回放指定 run 的 spine ledger
+  ./scripts/lca-ops journal logs lobehub      Next.js :3010 日志
+  ./scripts/lca-ops journal logs lobehub-spa  Vite :9876 日志（模块 504/缺文件先看此）
+  ./scripts/lca-ops journal logs daemon       sandbox 连接器日志
+  ./scripts/lca-ops logs                      (alias → journal logs)
+
+  事实（decision / step / tool / llm）→ 观察（insight：冗余/循环/成本/关键路径）
+  模型可见的一切都可从 journal 重建。
+
+────────────────────────────────
+单服务（lca-ops 只管外部平台服务）
+────────────────────────────────
+infra      postgres / redis / s3
+  动作    start | stop | status
+  start   端口不通才 docker compose up，不拆已有 lobe-postgres
+  ./scripts/lca-ops infra start
+
+lobehub    Next 前端 :3010 + Vite SPA :9876
+  日志    .lca-ops/lobehub.log（Next）/ .lca-ops/lobehub-spa.log（Vite）
+  排障    docs/debug/lobehub-frontend-debug.md（闪错/无限刷新/504 Outdated Optimize Dep）
+  动作    start | stop | restart | status | ensure
+  ensure  同步源码 / 打补丁 / 写 .env / bun install，不启进程
+          ⚠ ensure 是 short-circuit（hash 没变就不重打）；
+            强制重打源码补丁 → python3 deploy/lobehub/patch_lobehub.py
+            强制重打 pnpm patches → rm .lca-ops/lobehub-pnpm-patches.marker && ensure
+  ./scripts/lca-ops lobehub restart
+
+daemon     sandbox-user 连接器
+  日志    /home/sandbox-user/.lca/daemon.log
+  动作    start | stop | restart | status | ensure
+  ensure  感知源码变更 → 自动重建部署 packages/lca-cli
+  整机首次  ./scripts/lca-ops provision
+  ./scripts/lca-ops daemon restart
+
+onlyboxes  worker runtime(只读;无 start/stop 命令)
+  ./scripts/lca-ops status --json  看 onlyboxes 详情
+
+────────────────────────────────
+工作流(全站)
+────────────────────────────────
+status     看 kernel_serve + infra / lobehub / daemon / onlyboxes,JSON 加 --json
+heal       自己修不健康的服务(只补缺失,不重启 healthy)。kernel-restart 用于本地改完代码后。
+stop       停外部平台服务(daemon / lobehub / infra),不含 LCA 进程
+provision  整机首次:装包 / venv / sandbox 用户 / 工作区 / CLI
+
+  注: dev / compose 已删除(ADR-0119 决定 4)。
+      本地便捷 LCA 重启走 ``kernel-restart`` 子命令(SIGTERM + spawn)。
+
+────────────────────────────────
+LCA 进程 (kernel serve)  ADR-0119 决定 4
+────────────────────────────────
+lca-ops 不长管 LCA 进程(K6 ``lca_kernel.lifecycle`` 只负责
+SIGTERM/SIGINT LIFO dispose)。本地改完代码 / 换 profile / 强制刷新:
+
+  ./scripts/lca-ops kernel-restart   # 唯一便捷入口: SIGTERM → 等 K6 dispose
+                                     # → spawn → 自动跑 boot check + fiber
+                                     # report + health probe,失败 fail-loud
+
+  # 只校验 profile(不拉起进程)
+  ./scripts/lca-ops kernel_check [profile_path] [--json]
+
+  # 导出 CompiledRunPlan
+  ./scripts/lca-ops kernel_compose [profile_path] [--json]
+
+  # 列 profile 会加载的 plugin(按 layer 分组)
+  ./scripts/lca-ops kernel_plugins [-p profile] [--layer L0,L1] [--id <plugin_id>] [--json]
+  # 读最新 kernel stderr,只解析 boot.pending_event
+  ./scripts/lca-ops kernel_boot_log [--stderr <path>] [--failed-only] [--json]
+
+  # LCA 进程出问题 → 看 journal 而非 restart
+  ./scripts/lca-ops logs
+  ./scripts/lca-ops explain <run_id>
+  ./scripts/lca-ops diagnose <alias>
+
+  已退役(跑会 fail-loud 提示换 kernel-restart):
+    lca-ops kernel_serve   # 只 print 命令,从未真启动 — 已合并进 kernel-restart
+    lca-ops kernel-boot    # block 到 SIGINT、无 HTTP — 调试 profile 用 kernel_check
+
+────────────────────────────────
+Run 触发  创建新 run（carrier-aligned，唯一入口）
+────────────────────────────────
+  ./scripts/lca-ops runs create --user-text "..."   # 走 POST /runs，返回 run_id + trace_id
+  ./scripts/lca-ops runs create --user-text "..." --wait   # 阻塞直到 terminal
+  ./scripts/lca-ops runs create --user-text "..." --json    # 原始 carrier receipt
+  # --wait 仍可用(轮询 /runs/{id}/doctor 到 terminal),但只在你需要脚本里
+  # 拿到 terminal verdict 再继续时才加;调试 run 时建议直接看图,不阻塞。
+
+  # 调试 run 的标准剧本 - 第一步永远是 runs debug
+  # 1) 第一步:`runs debug` 按 layer 一次性输出,默认 graph + JSON,JSON 含 `next_layer_hint` 指引下一步。
+  ./scripts/lca-ops runs debug <run_id>                       # 顶层 orchestrator,直读 spine 五个 layer 的 projection
+  #    layer 列表(每个 layer 一行,默认 graph):
+  #      summary  - run 级计数 + terminal_outcome + anomalies_present,先判断要不要继续
+  #      graph    - 节点骨架 + 每个节点的真实 input/output + reducer 决策 + llm/tool_call 响应 + 自动根因标记
+  #      events   - 按 seq 排序的原始 spine 行(payload_keys 一览,适合 grep 后再下钻)
+  #      diff     - 计划蓝图 vs 实际执行节点(missing / unexpected),需要 blueprint.json
+  #      explain  - 第一个失败节点 + 上下文,定位根因后告诉调用者该看哪个 layer
+  #    agent 直接拿 JSON;人类加 `--output human` 看树形。
+  # 2) 下钻 / 专家路径 - 当 runs debug 的 hint 指向更深切片,或需要 HTML / 7 段摘要 / 旧入口时:
+  ./scripts/lca-ops debug-graph <run_id>                  # 与 runs debug layer=graph 等价,旧入口,保留
+  ./scripts/lca-ops timeline <run_id>                     # = observation run-replay --show-graph,纯图骨架,轻量
+  ./scripts/lca-ops debug-run <run_id>                    # 8 段诊断(读 journal.json,某些 run 缺失)
+  ./scripts/lca-ops journal trace <run_id>                # spine ledger 全量(grep 友好)
+  ./scripts/lca-ops journal trajectory <run_id>           # DSH 风格 HTML waterfall
+  ./scripts/lca-ops observation trace-show <run_id>       # observation fact 过滤(--node / --kind / --seq)
+  ./scripts/lca-ops observation run-replay <run_id>       # observation 时间序回放(默认 --show-graph)
+  ./scripts/lca-ops observation run-explain <run_id>      # observation summary + root_cause_chain + next_actions
+  ./scripts/lca-ops observation plan-show <ref>           # 显示 plan blueprint(预期图)
+
+  HTTP 等价（外部脚本用）：
+  curl -X POST http://192.0.2.10:8765/runs -H 'Content-Type: application/json' \
+    -d '{"messages":[{"role":"user","content":"..."}],"mode":"solo","agent":"agt_aVxY6ag9MbMc"}'
+
+  ❌ /v1/chat/completions 不是 run 创建入口——它是 LobeHub webui 的 OpenAI 兼容
+     代理（ADR-0099），不会注册 run_id，也不会写 traces/runs/<id>/。需要可调试的
+     run 必须走 POST /runs（包装见 lca-ops runs create）。
+
+────────────────────────────────
+Run 端到端  验证浏览器 wire 是否可达(ADR-0100)
+────────────────────────────────
+  ./scripts/lca-ops e2e timeline            # POST {frontend}/lca-api/runs + SSE /live
+  ./scripts/lca-ops e2e timeline --json     # 先打印 env,再驱动脚本
+
+  # 已退役(跑会 fail-loud 指向等价命令):
+  #   lca-ops e2e boot       # boot + compile + spawn + (默认无 HTTP)
+  #                          # 等价三件套:
+  #                          #   ./scripts/lca-ops kernel-restart    # boot check + fiber + health
+  #                          #   ./scripts/lca-ops plan compile      # v2 CompiledRunPlan 投影
+  #                          #   ./scripts/lca-ops e2e timeline      # 浏览器 wire smoke
+
+  默认 LCA_FRONTEND_URL=http://192.0.2.10:3010、LCA_TOKEN=lca-local。
+  /lca-api/runs 前缀经 Next rewrite → gateway /runs;纯 gateway 端口
+  (:8765) 不响应这条路径,跑不通时先看 frontend_url 是否可达。
+
+────────────────────────────────
+Run 复盘  coding-agent tools(ADR-0065 §六 / PR-9,只读)
+────────────────────────────────
+  7 个只读工具 —— trace / explain / optimize / graph-run / minimal-repro /
+  diff-context / diff-runs / cost。默认走人类可读,加 --json 给 agent。
+  ./scripts/lca-ops trace <run_id>           通用轨迹
+  ./scripts/lca-ops explain <run_id>         失败路径投影
+  ./scripts/lca-ops explain control <phase>  解析 profile 的声明式控制贡献
+  ./scripts/lca-ops optimize <run_id>        优化候选(延迟/token/重试)
+  ./scripts/lca-ops graph-run <run_id>       Mermaid 插件交互图
+  ./scripts/lca-ops minimal-repro <run_id>   失败因果链 + evidence refs
+  ./scripts/lca-ops diff-context <run_id>    同 run step 上下文
+  ./scripts/lca-ops diff-runs <a> <b>        两次 run 对比
+  ./scripts/lca-ops cost <run_id>            LlmCallCompleted 成本累加
+  ./scripts/lca-ops evidence <run_id> <ref>  查 state_ref → evidence payload
+
+  driver-debug 子集 —— think 子图流式 fail-loud 信号(从 stderr 还原):
+  ./scripts/lca-ops debug-credentials         .env 加载 + LLM adapter 形态
+  ./scripts/lca-ops debug-factories <profile>  plan spec 里所有 factory 解析状态
+  ./scripts/lca-ops debug-driver-chain <run>  从 stderr 还原节点执行链
+  ./scripts/lca-ops debug-short-circuits      当前 kernel 的 fail-loud 信号
+
+  diagnose <alias> 已内置 4 个 alias:model-not-seen / loop-stuck /
+  memory-poisoned / approval-rejected(看 DIAGNOSE_HINTS 拿修复建议)。
+
+────────────────────────────────
+事件投递诊断  ADR-0184(进程内计数器)
+────────────────────────────────
+  ./scripts/lca-ops events-delivery            按 category 的 published/persisted/delivered/dropped
+  ./scripts/lca-ops events-delivery --json     给 agent
+  ./scripts/lca-ops events-delivery --category spine.cognition.brain.think.start
+  计数器是 EventBus 进程内内存;独立 CLI 进程显示自己的快照。
+
+────────────────────────────
+Audit 测量网  ADR-0074 PR-0（只读）
+────────────────────────────
+  4 个 AST 扫描器,让 reviewer 一行命令看清 hardcode 在哪。
+  默认走人类可读,加 --json 给 agent。有发现时 exit 1（CI 可识别）。
+  ./scripts/lca-ops audit-control-surface  Control Slot 投稿分布 + 缺 control 段
+  ./scripts/lca-ops audit-state-writers     state.* 写入点(Reducer 单写校验基线)
+  ./scripts/lca-ops audit-direct-commands   Body 直接 import sandbox/transport 的路径
+  ./scripts/lca-ops audit-hook-attach       hooks.trigger / middleware_bag / _emit 残留
+  ./scripts/lca-ops audit-plugin-shape      lca/plugins/* 单 Manifest 范式(effects 缺失 + 双形态残留 + 同 id 镜像)
+
+────────────────────────────
+类型检查  Mypy + Pyright（IDE 爆红一键扫）
+────────────────────────────
+  VS Code 同时开 Mypy 扩展 + Pylance 会重复报；CLI 用本命令对齐两边。
+  Ruff 不管类型；lazy re-export 改完跑 ``--focus lazy-import`` 验证。
+  ./scripts/lca-ops typecheck                      全量 lca + lca_kernel（mypy + pyright）
+  ./scripts/lca-ops typecheck --focus callable     只看 not callable / reportCallIssue
+  ./scripts/lca-ops typecheck --focus lazy-import  lazy import / object 属性类
+  ./scripts/lca-ops typecheck --json               给 agent 的结构化输出
+  ./scripts/lca-ops typecheck --mypy-only lca/agent
+  ./scripts/lca-ops typecheck --pyright-only       仅 Pylance 同款引擎
+
+  ./scripts/lca-ops status-adr-supervision   一命令看 ADR-0066/0067/0068/0069/0074 监督状态
+                                              = 验证 tracker.md 一致性 + 输出当前历史迁移基线
+                                              (实现了 tracker 即实现 5 ADR)
+
+  Agent Notes (docs/notes/) 门禁 + 诊断（只读，老 ADR 一律不动；详见 docs/notes/README.md）
+  ./scripts/lca-ops notes-check       docs/notes/ 三态 + class 闭集 + filename + Alternatives considered 门禁
+  ./scripts/lca-ops notes-audit       ADR 健康体检（只读），写到 docs/notes/audit-YYYY-MM-DD.md
+  ./scripts/lca-ops notes-slop        docs/ 内 stale-time / change-log 散文扫描
+  ./scripts/lca-ops notes-list        枚举 docs/notes/ 现有 note（--json 给 agent）
+
+────────────────────────────────
+Composio（LCA-native OAuth，读 .env COMPOSIO_API_KEY）
+────────────────────────────────
+  ./scripts/lca-ops composio status
+  ./scripts/lca-ops composio connect google-drive
+  ./scripts/lca-ops composio refresh google-drive
+  ./scripts/lca-ops composio migrate --database-url $DATABASE_URL
+
+  OAuth callback（自动 refresh，无需手动 composioRefresh）:
+  http://192.0.2.10:8765/composio/oauth/callback
+
+────────────────────────────────
+通用参数
+────────────────────────────────
+  --json           结构化 JSON（agent）
+  -q / --quiet     少说话
+  -c PATH          配置，默认 ./lca-ops.yaml
+  密码文件         .lobehub-stack/sudo.pass
+"""
+
+
+__all__ = ["GUIDE"]

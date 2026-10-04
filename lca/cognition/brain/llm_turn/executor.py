@@ -1,0 +1,195 @@
+"""Single LLM turn executor — LobeHub ``call_llm`` / ``callLlmFinalizer`` parity.
+
+One cognitive step = exactly one LLM round-trip. The response (text, tool_calls,
+or both) is passed unchanged to ``llm_result`` / ``ModularBrain``.
+
+Forbidden (removed): second completion with ``tool_choice=required`` after a
+text-only stream — that broke G2A Mode A and caused search_skill loops.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+import structlog
+
+from lca.cognition.brain.llm_turn.mode import LlmTurnMode
+from lca.cognition.brain.llm_turn.policy import build_llm_call_kwargs, resolve_llm_turn_mode
+from lca.cognition.brain.prompt.tool_call_stream import (
+    mark_slot_done,
+    parse_completed_slot_args,
+    pop_completed_slots,
+    push_tool_call_stream,
+)
+from lca.contracts.atoms.enums.enums import LLMStreamEventType
+from lca.contracts.models.core.conversation.llm import LLMResponse
+from lca.contracts.models.core.state.state import AgentState
+from lca.contracts.models.observability.tool.journal_receipt import tool_call_resolved_receipt
+from lca.contracts.models.team.partial.buffer import append_run_partial
+from lca.contracts.protocols import LLMAdapter, Tool
+from lca.infrastructure.session.bindings import (
+    await_model_request_checkpoint,
+    resolve_session_reader,
+)
+from lca.infrastructure.session.history import derive_turn_history
+
+_log = structlog.get_logger(__name__)
+
+_EMPTY_STREAM_COMPLETE_RETRIES = 2
+_POST_SEARCH_COMPLETE_RETRIES = 3
+
+
+async def execute_llm_turn(
+    llm: LLMAdapter,
+    tools: list[Tool],
+    prompt: str,
+    *,
+    step: int,
+    state: AgentState,
+    task: str = "",
+    cursor: Any = None,
+    reasoner_prompt: Any = None,
+) -> LLMResponse:
+    """Run one LobeHub-aligned ``call_llm`` turn.
+
+    spec section H ContextVar deletion: ``cursor`` + ``reasoner_prompt``
+    are explicit kwargs forwarded to ``llm.complete`` / ``llm.stream``.
+    :class:`ModelVisibleHookAdapter` pops them from kwargs before passing
+    the rest to the inner LLM, and forwards them to
+    :class:`ModelVisibleHook` for fold + publish.
+    """
+    mode = resolve_llm_turn_mode(state)
+    llm_kwargs = build_llm_call_kwargs(state=state, task=task)
+    if cursor is not None:
+        llm_kwargs["cursor"] = cursor
+    if reasoner_prompt is not None:
+        llm_kwargs["reasoner_prompt"] = reasoner_prompt
+    session = resolve_session_reader()
+    llm_kwargs["history"] = derive_turn_history(session)
+    await await_model_request_checkpoint()
+    if mode == LlmTurnMode.SUMMARIZE:
+        return await _summarize_after_search(llm, tools, prompt, step=step, llm_kwargs=llm_kwargs)
+    return await _stream_turn(llm, tools, prompt, step=step, llm_kwargs=llm_kwargs, state=state)
+
+
+def _handle_output_text_chunk(chunk: str) -> None:
+    """ADR-0248 唯一声道：gated 模式下文本散文截流进 scratchpad，抑制向前端直出。"""
+    from lca.infrastructure.runtime_plane.capability_bindings import current_bindings_view
+
+    view = current_bindings_view()
+    if view is not None and getattr(view, "vocal_mode", "direct") == "gated":
+        gate = getattr(view, "vocal_gate", None)
+        if gate is not None and hasattr(gate, "handle_text_chunk"):
+            gate.handle_text_chunk(chunk)
+            return
+    append_run_partial(chunk)
+
+
+async def _summarize_after_search(
+    llm: LLMAdapter,
+    tools: list[Tool],
+    prompt: str,
+    *,
+    step: int,
+    llm_kwargs: dict[str, object],
+) -> LLMResponse:
+    """Stream the post-search summarization so journal emits StepTextDelta / ReasoningDelta."""
+    for attempt in range(_POST_SEARCH_COMPLETE_RETRIES):
+        accumulated = ""
+        stream_response: LLMResponse | None = None
+        async for event in llm.stream(prompt, tools=tools, step=step, **llm_kwargs):
+            if event.type == LLMStreamEventType.OUTPUT_TEXT_DELTA:
+                chunk = event.text or ""
+                accumulated += chunk
+                _handle_output_text_chunk(chunk)
+            elif event.type == LLMStreamEventType.COMPLETED and event.response is not None:
+                stream_response = event.response
+                break
+
+        response = (
+            _merge_stream_response(stream_response, accumulated)
+            if stream_response is not None
+            else LLMResponse(text=accumulated)
+            if accumulated.strip()
+            else LLMResponse(text="")
+        )
+        text = (response.text or "").strip()
+        if text or response.tool_calls:
+            return response
+        _log.warning("llm_turn_post_search_empty", step=step, attempt=attempt)
+    return LLMResponse(text="")
+
+
+async def _stream_turn(
+    llm: LLMAdapter,
+    tools: list[Tool],
+    prompt: str,
+    *,
+    step: int,
+    llm_kwargs: dict[str, object],
+    state: AgentState | None = None,
+) -> LLMResponse:
+    accumulated = ""
+    stream_response: LLMResponse | None = None
+    tool_slots: dict[str, dict[str, object]] = {}
+    async for event in llm.stream(prompt, tools=tools, step=step, **llm_kwargs):
+        if event.type == LLMStreamEventType.OUTPUT_TEXT_DELTA:
+            chunk = event.text or ""
+            accumulated += chunk
+            _handle_output_text_chunk(chunk)
+
+        elif event.type == LLMStreamEventType.FUNCTION_CALL_ARGUMENTS_DELTA:
+            push_tool_call_stream(
+                tool_slots,
+                tool_name=event.tool_name,
+                tool_call_id=event.tool_call_id,
+                arguments_delta=event.arguments_delta or "",
+            )
+        elif event.type == LLMStreamEventType.FUNCTION_CALL_ARGUMENTS_DONE:
+            if event.tool_call_id:
+                mark_slot_done(tool_slots, str(event.tool_call_id))
+        elif event.type == LLMStreamEventType.COMPLETED and event.response is not None:
+            stream_response = event.response
+            break
+
+    # args 收齐才 commit 一次 tool.call.resolved.v1;旧"每 delta 一次 ToolCallStreaming"
+    # 是 UI 信号误入事实账本,本批废 (前置步骤 ToolCallStreaming 已被删除)。
+    if tool_slots:
+        from lca.loop.commit.tool_journal import commit_tool_journal_receipt
+
+        for slot in pop_completed_slots(tool_slots):
+            receipt = tool_call_resolved_receipt(
+                tool_name=str(slot["tool_name"]),
+                tool_call_id=str(slot["tool_call_id"]),
+                arguments=parse_completed_slot_args(str(slot["raw"])),
+            )
+            commit_tool_journal_receipt(receipt, state=state)
+
+    if stream_response is not None:
+        return _merge_stream_response(stream_response, accumulated)
+
+    text = accumulated.strip()
+    if text:
+        return LLMResponse(text=accumulated)
+
+    for attempt in range(_EMPTY_STREAM_COMPLETE_RETRIES):
+        _log.warning("llm_turn_stream_empty_fallback", step=step, attempt=attempt)
+        response = await llm.complete(prompt, tools=tools, step=step, **llm_kwargs)
+        if response.text or response.tool_calls:
+            return response
+    return LLMResponse(text="")
+
+
+def _merge_stream_response(stream_response: LLMResponse, accumulated: str) -> LLMResponse:
+    """Prefer provider COMPLETED payload; fill missing text from streamed deltas."""
+    if stream_response.tool_calls or (stream_response.text or "").strip():
+        return stream_response
+    text = accumulated.strip()
+    if text:
+        return LLMResponse(
+            text=accumulated,
+            model=stream_response.model,
+            tool_calls=stream_response.tool_calls,
+            usage=stream_response.usage,
+        )
+    return stream_response

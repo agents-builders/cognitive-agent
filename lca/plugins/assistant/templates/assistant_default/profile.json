@@ -1,0 +1,10 @@
+{
+  "name": "{{ name }}",
+  "description": "{{ description }}",
+  "emoji": "🤖",
+  "status": "active",
+  "opening_message": "",
+  "locale": "zh-CN",
+  "model": "",
+  "runtime": {}
+}

@@ -1,0 +1,140 @@
+"""tools seam Definition — owns ctx.tools.
+
+Registry of tool factories. Each factory ``bind(s)``s a run's bindings
+(plane / file_store / sandbox / workspace) into a concrete ``Tool``.
+Consumers
+(loop / body) receive the forked per-run registry, never a process-global
+tool table.
+
+Providers register factories via ``register_factory``; ``fork_for_run``
+materializes them for one run.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from typing import Generic, TypeVar
+
+from lca.contracts.models.cognition.boundary import BindingsView
+from lca.contracts.protocols import Tool, ToolRegistry
+
+T = TypeVar("T", bound=Tool)
+
+
+class ToolFactory(Generic[T]):
+    """A tool factory bound to run bindings."""
+
+    name: str
+    description: str
+
+    def bind(self, bindings: BindingsView) -> T | None:
+        """Materialize a concrete tool for one run, or None to skip."""
+        raise NotImplementedError
+
+
+_Factory = Callable[[BindingsView], Tool | list[Tool] | None]
+
+
+class ToolsService(ToolRegistry):
+    """Service Definition：工具工厂注册表 + 每 Run 实例化。
+
+    ``register_factory`` 是唯一的 provider 挂载点；
+    ``fork_for_run`` 对每个工厂 bind 出一份只含本 run 实例的注册表。
+    禁止在 bind 之外调用 resolve_machine() / resolve_sandbox()。
+    """
+
+    def __init__(self) -> None:
+        self._factories: dict[str, _Factory] = {}
+        self._tools: dict[str, Tool] = {}
+
+    def register_factory(self, name: str, factory: _Factory) -> Callable[[], None]:
+        """Register a tool factory. Returns its disposer."""
+        if name in self._factories:
+            raise KeyError(f"tools: factory {name!r} already registered")
+        self._factories[name] = factory
+        disposed = False
+
+        def disposer() -> None:
+            nonlocal disposed
+            if disposed:
+                return
+            disposed = True
+            self._factories.pop(name, None)
+            self._tools.pop(name, None)
+
+        return disposer
+
+    def register(self, tool: Tool) -> None:
+        """Legacy path: register a pre-built tool instance directly.
+
+        ADR-0256 fail-fast: a tool without a declared non-empty
+        ``namespace`` is rejected here — at wiring time — instead of
+        surfacing later inside ``ToolDeferSession.update_turn``.
+        """
+        namespace = getattr(tool, "namespace", "")
+        if not namespace:
+            raise ValueError(
+                f"cannot register tool {tool.name!r}: missing non-empty "
+                "'namespace' (ADR-0256: namespace is factory-declared "
+                "metadata required for defer/wire gating)"
+            )
+        self._tools[tool.name] = tool
+
+    def unregister(self, name: str) -> Tool | None:
+        """Unregister a pre-built tool instance directly."""
+        return self._tools.pop(name, None)
+
+    def get(self, name: str) -> Tool | None:
+        return self._tools.get(name)
+
+    def fork_for_run(self, bindings: BindingsView) -> ToolsService:
+        """Fork a per-run registry: bind every factory against *bindings*.
+
+        The forked registry holds only this run's concrete instances. A
+        factory may return a single ``Tool``, a list of tools, or None.
+        Factories receive the typed ``BindingsView`` so per-run refs are
+        statically known (ADR-0220 §4.1).
+        """
+        forked = ToolsService()
+        for name, factory in self._factories.items():
+            bound = factory(bindings)
+            if bound is None:
+                continue
+            if isinstance(bound, list):
+                for tool in bound:
+                    forked._tools[f"{name}:{tool.name}"] = tool
+            else:
+                forked._tools[name] = bound
+        forked._tools.update(self._tools)
+        return forked
+
+    def names(self) -> list[str]:
+        return sorted(set(self._factories) | set(self._tools))
+
+    def list_tools(self) -> list[Tool]:
+        return list(self._tools.values())
+
+    def materialize(self, bindings: BindingsView | None = None) -> list[Tool]:
+        """Bind every factory against *bindings* and return concrete tools.
+
+        Tool ``name`` is kept as the factory produced it — no factory-id
+        prefix. A per-compose registry can then ``register`` these onto a
+        fresh ``ToolsService`` without mutating the boot-time table.
+        Accepts ``None`` for backwards-compat with tests that predate
+        BindingsView; production code paths use fork_for_run.
+        """
+        if bindings is None:
+            bindings = BindingsView()
+        out: list[Tool] = list(self._tools.values())
+        for factory in self._factories.values():
+            bound = factory(bindings)
+            if bound is None:
+                continue
+            if isinstance(bound, list):
+                out.extend(bound)
+            else:
+                out.append(bound)
+        from lca.infrastructure.observability.meta_event_emit import emit_tool_schema_published
+
+        emit_tool_schema_published(tuple(tool.name for tool in out))
+        return out

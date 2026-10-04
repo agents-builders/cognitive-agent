@@ -1,0 +1,245 @@
+"""角色模板注册表 + 引导式创建 BOOTSTRAP 完成流（ADR-0187 §3 D11/D12）。
+
+覆盖：
+
+- ``TEMPLATE_REGISTRY`` 6 个 template_id 全部可渲染，配置面文件齐全；
+- 每个角色模板的 profile.json emoji / SOUL 人设非空；
+- ``catalog.create`` 接受已登记角色模板，manifest.template_id 一致；
+- 未知 template_id ⇒ ``AssistantCatalogError``（fail-closed，不回落）；
+- ``seed_user_md`` 非空 ⇒ 删除 BOOTSTRAP.md + 发 ``assistant.bootstrap.completed``；
+- 无 ``seed_user_md`` ⇒ 保留 BOOTSTRAP.md、不发完成 EP。
+"""
+
+from __future__ import annotations
+
+import json
+from collections.abc import Mapping
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from lca.contracts.observability.closure.assistant_ep_closure import (
+    ASSISTANT_BOOTSTRAP_COMPLETED,
+    ASSISTANT_CREATED,
+)
+from lca.contracts.protocols.assistant.catalog import CreateAssistantRequest
+from lca.plugins.assistant.home._home_layout import (
+    CONFIG_FACE_FILES,
+    TEMPLATE_REGISTRY,
+    AssistantCatalogError,
+    known_template_ids,
+    render_template,
+)
+from lca.plugins.domain.assistant.catalog.plugin import AssistantCatalogImpl
+
+ROLE_TEMPLATES: tuple[str, ...] = (
+    "assistant.research",
+    "assistant.writing",
+    "assistant.coding",
+    "assistant.translation",
+    "assistant.daily",
+)
+
+TEMPLATES_DIR = Path(__file__).resolve().parents[3] / "lca/plugins/assistant/templates"
+
+
+@pytest.fixture
+def emitted() -> list[tuple[str, dict[str, Any]]]:
+    return []
+
+
+@pytest.fixture
+def catalog(tmp_path: Path, emitted: list[tuple[str, dict[str, Any]]]) -> AssistantCatalogImpl:
+    def _record(event: str, payload: Mapping[str, Any]) -> None:
+        emitted.append((event, dict(payload)))
+
+    return AssistantCatalogImpl(root=tmp_path, event_emitter=_record)
+
+
+class TestTemplateRegistry:
+    def test_registry_contains_default_and_five_roles(self) -> None:
+        assert set(known_template_ids()) == {
+            "assistant.default",
+            *ROLE_TEMPLATES,
+        }
+
+    @pytest.mark.parametrize("template_id", sorted(TEMPLATE_REGISTRY))
+    def test_render_template_produces_all_config_face_files(self, template_id: str) -> None:
+        rendered = render_template(template_id, name="小助", description="测试职责")
+        for entry in CONFIG_FACE_FILES:
+            assert entry in rendered.files, f"{template_id} 缺 {entry}"
+        assert rendered.files["BOOTSTRAP.md"].strip()
+        assert "主机映射" in rendered.files["TOOLS.md"]
+        assert "MEMORY.md" not in rendered.files
+        assert "测试职责" in rendered.files["profile.json"]
+        assert "IDENTITY.md" in rendered.files
+        assert "小助" in rendered.files["IDENTITY.md"]
+        assert "memory/people/INDEX.md" in rendered.files
+        assert "memory/groups/INDEX.md" in rendered.files
+        assert "dreams/alignment/derived/ALIGNMENT_SYNTHESIS.md" in rendered.files
+        assert "约定" in rendered.files["AGENTS.md"] and "教训" in rendered.files["AGENTS.md"]
+        assert (
+            "Who this user is and how to act for them"
+            in rendered.files["dreams/alignment/derived/ALIGNMENT_SYNTHESIS.md"]
+        )
+        assert "Notes" in rendered.files["USER.md"]
+
+    @pytest.mark.parametrize("template_id", ROLE_TEMPLATES)
+    def test_role_template_profile_carries_emoji_and_soul(self, template_id: str) -> None:
+        rendered = render_template(template_id, name="角色", description="角色职责")
+        profile = json.loads(rendered.files["profile.json"])
+        assert profile["emoji"].strip(), f"{template_id} 缺 emoji"
+        assert rendered.files["SOUL.md"].strip()
+        goals = rendered.files["goals.yaml"]
+        assert "name:" in goals, f"{template_id} goals.yaml 应含具体目标"
+
+    def test_render_unknown_template_raises(self) -> None:
+        with pytest.raises(AssistantCatalogError, match="template_id"):
+            render_template("assistant.nonexistent", name="x", description="")
+
+
+class TestPlanYamlTemplate:
+    """每个模板目录都必须有默认 plan.yaml（render_template 依赖它）。"""
+
+    @pytest.mark.parametrize("template_id", sorted(TEMPLATE_REGISTRY))
+    def test_template_dir_has_default_plan_yaml(self, template_id: str) -> None:
+        dir_name = TEMPLATE_REGISTRY[template_id]
+        plan_yaml = TEMPLATES_DIR / dir_name / "plan.yaml"
+        assert plan_yaml.is_file(), f"{dir_name}/plan.yaml 缺失"
+        text = plan_yaml.read_text(encoding="utf-8")
+        assert "prompt" in text and "graph" in text
+
+    @pytest.mark.parametrize("template_id", sorted(TEMPLATE_REGISTRY))
+    def test_rendered_home_includes_plan_yaml(self, template_id: str) -> None:
+        rendered = render_template(template_id, name="小助", description="测试职责")
+        assert "plan.yaml" in rendered.files, f"{template_id} 渲染结果缺 plan.yaml"
+        assert rendered.files["plan.yaml"].strip()
+
+
+class TestStructuredSoulTemplate:
+    """ADR-0242 D2 / 附录 C：SOUL 模板必须是八段结构，且裸模板能通过自我校验。"""
+
+    _ALL_MARKERS: tuple[str, ...] = (
+        "## 🧠 身份",
+        "## 🎭 性格",
+        "## 🛠 能力",
+        "## 🗣 语气",
+        "## 🔒 安全边界",
+        "## 💾 记忆规则",
+        "## ⚠️ 错误处理",
+        "## 🚫 红线",
+    )
+
+    @pytest.mark.parametrize("template_id", sorted(TEMPLATE_REGISTRY))
+    def test_soul_has_eight_sections(self, template_id: str) -> None:
+        rendered = render_template(template_id, name="小助", description="测试职责")
+        soul = rendered.files["SOUL.md"]
+        for marker in self._ALL_MARKERS:
+            assert marker in soul, f"{template_id}/SOUL.md 缺 {marker}"
+
+    @pytest.mark.parametrize("template_id", sorted(TEMPLATE_REGISTRY))
+    def test_soul_template_passes_self_check(self, template_id: str) -> None:
+        """模板本身 >= 200 字符（去空白）且含四核心标记。"""
+        rendered = render_template(template_id, name="小助", description="测试职责")
+        soul = rendered.files["SOUL.md"]
+        compact = "".join(soul.split())
+        assert len(compact) >= 200, f"{template_id}/SOUL.md 去空白后不足 200 字符"
+        for marker in ("## 🧠 身份", "## 🎭 性格", "## 🛠 能力", "## 🗣 语气"):
+            assert marker in soul, f"{template_id}/SOUL.md 缺核心段 {marker}"
+
+    @pytest.mark.parametrize("template_id", sorted(TEMPLATE_REGISTRY))
+    def test_profile_carries_opening_message_and_locale(self, template_id: str) -> None:
+        rendered = render_template(template_id, name="小助", description="测试职责")
+        profile = json.loads(rendered.files["profile.json"])
+        assert "opening_message" in profile, f"{template_id}/profile.json 缺 opening_message"
+        assert "locale" in profile, f"{template_id}/profile.json 缺 locale"
+        assert profile["locale"] == "zh-CN"
+        assert "model" in profile, f"{template_id}/profile.json 缺 model"
+        assert "runtime" in profile, f"{template_id}/profile.json 缺 runtime"
+        assert profile["model"] == ""
+        assert profile["runtime"] == {}
+
+    @pytest.mark.parametrize("template_id", sorted(TEMPLATE_REGISTRY))
+    def test_soul_renders_locale_placeholder(self, template_id: str) -> None:
+        """SOUL 模板的 ``主要语言：{{ locale }}`` 必须渲染为 zh-CN（PR-8）。"""
+        rendered = render_template(template_id, name="小助", description="测试职责")
+        soul = rendered.files["SOUL.md"]
+        assert "主要语言：{{ locale }}" not in soul
+        assert "主要语言：zh-CN" in soul
+
+    def test_bootstrap_md_has_no_identity_reference(self) -> None:
+        for template_id in TEMPLATE_REGISTRY:
+            rendered = render_template(template_id, name="小助", description="测试职责")
+            bootstrap = rendered.files["BOOTSTRAP.md"]
+            assert "IDENTITY" not in bootstrap, f"{template_id}/BOOTSTRAP.md 仍引用 IDENTITY"
+
+
+class TestCreateWithRoleTemplates:
+    @pytest.mark.parametrize("template_id", ROLE_TEMPLATES)
+    def test_create_accepts_role_templates(
+        self, catalog: AssistantCatalogImpl, template_id: str
+    ) -> None:
+        handle = catalog.create(CreateAssistantRequest(name="角色助理", template_id=template_id))
+        manifest = json.loads((Path(handle.home_path) / "manifest.json").read_text())
+        assert manifest["template_id"] == template_id
+
+    def test_create_rejects_unknown_template(self, catalog: AssistantCatalogImpl) -> None:
+        with pytest.raises(AssistantCatalogError, match="template_id"):
+            catalog.create(CreateAssistantRequest(name="x", template_id="other.tpl"))
+
+
+class TestBootstrapCompletion:
+    def test_seed_user_md_deletes_bootstrap_and_emits_ep(
+        self, catalog: AssistantCatalogImpl, emitted: list[tuple[str, dict[str, Any]]]
+    ) -> None:
+        handle = catalog.create(
+            CreateAssistantRequest(
+                name="引导创建",
+                template_id="assistant.research",
+                seed_user_md="# USER\n\n用户偏好：报告要带引用。",
+            )
+        )
+        assert not (Path(handle.home_path) / "BOOTSTRAP.md").exists()
+        user_md = (Path(handle.home_path) / "USER.md").read_text(encoding="utf-8")
+        assert "报告要带引用" in user_md
+
+        events = [event for event, _ in emitted]
+        assert ASSISTANT_CREATED in events
+        assert ASSISTANT_BOOTSTRAP_COMPLETED in events
+        completed = dict(emitted[events.index(ASSISTANT_BOOTSTRAP_COMPLETED)][1])
+        assert completed["assistant_id"] == handle.assistant_id
+        assert completed["revision_seq"] == 0
+        assert completed["manifest_digest"]
+        assert completed["actor"]
+
+    def test_no_seed_keeps_bootstrap_and_skips_ep(
+        self, catalog: AssistantCatalogImpl, emitted: list[tuple[str, dict[str, Any]]]
+    ) -> None:
+        handle = catalog.create(CreateAssistantRequest(name="裸创建"))
+        assert (Path(handle.home_path) / "BOOTSTRAP.md").exists()
+        events = [event for event, _ in emitted]
+        assert ASSISTANT_BOOTSTRAP_COMPLETED not in events
+
+    def test_bootstrap_absent_from_digest_face(self, catalog: AssistantCatalogImpl) -> None:
+        """BOOTSTRAP.md 不在配置面 digest 内：删除不影响 get 校验。"""
+        handle = catalog.create(
+            CreateAssistantRequest(name="digest 校验", seed_user_md="# USER\n\nx")
+        )
+        spec = catalog.get(handle.assistant_id)
+        assert spec.assistant_id == handle.assistant_id
+
+    def test_templates_have_no_host_private_hardcodings(self) -> None:
+        """INV-01: 角色模板中严禁包含任何宿主机私网 IP、特定端口或个人智库路径。"""
+        forbidden_tokens = (
+            "192.0.2.10",
+            "127.0.0.1:7890",
+            "~/everything-library",
+            "Asia/Shanghai (UTC+8)",
+        )
+        for path in TEMPLATES_DIR.rglob("*.md"):
+            content = path.read_text(encoding="utf-8")
+            for token in forbidden_tokens:
+                assert token not in content, (
+                    f"Template {path.relative_to(TEMPLATES_DIR)} contains forbidden hardcoding: {token}"
+                )

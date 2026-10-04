@@ -1,0 +1,110 @@
+"""Normalized receipts for effects executed in the world plane."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from enum import StrEnum
+
+
+class EffectOutcome(StrEnum):
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class EffectReceipt:
+    """Serializable tool/effect result used by reflection and recovery.
+
+    ADR-0220 §4.2: this DTO is the cross-graph boundary between
+    ``concept.effect.execute`` (concept graph) and
+    ``agent.reflection.turn`` / ``agent.memory.turn``. ``frozen=True``
+    enforces the closed boundary; the dataclass constructor rejects unknown
+    kwargs (extra=forbid equivalent). All fields are explicitly named; the
+    boundary contract is therefore: only the documented fields are accepted.
+    """
+
+    invocation_id: str
+    outcome: EffectOutcome
+    idempotency_key: str
+    provider: str
+    output_ref: str | None = None
+    error_code: str | None = None
+    retryable: bool = False
+    compensation_available: bool = False
+    failure_kind: str | None = None
+    """Body-classifier tag forwarded to the cognition seam.
+
+    Mirrors ``Observation.extra[FAILURE_KIND]``: ``"execution"`` for
+    deterministic failures the agent cannot retry into success *with the
+    same args* — it may still change approach or tool; ``"transient"``
+    for retryable infra errors; ``None`` for success, or for a failure
+    the body never classified because no tool ran (the host could not
+    dispatch the effect). Keeping it on the EffectReceipt is the single
+    SSOT for failure classification across the Body↔Cognition boundary;
+    do not derive it from ``error_code`` text at the seam.
+
+    A turn that forked N tool calls yields one receipt for the whole
+    batch, so the tag is the highest-precedence classification among the
+    failing calls (``fold_failure_kinds``). That fold is what keeps
+    ``None`` readable as "no tool ran" for a batch; a batch that lost its
+    parts' tags would look like a host dispatch failure and end the run.
+
+    Consumers read it for two distinct questions.
+    ``ReflectObservationBuildExecutor._build_observation`` maps the tag
+    value to a reflection prompt. ``act.observe.terminate_decide`` reads
+    only the tag's *absence*: an unclassified failure is host-side and
+    terminates the run, while any classified tag is the tool's report
+    about its own subject and goes back to the model.
+    """
+
+    def __post_init__(self) -> None:
+        if not self.invocation_id.strip() or not self.provider.strip():
+            raise ValueError("invocation_id and provider must not be empty")
+        if not self.idempotency_key.strip():
+            raise ValueError("effect receipt requires an idempotency key")
+        if self.outcome is EffectOutcome.SUCCEEDED and self.error_code:
+            raise ValueError("succeeded effect cannot carry an error code")
+        if self.outcome is EffectOutcome.FAILED and not self.error_code:
+            raise ValueError("failed effect must carry an error code")
+        if self.retryable and self.outcome is not EffectOutcome.FAILED:
+            raise ValueError("only failed effects can be retryable")
+        if self.failure_kind is not None and self.outcome is not EffectOutcome.FAILED:
+            raise ValueError(
+                "only failed effects carry a failure_kind tag "
+                f"(got outcome={self.outcome.value!r}, "
+                f"failure_kind={self.failure_kind!r})"
+            )
+
+
+def receipt_from_dispatcher(
+    value: object,
+    *,
+    invocation_id: str,
+    provider: str,
+) -> EffectReceipt:
+    """Normalize the legacy gateway mapping into an explicit receipt."""
+
+    if not isinstance(value, dict):
+        raise ValueError("gateway effect output must be a mapping")
+    key = value.get("idempotency_key")
+    if not isinstance(key, str) or not key:
+        raise ValueError("gateway receipt must contain idempotency_key")
+    error_code = value.get("error_code")
+    raw_failure_kind = value.get("failure_kind")
+    failure_kind = (
+        raw_failure_kind if isinstance(raw_failure_kind, str) and raw_failure_kind else None
+    )
+    return EffectReceipt(
+        invocation_id=invocation_id,
+        outcome=EffectOutcome.FAILED if error_code else EffectOutcome.SUCCEEDED,
+        idempotency_key=key,
+        provider=provider,
+        output_ref=value.get("output_ref") if isinstance(value.get("output_ref"), str) else None,
+        error_code=error_code if isinstance(error_code, str) else None,
+        retryable=bool(value.get("retryable", False)),
+        failure_kind=failure_kind,
+    )
+
+
+__all__ = ["EffectOutcome", "EffectReceipt", "receipt_from_dispatcher"]

@@ -1,0 +1,103 @@
+"""ADR-0169 PR-1:LoopCursor Protocol 公共面契约测试。"""
+
+from __future__ import annotations
+
+from dataclasses import FrozenInstanceError
+
+import pytest
+
+from lca.contracts.observability.cursor.loop_cursor import (
+    CloseReason,
+    CursorError,
+    CursorSnapshot,
+    IterationReason,
+    LoopCursor,
+    PhaseName,
+)
+
+
+def test_phase_name_is_closed_set() -> None:
+    assert set(PhaseName.__args__) == {
+        "perceive",
+        "think",
+        "act",
+        "reflect",
+        "remember",
+        "stop",
+    }
+
+
+def test_close_reason_is_closed_set() -> None:
+    assert set(CloseReason.__args__) == {
+        "completed",
+        "user_stop",
+        "budget_exhausted",
+        "approval_pending",
+        "approval_rejected",
+        "error",
+        "loop_guard",
+        "kernel_shutdown",
+    }
+
+
+def test_iteration_reason_is_closed_set() -> None:
+    assert set(IterationReason.__args__) == {
+        "tool_retry",
+        "gate_retry",
+        "checkpoint_resume",
+        "subagent_resume",
+        "user_replay",
+    }
+
+
+def test_cursor_snapshot_is_frozen() -> None:
+    s = CursorSnapshot(
+        run_id="r1",
+        trace_id="t1",
+        incarnation=1,
+        iteration=0,
+        attempt_in_step=0,
+        phase=None,
+        iteration_reason=None,
+        stop_signal=None,
+        seq=0,
+    )
+    with pytest.raises(FrozenInstanceError):
+        s.run_id = "r2"  # type: ignore[misc]
+
+
+def test_cursor_error_is_exception_subclass() -> None:
+    assert issubclass(CursorError, Exception)
+
+
+def test_loop_cursor_protocol_has_only_live_methods() -> None:
+    # 2026-09-14 dead-code 修剪:record_* / halt / close / fork 全部删除,
+    # LoopCursor docstring 钉死第二轨方法禁止扩展:open_step / begin_step /
+    # end_step 等不在 snapshot 暴露,step 边界由 ModelVisibleHook 唯一驱动。
+    # Protocol 只剩 advance + snapshot。
+    expected = {"advance", "snapshot"}
+    assert expected <= set(dir(LoopCursor))
+    # 反向断言:被删的方法绝不能再悄悄出现(防止回归)。
+    forbidden = {
+        "halt",
+        "close",
+        "fork",
+        "record_thinking",
+        "record_tool_call",
+        "record_tool_result",
+        "record_request_header",
+        "open_step",
+        "begin_step",
+        "end_step",
+        "open_segment",
+        "close_segment",
+        "register_projection",
+        "emit_step_start",
+        "resume_cursor",
+        "emit_phase",
+        "emit",
+        "subscribe",
+        "flush",
+    }
+    leaked = forbidden & set(dir(LoopCursor))
+    assert not leaked, f"deleted methods leaked back into LoopCursor Protocol: {leaked}"

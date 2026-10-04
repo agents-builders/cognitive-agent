@@ -1,0 +1,32 @@
+entries:
+- id: lca-role-cordis-creator
+  name: lca_role_cordis_creator
+  $module: lca.plugins.roles.cordis_creator
+  config: {}
+- id: lca-tool-cordis-control
+  name: lca_tool_cordis_control
+  $module: lca.plugins.tools.cordis_control
+  config:
+    caller_grant:
+    - cordis_control.inspect
+    - cordis_control.author
+    - cordis_control.validate
+    - cordis_control.promote
+    - tool_fs.read
+    - tool_fs.write
+    - tool_bash
+    - file_write
+- id: lca-mode-cordis-creator-default
+  name: lca_mode_cordis_creator_default
+  $module: lca.plugins.collaboration.modes.cordis_creator
+  config: {}
+- id: lca-tool-bash
+  name: lca_tool_bash
+  $module: lca.plugins.tools.bash
+  config:
+    allowed: true
+- id: lca-tool-file-write
+  name: lca_tool_file_write
+  $module: lca.plugins.tools.file_write
+  config:
+    allowed: true

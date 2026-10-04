@@ -1,0 +1,57 @@
+# profiles/cordis-creator.yaml — Creator §13.3.4 完整 profile。
+#
+# 默认组合：base + web-app + scenario-cordis-creator；LLM 走 qwen3.7-plus。
+# 与 scenario YAML 共享同一组 bundle；patch 覆盖角色与 capability grant 子集，
+# 保证 ``boot_profile("cordis-creator")`` 单行可启。
+#
+# ADR-0174 PR-7.4/S7.4: profile migrated to ``loop_cursor.spine_*`` bundle
+# naming(§D1 第四批);observability 五缝装配段 schema 与 web-standard 对齐,
+# loop_cursor 复用 bundles/loop_cursor.spine_default.yaml(全 spine + 全 deriver)。
+
+observability:
+  loop_cursor:
+    implementation: std                              # 默认实现(PR-14 LoopCursorFactory)
+    spine_default: loop_cursor.spine_default         # 复用 bundles/loop_cursor.spine_default.yaml 的 bundle
+  projection_host:
+    initial: [step_tree, narrative, graph, cost]     # 默认 deriver 注册
+  persistence:
+    coalescer: default
+    sink: routing_file
+  model_visible:
+    enabled: true
+  close_barrier:
+    enabled: true
+  plan_ref: cordis-creator
+
+bundles:
+  - bundles/base.yaml
+  - bundles/web-app.yaml
+  - bundles/scenario-cordis-creator.yaml
+  - bundles/loop_cursor.spine_default.yaml
+  - bundles/outer/phase_main.yaml
+  - bundles/think/think_subgraph.yaml
+  - bundles/act/act_subgraph.yaml
+  - bundles/perceive/perceive_subgraph.yaml
+  - bundles/reflect/reflect_subgraph.yaml
+  - bundles/remember/remember_subgraph.yaml
+
+patch:
+  - id: lca-llm-resolver
+    # NOTE(round-0358): Config 自 506b7630d 起为空(extra=forbid);旧 default_model /
+    # load_dotenv 键已无法通过校验,对齐空配置。
+    config: {}
+
+profile:
+  id: cordis-creator
+  description: "Creator §13.3 —— self-plugin-authoring + preset reuse"
+  trust: system
+  role: cordis-creator
+  capability_grant:
+    - cordis_control.inspect
+    - cordis_control.author
+    - cordis_control.validate
+    - cordis_control.promote
+    - tool_fs.read
+    - tool_fs.write
+    - tool_bash
+    - file_write

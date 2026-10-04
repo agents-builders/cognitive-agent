@@ -1,0 +1,210 @@
+"""Per-turn typed ``BindingsView`` seam — RuntimePlane.current_bindings().
+
+ADR-0220 §7.3 / §闸门 5: ``BindingsView`` is the typed per-run capability
+bag that replaces the legacy ``AgentState._xxx_ref`` private attributes.
+The ``RuntimePlane`` exposes a typed ContextVar ``current_bindings()``
+that the runtime loop entry point populates each turn; the graph
+layer (``agent.run.phase`` / ``agent.reasoning.turn`` /
+``concept.tool.fork``) reads it via this seam rather than reading
+``AgentState`` private attributes.
+
+``BindingsViewBuilder`` is the typed input surface — the runtime entry
+point collects each capability reference it has registered (file_store,
+sandbox, skill_store, machine_resolver, search, bindings) and passes
+them to ``build()``. The seam is fail-loud: a missing builder at graph
+execution time is a wiring bug, not a silent fallback.
+
+This module lives in ``lca.infrastructure.runtime_plane`` because the
+runtime plane is the only layer that may construct capability bag
+references (AGENTS.md capability hard constraint). It does not
+import cognition or plugins, so the dependency direction stays
+one-way (contracts → infrastructure).
+"""
+
+from __future__ import annotations
+
+from contextvars import ContextVar, Token
+from dataclasses import dataclass
+
+from lca.contracts.models.cognition.boundary import BindingsView
+
+
+@dataclass(frozen=True, slots=True)
+class BindingsViewBuilder:
+    """Per-turn capability references collected by the runtime entry point.
+
+    Each field is optional: ``None`` means the runtime did not register
+    that capability in this turn (the corresponding factory in
+    ``ToolsService.fork_for_run`` will receive ``None`` for that key).
+    The bag is purely a value carrier — it does not reach into
+    ``AgentState`` or perform reflection on any model instance.
+
+    The runtime entry point constructs one of these per turn and feeds
+    it to ``set_capability_bindings()`` so the graph layer can read
+    the typed ``BindingsView`` without touching state.
+
+    ``mode`` carries the run-coordination mode selected for this turn
+    (``"solo"`` / ``"cordis-creator"`` / ``"team"``) so per-run tool-
+    visibility gates can key on policy, not on the sandbox isolation
+    seam.
+    """
+
+    file_store: object | None = None
+    sandbox: object | None = None
+    skill_store: object | None = None
+    machine_resolver: object | None = None
+    search: object | None = None
+    bindings: object | None = None
+    mode: str = "solo"
+    assistant_id: str = ""
+    home_path: str | None = None
+    # ADR-0248: 运行时总装字段 — runtime loop 解析后回填，tool.fork / 工具执行 seam 读取。
+    vocal_mode: str = "direct"
+    vocal_gate: object | None = None
+    auto_review_mode: str = "off"
+    auto_review_gate: object | None = None
+    origin: str = "user"
+    box_accessor: object | None = None
+
+    def build(self) -> BindingsView:
+        """Project the builder onto the typed ``BindingsView`` boundary DTO.
+
+        Construction is pure — no I/O, no env reads, no state mutation.
+        Callers (typically the graph layer) receive a frozen
+        ``BindingsView`` whose every field is statically known.
+        """
+        return BindingsView(
+            file_store=self.file_store,
+            sandbox=self.sandbox,
+            skill_store=self.skill_store,
+            machine_resolver=self.machine_resolver,
+            search=self.search,
+            bindings=self.bindings,
+            mode=self.mode,
+            assistant_id=self.assistant_id,
+            home_path=self.home_path,
+            vocal_mode=self.vocal_mode,
+            vocal_gate=self.vocal_gate,
+            auto_review_mode=self.auto_review_mode,
+            auto_review_gate=self.auto_review_gate,
+            origin=self.origin,
+            box_accessor=self.box_accessor,
+        )
+
+
+_capability_bindings: ContextVar[BindingsViewBuilder | None] = ContextVar(
+    "lca_runtime_capability_bindings",
+    default=None,
+)
+
+
+def set_capability_bindings(
+    builder: BindingsViewBuilder,
+) -> Token[BindingsViewBuilder | None]:
+    """Bind a per-turn ``BindingsViewBuilder`` to the runtime plane seam.
+
+    Returns the reset token; the caller MUST reset it (typically via
+    ``capability_bindings_scope``). Re-binding without resetting leaks
+    the previous turn's bindings into the next turn — fail-loud via
+    a programmer error rather than a runtime fall-through.
+    """
+    return _capability_bindings.set(builder)
+
+
+def reset_capability_bindings(
+    token: Token[BindingsViewBuilder | None],
+) -> None:
+    """Release the per-turn ``BindingsViewBuilder`` token."""
+    _capability_bindings.reset(token)
+
+
+def current_bindings() -> BindingsViewBuilder | None:
+    """Return the active per-turn ``BindingsViewBuilder``, or ``None``.
+
+    The graph layer (``agent.run.phase`` entry, ``concept.tool.fork``
+    fallback) calls this when no upstream typed ``BindingsView`` has
+    been wired. ``None`` means "no per-turn bindings registered" — the
+    caller decides whether to fail loud or to skip.
+    """
+    return _capability_bindings.get()
+
+
+def current_bindings_view() -> BindingsView | None:
+    """Typed boundary DTO convenience: project the builder or return ``None``.
+
+    Most graph-layer code wants the typed ``BindingsView`` directly,
+    not the builder. This helper bridges the seam: callers that have
+    a builder turn it into the boundary DTO in one call. The seam
+    itself stays builder-shaped because the runtime layer may want
+    to inspect the builder (e.g. log capability misses) before
+    projecting.
+    """
+    builder = _capability_bindings.get()
+    if builder is None:
+        return None
+    return builder.build()
+
+
+def with_runtime_bindings(**overrides: object) -> Token[BindingsViewBuilder | None]:
+    """Replace the active per-turn builder with one carrying ``overrides``.
+
+    ADR-0248 运行时总装：``runtime_loop`` 在 Run 启动后解析声带/审查策略，
+    通过该 seam 把 ``vocal_mode`` / ``vocal_gate`` / ``auto_review_mode`` /
+    ``auto_review_gate`` / ``origin`` / ``box_accessor`` 回填到当前
+    ``BindingsViewBuilder`` 并重新发布，使图层的 ``concept.tool.fork`` 与
+    工具执行 seam 读取到同一份每 Run 绑定。返回的 token 必须由调用方 reset。
+    """
+    from dataclasses import replace
+
+    builder = _capability_bindings.get()
+    if builder is None:
+        builder = BindingsViewBuilder()
+    return _capability_bindings.set(replace(builder, **overrides))
+
+
+_tools_service: ContextVar[object | None] = ContextVar(
+    "lca_runtime_tools_service",
+    default=None,
+)
+
+
+def set_current_tools_service(tools_service: object) -> Token[object | None]:
+    """Bind the per-turn ``ToolsService`` to the runtime plane seam.
+
+    Mirror of :func:`set_capability_bindings`: the kernel reads this
+    ContextVar at the outer plan entry to seed the typed ``tools``
+    port on every plan.  Returns the reset token; the caller MUST
+    reset it.  Re-binding without resetting leaks the previous
+    turn's ToolsService into the next turn — a hard runtime bug, not
+    a silent fall-through.
+    """
+    return _tools_service.set(tools_service)
+
+
+def reset_current_tools_service(token: Token[object | None]) -> None:
+    """Release the per-turn ``ToolsService`` token."""
+    _tools_service.reset(token)
+
+
+def current_tools_service() -> object | None:
+    """Return the active per-turn ``ToolsService``, or ``None``.
+
+    ``None`` means the carrier did not publish a ToolsService for
+    this turn — kernel falls back to a typed-port-missing failure at
+    any node that declares ``tools``.  The kernel never fabricates a
+    default ToolsService; missing = fail loud.
+    """
+    return _tools_service.get()
+
+
+__all__ = [
+    "BindingsViewBuilder",
+    "current_bindings",
+    "current_bindings_view",
+    "current_tools_service",
+    "reset_capability_bindings",
+    "reset_current_tools_service",
+    "set_capability_bindings",
+    "set_current_tools_service",
+    "with_runtime_bindings",
+]

@@ -1,0 +1,330 @@
+"""编译计划的散列、来源与可解释性投影服务。
+
+``CompiledRunPlan`` 保持在 contracts 中作为不可变数据载体；本模块拥有
+对该数据进行散列、序列化和解释的运行时行为。这样计划的事实形状不会再同时
+承担策略与展示职责，Harness、CLI 与运行时也共享唯一的 canonical plan_ref。
+"""
+
+from __future__ import annotations
+
+import json
+from collections.abc import Iterable, Mapping
+from dataclasses import asdict, is_dataclass
+from enum import Enum
+from typing import Any, Protocol, cast
+
+from lca.contracts.observability.canonical_digest import canonical_digest
+from lca.contracts.protocols.declarative.declarative_2.declarative_phase_graph import (
+    CognitivePhaseGraphPlan,
+    PluginSpec,
+    ValidationReport,
+    ValidationSeverity,
+)
+from lca.contracts.protocols.perceive.capability_plan import CapabilityPlan, capability_plan_hash
+from lca.contracts.protocols.state.plan import CompiledRunPlan
+from lca.contracts.protocols.state.scope_plan import ScopePlan, scope_plan_hash
+
+
+def canonical_json(value: Any) -> str:
+    """Serialize plan data deterministically across Python processes."""
+
+    return json.dumps(
+        _canonicalize(value), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+
+
+def declarative_plan_hash(value: Any) -> str:
+    """Return the stable digest used by declarative sub-plan diagnostics."""
+
+    return canonical_digest(canonical_json(value), length=32)
+
+
+class _V2PlanWrapper(Protocol):
+    """Structural shape of ``lca_kernel``'s ``V2ExecutablePlan``.
+
+    Imported eagerly it would cycle (lca_kernel imports lca.harness.*),
+    so this module only duck-types on it; the Protocol documents the
+    shape for the seam cast in ``_unwrap_v2``.
+    """
+
+    inner: CompiledRunPlan
+    graph_spec: dict[str, Any]
+
+
+def _unwrap_v2(plan: CompiledRunPlan | Any) -> CompiledRunPlan:
+    """Return the ``CompiledRunPlan`` inside a v2 wrapper, or ``plan`` itself.
+
+    ADR-0221 P3: the kernel may wrap the plan in ``V2ExecutablePlan``
+    to carry the v2 graph spec alongside the immutable plan. This is the
+    single point that recognises that wrapper and unwraps to the inner
+    ``CompiledRunPlan`` so callers (plan_ref hashing, to_dict projection,
+    CLI introspection) see a stable v1-shaped view.
+
+    Duck-typed on purpose: ``V2ExecutablePlan`` lives in ``lca_kernel``,
+    which already imports ``lca.harness.*``, so an eager
+    ``isinstance(V2ExecutablePlan)`` here would create a cycle. The shape
+    (``inner`` + ``graph_spec``) is stable on the wrapper class.
+    """
+    if hasattr(plan, "inner") and hasattr(plan, "graph_spec"):
+        # Seam cast (0132 idiom): pyright cannot narrow attribute access
+        # through hasattr duck-typing; the wrapper shape (inner +
+        # graph_spec) is stable on V2ExecutablePlan. Behavior identical
+        # to ``plan.inner`` above.
+        return cast("_V2PlanWrapper", plan).inner
+    return plan
+
+
+def compiled_run_plan_ref(plan: CompiledRunPlan) -> str:
+    """Compute the cross-process stable canonical reference for a compiled plan.
+
+    ADR-0221 P3: the kernel may wrap the plan in ``V2ExecutablePlan``
+    to carry the v2 graph spec alongside the immutable plan. Unwrap
+    transparently here so callers continue to receive a stable
+    ``CompiledRunPlan`` view.
+    """
+    plan = _unwrap_v2(plan)
+    payload = {
+        "capability": capability_sub_plan_hash(plan),
+        "control": control_entries_sub_plan_hash(plan),
+        "scope": scope_sub_plan_hash(plan),
+        "profile_path": plan.profile_path,
+        "plan_version": plan.plan_version,
+        "revision": plan.revision,
+        "input_provenance": sorted((kind, path) for kind, path in plan.input_provenance),
+        "declarative": _declarative_payload(plan),
+    }
+    return canonical_digest(canonical_json(payload), length=16)
+
+
+def capability_sub_plan_hash(plan: CompiledRunPlan) -> str:
+    """Return the stable reference of the capability sub-plan."""
+
+    return str(capability_plan_hash(plan.capability))
+
+
+def control_entries_sub_plan_hash(plan: CompiledRunPlan) -> str:
+    """Return the stable reference of the executable declarative control projection."""
+
+    return declarative_plan_hash(
+        {
+            "profile_path": plan.profile_path,
+            "control_entries": plan.control_entries,
+        }
+    )
+
+
+def scope_sub_plan_hash(plan: CompiledRunPlan) -> str:
+    """Return the stable reference of the scope sub-plan."""
+
+    return str(scope_plan_hash(plan.scope))
+
+
+def compiled_run_plan_to_dict(plan: CompiledRunPlan) -> dict[str, Any]:
+    """Build the complete JSON-ready diagnostic projection for a compiled plan.
+
+    ADR-0221 P3: ``CompiledRunPlan.phase_graph`` was retired; v2 plans arrive
+    wrapped in ``V2ExecutablePlan`` carrying ``graph_spec``. Unwrap it the
+    same way ``compiled_run_plan_ref`` does so callers see a v1-shaped
+    payload even when the v2 region is the source of truth.
+    """
+    inner = _unwrap_v2(plan)
+
+    result: dict[str, Any] = {
+        "profile_path": inner.profile_path,
+        "plan_version": inner.plan_version,
+        "schema_version": inner.plan_version,
+        "plan_ref": compiled_run_plan_ref(plan),
+        "plan_hash": compiled_run_plan_ref(plan),
+        "revision": inner.revision,
+        "input_provenance": [{"kind": kind, "path": path} for kind, path in inner.input_provenance],
+        "capability": _capability_plan_to_dict(inner.capability),
+        "control": _control_entries_to_dict(inner),
+        "scope": _scope_plan_to_dict(inner.scope),
+        # ADR-0242 D10：per-agent prompt 覆盖（诊断投影可见）。
+        "prompt_template_id": inner.prompt_template_id,
+        "prompt_section_overrides": [
+            {"name": section.name, "content": section.content}
+            for section in inner.prompt_section_overrides
+        ],
+    }
+    result["declarative"] = _declarative_payload(inner)
+    return result
+
+
+def build_input_provenance(
+    profile_path: str,
+    bundles: Iterable[str],
+    patches: Iterable[str] = (),
+    task_id: str | None = None,
+    env_fingerprint: str | None = None,
+) -> tuple[tuple[str, str], ...]:
+    """Construct stable provenance from profile, bundle, patch, task, and environment inputs."""
+
+    out: list[tuple[str, str]] = [("profile", str(profile_path))]
+    out.extend(("bundle", str(bundle)) for bundle in bundles)
+    out.extend(("patch", str(patch)) for patch in patches)
+    if task_id is not None:
+        out.append(("task", str(task_id)))
+    if env_fingerprint is not None:
+        out.append(("env", str(env_fingerprint)))
+    return tuple(out)
+
+
+def plugin_spec_to_dict(spec: PluginSpec) -> dict[str, Any]:
+    """Project a plugin specification to deterministic JSON-ready data."""
+
+    return cast("dict[str, Any]", _canonicalize(spec))
+
+
+def phase_graph_to_dict(graph: CognitivePhaseGraphPlan) -> dict[str, Any]:
+    """Project a phase graph to deterministic JSON-ready data.
+
+    ADR-0221 P3: ``CognitivePhaseGraphPlan`` was retired from
+    ``CompiledRunPlan``. This helper stays only for tests that still
+    project a directly-constructed phase graph; new callers should use
+    ``PlanInterpreter`` instead.
+    """
+
+    return cast("dict[str, Any]", _canonicalize(graph))
+
+
+def validation_report_to_dict(report: ValidationReport) -> dict[str, Any]:
+    """Project a validation report to deterministic JSON-ready data."""
+
+    errors = tuple(item for item in report.issues if item.severity == ValidationSeverity.ERROR)
+    warnings = tuple(item for item in report.issues if item.severity != ValidationSeverity.ERROR)
+    return {
+        "valid": not errors,
+        "errors": [_canonicalize(item) for item in errors],
+        "warnings": [_canonicalize(item) for item in warnings],
+    }
+
+
+def _capability_plan_to_dict(plan: CapabilityPlan) -> dict[str, Any]:
+    return {
+        "profile_path": plan.profile_path,
+        "revision": plan.revision,
+        "plan_hash": capability_plan_hash(plan),
+        "binding_count": len(plan.provider_bindings),
+        "relation_count": len(plan.relations),
+    }
+
+
+def _control_entries_to_dict(plan: CompiledRunPlan) -> dict[str, Any]:
+    return {
+        "plan_hash": control_entries_sub_plan_hash(plan),
+        "entry_count": len(plan.control_entries),
+        "covered_phases": sorted({entry.phase.value for entry in plan.control_entries}),
+    }
+
+
+def _scope_plan_to_dict(plan: ScopePlan) -> dict[str, Any]:
+    return {
+        "profile_path": plan.profile_path,
+        "lifecycle": plan.lifecycle.value,
+        "visibility": [scope.value for scope in plan.visibility],
+        "acl_grants": list(plan.acl_grants),
+        "budget_ceiling": {
+            "max_tokens": plan.budget_ceiling.max_tokens,
+            "max_wall_clock_seconds": plan.budget_ceiling.max_wall_clock_seconds,
+            "max_tool_calls": plan.budget_ceiling.max_tool_calls,
+            "max_steps": plan.budget_ceiling.max_steps,
+            "max_cost_cents": plan.budget_ceiling.max_cost_cents,
+        },
+        "plan_hash": scope_plan_hash(plan),
+    }
+
+
+def _declarative_payload(plan: CompiledRunPlan) -> dict[str, Any]:
+    # ADR-0221 P3: ``phase_graph`` / ``phase_bindings`` retired from
+    # ``CompiledRunPlan``; the v2 plan serialises only the v2 regions.
+    return {
+        "plugin_specs": [plugin_spec_to_dict(spec) for spec in plan.plugin_specs],
+        "capability_bindings": [
+            {
+                "capability": binding.capability,
+                "provider": binding.owner_plugin,
+                "cardinality": binding.fallback_policy,
+                "scope": binding.scope,
+                "grant": [binding.effect_class],
+                "provenance": [binding.provenance],
+            }
+            for binding in plan.capability_bindings
+        ],
+        "control_entries": [
+            {
+                "phase": entry.phase.value,
+                "executor_capability": entry.executor_capability,
+                "predicate": entry.predicate,
+                "aggregation": entry.aggregation,
+                "evidence_required": entry.evidence_required,
+            }
+            for entry in plan.control_entries
+        ],
+        "replacement_map": [
+            {
+                "target": decision.target,
+                "winner": decision.winner,
+                "mode": decision.mode,
+                "reason": decision.reason,
+                "candidates": list(decision.candidates),
+            }
+            for decision in plan.replacement_map
+        ],
+        "effect_policy": {
+            "gateway_capability": plan.effect_policy.gateway_capability
+            if plan.effect_policy
+            else "",
+            "allowed_effects": list(plan.effect_policy.allowed_effects)
+            if plan.effect_policy
+            else [],
+            "approval_required": list(plan.effect_policy.approval_required)
+            if plan.effect_policy
+            else [],
+            "idempotency_required": list(plan.effect_policy.idempotency_required)
+            if plan.effect_policy
+            else [],
+        },
+        "action_authority": _canonicalize(plan.action_authority) if plan.action_authority else {},
+        "provenance": {
+            "profile_path": plan.provenance.profile_path if plan.provenance else plan.profile_path,
+            "bundles": list(plan.provenance.bundles) if plan.provenance else [],
+            "plugin_revisions": list(plan.provenance.plugin_revisions) if plan.provenance else [],
+            "task_contract": plan.provenance.task_contract if plan.provenance else "",
+            "environment": plan.provenance.environment if plan.provenance else "",
+            "actor_grant": list(plan.provenance.actor_grant) if plan.provenance else [],
+        },
+        "validation_report": validation_report_to_dict(plan.validation_report),
+    }
+
+
+def _canonicalize(value: Any) -> Any:
+    if isinstance(value, Enum):
+        return value.value
+    if is_dataclass(value):
+        return {key: _canonicalize(item) for key, item in asdict(cast("Any", value)).items()}
+    if isinstance(value, Mapping):
+        return {
+            str(key): _canonicalize(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+        }
+    if isinstance(value, (tuple, list)):
+        return [_canonicalize(item) for item in value]
+    if isinstance(value, (set, frozenset)):
+        return sorted((_canonicalize(item) for item in value), key=canonical_json)
+    return value
+
+
+__all__ = [
+    "build_input_provenance",
+    "canonical_json",
+    "capability_sub_plan_hash",
+    "compiled_run_plan_ref",
+    "compiled_run_plan_to_dict",
+    "control_entries_sub_plan_hash",
+    "declarative_plan_hash",
+    "phase_graph_to_dict",
+    "plugin_spec_to_dict",
+    "scope_sub_plan_hash",
+    "validation_report_to_dict",
+]

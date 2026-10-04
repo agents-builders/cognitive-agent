@@ -1,0 +1,410 @@
+"""Section / template / output contracts for the prompt assembly seam (cognition L1).
+
+These contracts describe **only the shape of the data** that flows between
+the PromptSectionRegistry, PromptTemplateProvider, PromptAssembler, and the
+PromptReasoner. They live in :mod:`lca.contracts` so plugins and the cognitive
+implementation can both depend on them without crossing a higher layer.
+
+The seam replaces the prompt-rendering surface that previously lived in
+``cognition/brain/reasoner.py``. Each section is a small typed provider:
+``PureSection`` for static/profile-derived content, ``StatefulSection`` for
+content that reads the turn's ``ContextManifest`` / ``TeamAwareness``.
+The assembler resolves them through the registry, never by re-reading
+configuration or recomputing template variables inline.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
+from typing import ClassVar, Literal, Protocol, runtime_checkable
+
+from lca.contracts.models.core.perceive.perception import ContextManifest
+from lca.contracts.models.core.state.state import AgentState
+from lca.contracts.models.core.workspace.activation import ActivatedSkill
+from lca.contracts.models.team.role.team import RoleProfile
+from lca.contracts.models.team.team.awareness import TeamAwareness
+from lca.contracts.protocols.runtime.infra.infra import Tool
+
+SectionKind = Literal["pure", "stateful"]
+"""Closed vocabulary for the kind of section a section plugin contributes."""
+
+# 内建模板注册表（lca.plugins.prompts.template_provider 的 built-ins）。
+# plan.yaml 的 ``prompt.template`` 只能选择已登记模板（ADR-0242 I-B11）；
+# 编译层用本闭集 + profile 声明的扩展模板做静态校验。
+BUILTIN_PROMPT_TEMPLATE_IDS: frozenset[str] = frozenset(
+    {"react_prompt", "routing_prompt", "hierarchical_prompt"}
+)
+
+# 内建 section 注册表（lca.plugins.prompts.sections 登记的名字闭集）。
+# plan.yaml 的 ``prompt.sections[*].name`` 必须落在本闭集内；``content``
+# 只是渲染数据覆盖，不是新 section 类型（ADR-0242 I-B11 / C1）。
+REGISTERED_PROMPT_SECTION_NAMES: frozenset[str] = frozenset(
+    {
+        "role",
+        "goal",
+        "backstory",
+        "available_skills",
+        "react_workflow",
+        "react_tool_usage_guidelines",
+        "routing_instructions",
+        "hierarchical_instructions",
+        "tools",
+        "cloud_sandbox",
+        "current_date",
+        "task",
+        "activated_skills",
+        "context",
+        "user_profile",
+        "teammates",
+        "assigned_roles_text",
+        "member_reports_text",
+        "member_status_text",
+        "evidence_pack_text",
+        "vocal_contract",
+    }
+)
+
+
+@dataclass(frozen=True, slots=True)
+class SectionOutput:
+    """A section's rendered output."""
+
+    text: str
+    used_fallback: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class SectionReference:
+    """A reference to one section within a template."""
+
+    name: str
+    kind: SectionKind
+    optional: bool = False
+    fallback: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.kind not in ("pure", "stateful"):
+            raise MissingSectionKindError(self.name, self.kind)
+
+
+class MissingSectionKindError(ValueError):
+    """Raised when a SectionReference omits its ``kind`` discriminator."""
+
+    def __init__(self, name: str, kind: object) -> None:
+        super().__init__(
+            f"SectionReference(name={name!r}) requires kind in {{'pure', 'stateful'}}, got {kind!r}"
+        )
+        self.section_name = name
+        self.kind = kind
+
+
+class MissingPromptSectionError(KeyError):
+    """Raised when the assembler cannot find a section in the registry."""
+
+    def __init__(self, name: str, kind: SectionKind) -> None:
+        super().__init__(f"prompt section {name!r} ({kind}) is not registered")
+        self.section_name = name
+        self.kind = kind
+
+
+PromptTemplateVariant = Literal["react", "hierarchical", "routing", "casting"]
+
+
+@dataclass(frozen=True, slots=True)
+class PromptTemplate:
+    """An ordered list of section references assembled into a prompt."""
+
+    id: str
+    variant: PromptTemplateVariant
+    sections: tuple[SectionReference, ...] = field(default_factory=tuple)
+
+    def __post_init__(self) -> None:
+        seen: set[tuple[str, SectionKind]] = set()
+        duplicates: list[str] = []
+        for ref in self.sections:
+            key = (ref.name, ref.kind)
+            if key in seen:
+                duplicates.append(f"{ref.name}/{ref.kind}")
+                continue
+            seen.add(key)
+        if duplicates:
+            raise ValueError(
+                f"PromptTemplate(id={self.id!r}) contains duplicate section refs: {duplicates}"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class PromptTemplateConfig:
+    """Profile-side template override (Pydantic-compatible schema)."""
+
+    id: str
+    variant: PromptTemplateVariant
+    sections: tuple[SectionReference, ...] = field(default_factory=tuple)
+
+
+@dataclass(frozen=True, slots=True)
+class SectionManifest:
+    """Profile-side inventory of section providers registered for a run."""
+
+    sections: Mapping[str, str]
+    templates: tuple[PromptTemplate, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class SectionTrace:
+    """Per-section render trace produced by :class:`PromptAssembler` (ADR-0175 D2)。
+
+    让 model-visible writer(以及 tests)能重建 prompt 结构而不用再渲染 / 抓
+    完整字符串。ADR-0176 D3 升级:新增 ``text`` 字段(实际渲染正文),
+    ``text_chars`` 同步 = ``len(text)``;``content_digest`` 由 writer 派生
+    (sha256(text)),不落 trace dataclass。
+    """
+
+    name: str
+    kind: SectionKind
+    optional: bool
+    used_fallback: bool
+    skipped_empty: bool
+    text_chars: int
+    text: str = ""  # ADR-0176 D3:section 实际渲染正文(replay 可零 token 重建)
+
+
+AvailableSkillsReason = Literal["not_enabled", "no_match", "activated"]
+"""SkillRouter 决策原因闭集(ADR-0185 spec §2.4 P4)。
+
+区分 SkillRouter 三种状态:
+
+- ``not_enabled`` —— profile / agent 未启用 skill_router(等价
+  ``activated_skill_ids=()`` 且 ``available_skills_count=0``)
+- ``no_match`` —— skill_router 已启用,但本 step 关键词未命中
+  任何规则,回退到 default_template(``activated_skill_ids=()``)
+- ``activated`` —— skill_router 命中规则并返回非 default 模板
+  (``activated_skill_ids`` 非空)
+
+设计上,``available_skills_count`` 与 ``activated_skill_ids`` 的
+真实状态由 producer 端(assembler)在 trace 上落,本闭集只是 caller
+侧 truthiness → 原因的派生。
+"""
+
+
+@dataclass(frozen=True, slots=True)
+class PromptTrace:
+    """Full render trace produced by :class:`PromptAssembler` (ADR-0175 D2).
+
+    ``system_prompt_text`` is the joined string that the brain will hand
+    to the LLM; the trace fields are the structural breakdown so the
+    rendered prompt can be reconstructed without re-rendering
+    (ADR-0185 PR-4 后由 spine event bus 承载,不再写旁路文件)。
+    """
+
+    template_id: str
+    variant: PromptTemplateVariant
+    selector_decision_path: str
+    sections: tuple[SectionTrace, ...]
+    total_chars: int
+    activated_skill_ids: tuple[str, ...]
+    tools_count: int
+    available_skills_count: int
+    system_prompt_text: str
+    available_skills_reason: AvailableSkillsReason = "not_enabled"
+    """SkillRouter 决策原因(ADR-0185 spec §2.4 P4)。
+
+    由 assembler 在构造 trace 时基于 ``activated_skill_ids`` /
+    ``available_skills_count`` 派生:
+
+    - ``not_enabled`` —— ``available_skills_count == 0`` 且
+      ``activated_skill_ids == ()``
+    - ``no_match`` —— ``available_skills_count > 0`` 但
+      ``activated_skill_ids == ()``
+    - ``activated`` —— ``activated_skill_ids`` 非空
+
+    旧字段 ``activated_skill_ids=[]`` 与 ``available_skills_count=0``
+    不区分原因(spec §0.3 病灶),本字段统一解释。
+
+    delete-when:N/A(纯加法,narrative 章节 P1 与 viewer 都依赖)。
+    """
+
+
+SelectorDecisionPath = Literal[
+    "active_template_override",
+    "consult_duty",
+    "team_awareness_routing",
+    "profile_default",
+    "legacy",
+]
+"""Why a :class:`PromptTemplateSelector` chose the template it did."""
+
+
+@runtime_checkable
+class PureSection(Protocol):
+    """A section whose content derives from non-state inputs."""
+
+    name: ClassVar[str]
+
+    def render(
+        self,
+        *,
+        role_profile: RoleProfile,
+        tools: Sequence[Tool],
+    ) -> SectionOutput: ...
+
+
+@runtime_checkable
+class StatefulSection(Protocol):
+    """A section that reads the turn's context manifest and team awareness.
+
+    ``AgentState`` is deliberately absent: the manifest the perceive phase
+    produced is the only run-state channel a section may read, so a section
+    cannot reach past the turn boundary into reducer-owned state.
+    """
+
+    name: ClassVar[str]
+
+    def render(
+        self,
+        *,
+        role_profile: RoleProfile,
+        task: str,
+        awareness: TeamAwareness | None,
+        manifest: ContextManifest | None,
+        tools: Sequence[Tool],
+        activated_skills: tuple[ActivatedSkill, ...],
+    ) -> SectionOutput: ...
+
+
+@runtime_checkable
+class PromptSectionRegistry(Protocol):
+    """Closed-vocabulary registry of section providers keyed by ``(kind, name)``."""
+
+    def register(self, section: object, *, kind: SectionKind, name: str) -> None: ...
+
+    def resolve(self, *, kind: SectionKind, name: str) -> object | None: ...
+
+    def list_sections(self) -> tuple[tuple[SectionKind, str, object], ...]: ...
+
+
+@runtime_checkable
+class PromptTemplateProvider(Protocol):
+    """Holds the active template set queried by id."""
+
+    def get_template(self, template_id: str) -> PromptTemplate | None: ...
+
+    def list_templates(self) -> tuple[tuple[str, PromptTemplate], ...]: ...
+
+
+@runtime_checkable
+class PromptTemplateSelector(Protocol):
+    """Picks the active template id per AgentState (ADR-0175 D5).
+
+    Selectors may return ``str`` (legacy) or ``tuple[str, str]``
+    ``(template_id, decision_path)`` (new). The helper
+    :func:`normalize_selector_result` flattens either shape.
+    """
+
+    def select(
+        self,
+        *,
+        state: AgentState,
+    ) -> str | tuple[str, str]: ...
+
+
+@runtime_checkable
+class PromptAssembler(Protocol):
+    """Renders a prompt by walking one ``PromptTemplate``'s section refs.
+
+    The default implementation :class:`SectionManifestPromptAssembler`
+    returns the joined prompt **plus** a :class:`PromptTrace` so the
+    caller (Reasoner) can publish a structured section breakdown to the
+    model-visible writer without re-rendering (ADR-0175 D2).
+    """
+
+    def render(
+        self,
+        *,
+        template_id: str,
+        role_profile: RoleProfile,
+        task: str,
+        awareness: TeamAwareness | None,
+        manifest: ContextManifest | None,
+        tools: Sequence[Tool],
+        activated_skills: tuple[ActivatedSkill, ...],
+        selector_decision_path: SelectorDecisionPath = "legacy",
+    ) -> str | tuple[str, PromptTrace]: ...
+
+
+@runtime_checkable
+class BrainPromptCatalog(Protocol):
+    """模型可见的工具与技能目录。"""
+
+    def render_tools_xml(self) -> str: ...
+    def render_brain_skills(self) -> str: ...
+    def render_skill_discovery(self) -> str: ...
+
+
+def normalize_selector_result(
+    result: str | tuple[str, str],
+) -> tuple[str, SelectorDecisionPath]:
+    """Flatten ``PromptTemplateSelector.select`` return to ``(template_id, path)``.
+
+    Accepts either the new ``tuple[str, str]`` shape or the legacy ``str``
+    shape so older selectors keep working without code changes.
+    """
+    if isinstance(result, tuple) and len(result) == 2:
+        template_id, decision_path = result
+        return template_id, _coerce_decision_path(decision_path)
+    return result, "legacy"
+
+
+def _coerce_decision_path(value: object) -> SelectorDecisionPath:
+    """Map unknown decision paths to ``"legacy"`` rather than failing."""
+    if value == "active_template_override":
+        return "active_template_override"
+    if value == "consult_duty":
+        return "consult_duty"
+    if value == "team_awareness_routing":
+        return "team_awareness_routing"
+    if value == "profile_default":
+        return "profile_default"
+    if value == "legacy":
+        return "legacy"
+    return "legacy"
+
+
+def normalize_assembler_result(
+    result: str | tuple[str, PromptTrace],
+) -> tuple[str, PromptTrace | None]:
+    """Flatten ``PromptAssembler.render`` return.
+
+    Legacy implementations return a bare ``str``; new ones return
+    ``(prompt, PromptTrace)``. The helper returns ``(prompt, trace_or_None)``.
+    """
+    if isinstance(result, tuple) and len(result) == 2:
+        return result
+    return result, None
+
+
+__all__ = [
+    "AvailableSkillsReason",
+    "BrainPromptCatalog",
+    "MissingPromptSectionError",
+    "MissingSectionKindError",
+    "PromptAssembler",
+    "PromptSectionRegistry",
+    "PromptTemplate",
+    "PromptTemplateConfig",
+    "PromptTemplateProvider",
+    "PromptTemplateSelector",
+    "PromptTemplateVariant",
+    "PromptTrace",
+    "PureSection",
+    "SectionKind",
+    "SectionManifest",
+    "SectionOutput",
+    "SectionReference",
+    "SectionTrace",
+    "SelectorDecisionPath",
+    "StatefulSection",
+    "normalize_assembler_result",
+    "normalize_selector_result",
+]

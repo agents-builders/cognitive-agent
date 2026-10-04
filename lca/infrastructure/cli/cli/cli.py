@@ -1,0 +1,214 @@
+"""CLI entry point — thin shell that delegates to focused command modules.
+
+Responsibilities:
+- Construct the typer app with the operator-facing ``GUIDE`` banner.
+- Register every command group via its ``register(app)`` entry point.
+- Forward ``lca-ops logs`` to ``journal logs`` (legacy alias kept for
+  documentation and tests that still reference the old name; see
+  ``logs_alias``).
+
+The banner text itself lives in :mod:`lca.infrastructure.cli.guide`.
+Command surface lives in :mod:`lca.infrastructure.cli.commands`.
+
+Backward compatibility: ``from lca.infrastructure.cli.cli.cli import app``
+still works — tests and scripts import ``app`` directly.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import typer
+
+# Side-effect import: ``lca.infrastructure.cli.steps`` populates the global
+# step registry that ``commands.workflow`` and ``commands.services``
+# look up via ``build_pipeline``. The modules themselves never reference
+# step functions by name; the import here is the only place that wires
+# the registry before any command runs.
+import lca.infrastructure.cli.steps.steps  # noqa: F401
+from lca.infrastructure.cli.commands import (
+    assistants,
+    audit,
+    composio,
+    creator_plan,
+    declarative,
+    driver_debug,
+    e2e,
+    events_delivery,
+    journal,
+    journal_exceptions,
+    journal_replay,
+    journal_session,
+    journal_step,
+    journal_steps,
+    journal_trace,
+    kernel,
+    memory,
+    notes,
+    observation,
+    package_organization,
+    profile_inspect,
+    runs,
+    services,
+    tools,
+    typecheck,
+    workflow,
+)
+from lca.infrastructure.cli.commands.kernel import supervisor as kernel_supervisor_mod
+from lca.infrastructure.cli.guide.guide import GUIDE
+
+app = typer.Typer(
+    name="lca-ops",
+    help=GUIDE,
+    rich_markup_mode=None,
+    add_completion=False,
+    invoke_without_command=True,
+    context_settings={"help_option_names": ["--help", "-h"]},
+)
+
+
+@app.callback()
+def _root(ctx: typer.Context) -> None:
+    if ctx.invoked_subcommand is None:
+        typer.echo(GUIDE)
+        raise typer.Exit(0)
+
+
+# Register all command groups (skip retired composition/declarative-graph
+# modules that fail to import under ADR-0221 P3).
+for _cmd in (
+    workflow,
+    services,
+    journal,
+    runs,
+    assistants,
+    e2e,
+    tools,
+    driver_debug,
+    profile_inspect,
+    events_delivery,
+    package_organization,
+    audit,
+    creator_plan,
+    composio,
+    declarative,
+):
+    if _cmd is not None:
+        _cmd.register(app)
+# ``journal`` owns the ``journal`` typer group; the four siblings below
+# add their subcommands to that same group rather than calling
+# add_typer again (typer would create a duplicate group entry).
+_journal_group = journal.create_journal_group(app)
+journal.register(app, group=_journal_group)
+journal_steps.register(_journal_group)
+journal_trace.register(_journal_group)
+journal_replay.register(_journal_group)
+journal_exceptions.register(_journal_group)
+journal_step.register(_journal_group)
+journal_session.register(_journal_group)
+kernel.register(app)
+
+kernel_supervisor_mod.register(app)
+notes.register(app)
+memory.register(app)
+typecheck.register(app)
+observation.register(app)
+
+
+# ── legacy alias: `lca-ops logs` → `journal logs` ──────────────────
+# Kept because the canonical name changed and external references
+# (kernel boot trace docstring, agent runbook examples, tests
+# test_plugin_tree_single_owner.py) still spell ``lca-ops logs``. The
+# handler is a one-line forward — no flag duplication.
+
+
+@app.command(
+    name="logs",
+    help="(alias for `journal logs`) tail the spine SSOT of the latest run.",
+)
+def logs_alias(
+    target: str = typer.Argument(
+        "",
+        help="空=tail 最新 run；lobehub | lobehub-spa | daemon = 进程日志(同 journal logs)",
+    ),
+    replay: str = typer.Option("", "--replay", "-r", help="(同 -r) 离线回放指定 run_id"),
+    verbose: bool = typer.Option(
+        False, "--verbose", "-v", help="(同 -v) 显示完整 payload + sidecar traceback"
+    ),
+    config: Path | None = typer.Option(  # noqa: B008 -- standard typer pattern: Option() in defaults is the documented typer idiom
+        None, "--config", "-c", help="(同 -c) 配置文件"
+    ),
+) -> None:
+    """Forward all args to ``journal logs``. See ``journal logs --help``."""
+    from lca.infrastructure.cli.commands.journal.journal import _follow_spine_ssot
+
+    _follow_spine_ssot(replay=replay, verbose=verbose)
+
+
+# ── top-level alias: `lca-ops timeline <run_id>` → `observation run-replay --show-graph` ──
+# First-step entry point for run debugging: shows the phase-graph node/subgraph
+# timeline from the spine ledger.  See docs/debug/run-debug-guide.md Step 1.
+# delete-when: never (the alias is the documented first step).
+
+
+@app.command(
+    name="timeline",
+    help=(
+        "Show the phase-graph timeline for a run (alias for "
+        "`observation run-replay <run_id> --show-graph`).  Run-debug Step 1."
+    ),
+)
+def timeline_alias(
+    run_id: str = typer.Argument(
+        ...,
+        help="run_id (例: run_xxx); default to latest under traces/runs/.",
+    ),
+    show_graph: bool = typer.Option(
+        True,
+        "--show-graph/--no-show-graph",
+        help="Print phase_graph node/subgraph timeline from spine (default: on).",
+    ),
+    as_json: bool = typer.Option(
+        False,
+        "--json",
+        help="JSON output (default: human).",
+    ),
+) -> None:
+    """Forward to ``observation run-replay``.  See ``observation run-replay --help``."""
+    from lca.infrastructure.cli.commands.observation.run_replay import run_replay_command
+
+    run_replay_command(run_id=run_id, show_graph=show_graph, as_json=as_json)
+
+
+# ── top-level alias: `lca-ops debug-graph <run_id>` → `observation debug-graph` ──
+# 一次性图 + 节点真实 payload + reducer 决策 + 自动根因。直读 spine,
+# 不依赖 observation-9module bundle(``explain`` / ``run-replay`` 在物化
+# 缺失的 run 上返 0;这条不会)。 SSOT 入口,agent 第一查询。
+# delete-when: never (顶层 alias 是文档化入口)。
+
+
+@app.command(
+    name="debug-graph",
+    help=(
+        "Run debug one-shot: graph skeleton + per-node input/output payload + "
+        "reducer decisions + llm responses + auto root-cause markers. Reads "
+        "spine directly; works even when journal.json has not materialized."
+    ),
+)
+def debug_graph_alias(
+    run_id: str = typer.Argument(..., help="run_id (例: run_xxx)"),
+    as_json: bool = typer.Option(False, "--json", help="JSON output (default: human)."),
+) -> None:
+    """Forward to ``observation debug-graph``.  See ``observation debug-graph --help``."""
+    from lca.infrastructure.cli.commands.observation.debug_graph import debug_graph_command
+
+    debug_graph_command(run_id=run_id, as_json=as_json)
+
+
+def main() -> None:
+    """Entry point for scripts/lca-ops."""
+    app()
+
+
+if __name__ == "__main__":
+    main()

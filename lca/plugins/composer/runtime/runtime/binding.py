@@ -1,0 +1,157 @@
+"""Bind a complete AgentGraph into immutable runtime bindings.
+
+The production dependency value lives in ``runtime_deps``. This module owns
+only the binding action: validating graph completeness, resolving plan-selected
+inputs, and delegating the final immutable binding construction.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from typing import TYPE_CHECKING
+
+from lca.contracts.mechanisms import consume
+from lca.contracts.models.team.role.team import ToolPermissionManifest
+from lca.contracts.protocols.declarative.declarative_1.node_executor import NodeExecutor
+from lca.contracts.protocols.session.resume.input import ResumeInputAdapter
+from lca.contracts.protocols.state.plan import CompiledRunPlan
+from lca.plugins.composer.runtime.runtime.deps import ProductionRuntimeDeps
+from lca.runtime.support.runtime_bindings import DeclarativeRuntimeBindings
+
+if TYPE_CHECKING:
+    from cordis import Context
+
+    from lca.contracts.harness.composition.composer import AgentGraph
+    from lca.contracts.protocols.journal.spec.spec import AgentSpec
+    from lca.plugins.composer.runtime.runtime.capabilities import RuntimeCapabilityClosure
+
+
+def from_runtime_graph(
+    *,
+    graph: AgentGraph,
+    capabilities: RuntimeCapabilityClosure,
+    compiled_plan: CompiledRunPlan,
+    node_executors: Mapping[str, NodeExecutor],
+    resume_input_adapter: ResumeInputAdapter,
+    permission_manifest: ToolPermissionManifest | None = None,
+) -> ProductionRuntimeDeps:
+    """Adapt graph facts to the dependency value at the binding seam."""
+    return ProductionRuntimeDeps(
+        brain=graph.brain,
+        body=graph.body,
+        memory=consume("memory", graph.memory, from_runtime_graph),
+        hooks=graph.hooks,
+        state_store=consume("state_store", graph.state_store, from_runtime_graph),
+        perceive_hub=graph.perceive_hub,
+        llm=graph.llm,
+        permission_manifest=permission_manifest,
+        reducer=capabilities.reducer,
+        compiled_plan=compiled_plan,
+        node_executors=node_executors,
+        phase_capabilities=graph.phase_capabilities,
+        effect_handler_registry=capabilities.effect_handler_registry,
+        delta_handler_registry=capabilities.delta_handler_registry,
+        artifact_closure=capabilities.artifact_closure,
+        idempotency_store=capabilities.idempotency_store,
+        resume_input_adapter=resume_input_adapter,
+        effect_dispatcher_factory=capabilities.effect_dispatcher_factory,
+        delta_reducer_factory=capabilities.delta_reducer_factory,
+        journal_factory=capabilities.journal_factory,
+        interpreter_factory=capabilities.interpreter_factory,
+        checkpoint_state_resolver_factory=capabilities.checkpoint_state_resolver_factory,
+        result_finalizer_factory=capabilities.result_finalizer_factory,
+        phase_observer=capabilities.phase_observer,
+        lifecycle_publisher=capabilities.lifecycle_publisher,
+    )
+
+
+def build_production_runtime_bindings(
+    deps: ProductionRuntimeDeps,
+) -> DeclarativeRuntimeBindings:
+    """Freeze one complete production closure before a runtime factory runs."""
+    return DeclarativeRuntimeBindings.assemble(
+        plan=deps.compiled_plan,
+        node_executors=deps.node_executors,
+        capabilities=deps.runtime_phase_capabilities(),
+        reducer=deps.reducer,
+        hooks=deps.hooks,
+        effect_handler_registry=deps.effect_handler_registry,
+        delta_handler_registry=deps.delta_handler_registry,
+        artifact_closure=deps.artifact_closure,
+        idempotency_store=deps.idempotency_store,
+        resume_input_adapter=deps.resume_input_adapter,
+        state_store=deps.state_store,
+        effect_dispatcher_factory=deps.effect_dispatcher_factory,
+        delta_reducer_factory=deps.delta_reducer_factory,
+        journal_factory=deps.journal_factory,
+        interpreter_factory=deps.interpreter_factory,
+        checkpoint_state_resolver_factory=deps.checkpoint_state_resolver_factory,
+        result_finalizer_factory=deps.result_finalizer_factory,
+        # phase_observer=capabilities.phase_observer remains selected by the closure.
+        phase_observer=deps.phase_observer,
+        lifecycle_publisher=deps.lifecycle_publisher,
+    )
+
+
+def bind_runtime_graph(
+    capabilities: RuntimeCapabilityClosure,
+    *,
+    spec: AgentSpec,
+    graph: AgentGraph,
+    plan: CompiledRunPlan,
+    scope: Context,
+) -> DeclarativeRuntimeBindings:
+    """close one complete graph into immutable runtime bindings at one seam."""
+    from lca.plugins.composer.runtime.runtime.capabilities import (
+        require_complete_runtime_graph,
+        resolve_node_executor_bindings,
+        resolve_resume_input_adapter,
+    )
+
+    require_complete_runtime_graph(graph)
+    node_executors = resolve_node_executor_bindings(scope)
+    resume_input_adapter = resolve_resume_input_adapter(
+        spec,
+        capabilities.resume_input_adapters,
+    )
+    permission_manifest = _resolve_permission_manifest(scope)
+    deps = from_runtime_graph(
+        graph=graph,
+        capabilities=capabilities,
+        compiled_plan=plan,
+        node_executors=node_executors,
+        resume_input_adapter=resume_input_adapter,
+        permission_manifest=permission_manifest,
+    )
+    return build_production_runtime_bindings(deps)
+
+
+def _resolve_permission_manifest(scope: Context) -> ToolPermissionManifest | None:
+    """Pick the highest-precedence ``permission_manifest.*`` from booted scope.
+
+    Wildcard ``require_matching`` requires the consumer to declare a
+    ``permission_manifest.*`` requires, but at composition time there is no
+    consumer — we walk the booted ctx bindings directly. ``None`` keeps
+    the historical fail-loud default ("manifest missing → deny") at the
+    envelope gate.
+    """
+    try:
+        from lca.harness.plugin.context import collect_context_bindings
+    except ImportError:
+        return None
+    matches = {
+        key: value
+        for key, value in collect_context_bindings(scope).items()
+        if isinstance(key, str) and key.startswith("permission_manifest.")
+    }
+    if not matches:
+        return None
+    return next(iter(matches.values()))
+
+
+__all__ = [
+    "ProductionRuntimeDeps",
+    "bind_runtime_graph",
+    "build_production_runtime_bindings",
+    "from_runtime_graph",
+]

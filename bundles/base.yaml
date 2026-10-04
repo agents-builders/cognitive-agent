@@ -1,0 +1,620 @@
+entries:
+- id: lca-decision-classifier-seam
+  name: lca_decision_classifier_seam
+  $module: lca.plugins.gate.decision_classifier_seam
+  config: {}
+- id: lca-factory-seams-default
+  name: lca_factory_seams_default
+  $module: lca.plugins.gate.factory_seams_seam
+  config: {}
+- id: lca-cognitive-think-pipeline-standard
+  name: lca_cognitive_think_pipeline_standard
+  $module: lca.plugins.think.cognitive.think_pipeline_provider
+  config: {}
+- id: lca-cognitive-reflection-pipeline-standard
+  name: lca_cognitive_reflection_pipeline_standard
+  $module: lca.plugins.think.cognitive.reflection_pipeline_provider
+  config: {}
+- id: lca-tools-service
+  name: lca_tools_service
+  $module: lca.plugins.act.tools.seam
+  config: {}
+- id: lca-transport-service
+  name: lca_transport_service
+  $module: lca.plugins.act.transport.seam
+  config: {}
+- id: lca-skills-service
+  name: lca_skills_service
+  $module: lca.plugins.memory.seams.skills_seam
+  config: {}
+- id: lca-file-store-service
+  name: lca_file_store_service
+  $module: lca.plugins.memory.seams.file_store_seam
+  config: {}
+- id: lca-observability-service
+  name: lca_observability_service
+  $module: lca.plugins.perceive.observability.service_seam
+  config: {}
+- id: lca-sandbox-service
+  name: lca_sandbox_service
+  $module: lca.plugins.act.sandbox.seam
+  config: {}
+- id: lca-memory-service
+  name: lca_memory_service
+  $module: lca.plugins.memory.seams.memory_seam
+  config: {}
+- id: lca-search-service
+  name: lca_search_service
+  $module: lca.plugins.memory.seams.search_seam
+  config: {}
+- id: lca-state-store-service
+  name: lca_state_store_service
+  $module: lca.plugins.state.state.store_seam
+  config: {}
+- id: phase.think.reasoner.credentials
+  name: phase_think_reasoner_credentials
+  $module: lca.plugins.think.reasoner.credentials
+  config: {}
+- id: lca-llm-resolver
+  name: lca_llm_resolver
+  $module: lca.plugins.think.reasoner.llm_resolver
+  config: {}
+- id: phase.think.shortcut
+  name: phase_think_shortcut
+  $module: lca.nodes.think.route.shortcut
+  config: {}
+- id: phase.think.route
+  name: phase_think_route
+  $module: lca.nodes.think.route.route
+  config: {}
+- id: phase.think.route.decide
+  name: phase_think_route_decide
+  $module: lca.nodes.think.route.decide
+  config: {}
+# PR-B typed-port rewrite: budget gate now reads a typed ``budget``
+# port (no more ``context.runtime.state`` theft). Same SSOT
+# (``Budget.exceeded``), same declaration-order tie break — emits a
+# ``RoutingDecision`` typed port (ADR-0219 §5.5, ADR-0225, ADR-0228).
+- id: phase.think.budget.gate
+  name: phase_think_budget_gate
+  $module: lca.nodes.think.budget.threshold_gate
+  config: {}
+# PR-B: truncation node owns only the ``truncate_oldest`` strategy.
+# Reads the typed ``budget`` + ``context_payload`` ports; emits a
+# ``CompactReceipt`` (no routing — the gate decision moved up to
+# ``phase.think.budget.gate``).
+- id: phase.think.context.truncate
+  name: phase_think_context_truncate
+  $module: lca.nodes.think.context.truncate
+  config: {}
+# ADR-0283: sediment-before-compact + structured summary. Replaces
+# ``phase.think.context.truncate`` on the think subgraph under-cap path
+# (truncate retired from the plan; its module stays registered).
+- id: phase.think.context.summarize
+  name: phase_think_context_summarize
+  $module: lca.nodes.think.context.summarize
+  config: {}
+- id: lca.nodes.plan.compose
+  name: lca_nodes_plan_compose
+  $module: lca.nodes.plan.compose
+  config: {}
+# PR-3.7.b: plan.revise sibling node. Reads ``state`` + ``reflection``
+# ports; emits a revised ``TaskList`` typed port (ADR-0228 §Decision 3).
+- id: lca.nodes.plan.revise
+  name: lca_nodes_plan_revise
+  $module: lca.nodes.plan.revise
+  config: {}
+- id: phase.think.gate
+  name: phase_think_gate
+  $module: lca.nodes.think.gate
+  config: {}
+- id: phase.think.reason.plan
+  name: phase_think_reason_plan
+  $module: lca.nodes.think.reason.plan
+  config: {}
+- id: phase.think.reason.render
+  name: phase_think_reason_render
+  $module: lca.nodes.think.reason.render
+  config: {}
+- id: phase.think.history.derive
+  name: phase_think_history_derive
+  $module: lca.nodes.think.history.assemble
+  config: {}
+# PR-B: typed-port split of the prior ``phase.think.llm.call``
+# (which mixed adapter.stream + writer.append). Two single-responsibility
+# nodes — ``invoke`` drives the LLM adapter, ``persist`` writes the
+# journal — both pure typed-port nodes (no runtime theft).
+- id: phase.think.llm.invoke
+  name: phase_think_llm_invoke
+  $module: lca.nodes.think.llm.invoke
+  config: {}
+- id: phase.think.llm.persist
+  name: phase_think_llm_persist
+  $module: lca.nodes.think.llm.persist
+  config: {}
+- id: phase.think.decision.parse
+  name: phase_think_decision_parse
+  $module: lca.nodes.think.decision.parse
+  config: {}
+# PR-3.8.3: typed-boundary repair node between think.decision.parse
+# and think.gate. Reads the parsed Decision + tools runtime
+# registry; emits either the original / repaired Decision plus a
+# RoutingDecision that forwards to think.gate (ok / repaired) or
+# re-routes to think.route.decide (rejected_schema /
+# rejected_truncated). No per-node max_visits (ADR-0225).
+- id: phase.think.decision.repair
+  name: phase_think_decision_repair
+  $module: lca.nodes.think.decision_repair
+  config: {}
+
+# Six-phase subgraph node plugins (ADR-0221). Each phase subgraph is a
+# multi-node typed port graph; the nodes below are the leaf executors
+# wired into the corresponding subgraph bundles
+# (``bundles/{perceive,reflect,remember,stop}_subgraph.yaml``). No
+# phase host / standard shim: every node plugin implements
+# ``NodeExecutor`` directly.
+- id: phase.perceive.observe
+  name: phase_perceive_observe
+  $module: lca.nodes.perceive.observe.observe
+  config: {}
+- id: phase.perceive.memory_retrieve
+  name: phase_perceive_memory_retrieve
+  $module: lca.nodes.perceive.memory_retrieve.memory_retrieve
+  config: {}
+- id: phase.perceive.fold
+  name: phase_perceive_fold
+  $module: lca.nodes.perceive.fold.fold
+  config: {}
+- id: phase.reflect.score
+  name: phase_reflect_score
+  $module: lca.nodes.reflect.score.score
+  config: {}
+- id: phase.reflect.memory.extract
+  name: phase_reflect_memory_extract
+  $module: lca.nodes.reflect.memory_extract.memory_extract
+  config: {}
+- id: phase.reflect.admit_recovery
+  name: phase_reflect_admit_recovery
+  $module: lca.nodes.reflect.admit_recovery.admit_recovery
+  config: {}
+- id: phase.remember.admit
+  name: phase_remember_admit
+  $module: lca.nodes.remember.admit.admit
+  config: {}
+- id: phase.remember.write
+  name: phase_remember_write
+  $module: lca.nodes.remember.write.write
+  config: {}
+- id: phase.remember.fold
+  name: phase_remember_fold
+  $module: lca.nodes.remember.fold.fold
+  config: {}
+- id: phase.delegate.fold
+  name: phase_delegate_fold
+  $module: lca.nodes.delegate.fold
+  config: {}
+- id: lca.nodes.delegate.compose
+  name: lca_nodes_delegate_compose
+  $module: lca.nodes.delegate.compose
+  config: {}
+- id: control.perceive.context
+  name: control_perceive_context
+  $module: lca.plugins.loop.control.perceive_context.plugin
+  config: {}
+- id: control.think.guard
+  name: control_think_guard
+  $module: lca.plugins.loop.control.think_guard.plugin
+  config: {}
+- id: control.remember.admit
+  name: control_remember_admit
+  $module: lca.plugins.loop.control.remember_admit.plugin
+  config: {}
+- id: control.observe.checkpoint
+  name: control_observe_checkpoint
+  $module: lca.plugins.loop.control.observe_checkpoint.plugin
+  config: {}
+- id: control.observe.wildcard
+  name: control_observe_wildcard
+  $module: lca.plugins.loop.control.observe_wildcard.plugin
+  config: {}
+
+- id: phase.primitive.capability.fork.dispatch
+  name: phase_primitive_capability_fork_dispatch
+  $module: lca.plugins.primitive.capability_fork.dispatch
+  config: {}
+- id: phase.concept.tool.fork.dispatch
+  name: phase_concept_tool_fork_dispatch
+  $module: lca.nodes.concept.tool_fork.dispatch
+  config: {}
+- id: phase.concept.role_snapshot.capability_role_normalize
+  name: phase_concept_role_snapshot_capability_role_normalize
+  $module: lca.nodes.concept.role_snapshot.normalize
+  config: {}
+- id: phase.concept.role_snapshot.capability_role_compose
+  name: phase_concept_role_snapshot_capability_role_compose
+  $module: lca.nodes.concept.role_snapshot.compose
+  config: {}
+- id: phase.concept.context_compose.context_lines_collect
+  name: phase_concept_context_compose_context_lines_collect
+  $module: lca.nodes.concept.context_compose.collect
+  config: {}
+- id: phase.concept.context_compose.context_skills_merge
+  name: phase_concept_context_compose_context_skills_merge
+  $module: lca.nodes.concept.context_compose.skills
+  config: {}
+- id: phase.concept.template_select.prompt_candidate_enumerate
+  name: phase_concept_template_select_prompt_candidate_enumerate
+  $module: lca.nodes.concept.template_select.enumerate
+  config: {}
+- id: phase.concept.template_select.prompt_candidate_score
+  name: phase_concept_template_select_prompt_candidate_score
+  $module: lca.nodes.concept.template_select.score
+  config: {}
+- id: phase.concept.template_select.prompt_candidate_pick
+  name: phase_concept_template_select_prompt_candidate_pick
+  $module: lca.nodes.concept.template_select.pick
+  config: {}
+- id: phase.concept.decision_classify.decision_parse_response
+  name: phase_concept_decision_classify_decision_parse_response
+  $module: lca.nodes.concept.decision_classify.parse_tool_calls
+  config: {}
+- id: phase.concept.decision_classify.decision_compose_action
+  name: phase_concept_decision_classify_decision_compose_action
+  $module: lca.nodes.concept.decision_classify.compose_action
+  config: {}
+- id: phase.concept.decision_enforce.gate_chain_run
+  name: phase_concept_decision_enforce_gate_chain_run
+  $module: lca.nodes.concept.decision_enforce.chain_run
+  config: {}
+- id: phase.concept.decision_enforce.gate_chain_reject
+  name: phase_concept_decision_enforce_gate_chain_reject
+  $module: lca.nodes.concept.decision_enforce.chain_reject
+  config: {}
+- id: phase.concept.act_subgraph.act_validate
+  name: phase_concept_act_subgraph_act_validate
+  $module: lca.nodes.act.validate.validate
+  config: {}
+- id: phase.concept.act_subgraph.act_authorize
+  name: phase_concept_act_subgraph_act_authorize
+  $module: lca.nodes.act.authorize.authorize
+  config: {}
+- id: phase.concept.act_subgraph.act_envelope
+  name: phase_concept_act_subgraph_act_envelope
+  $module: lca.nodes.act.envelope.envelope
+  config: {}
+# PR-3.8.4: typed-boundary 1:1 fan-out node. Reads ``envelope`` and
+# emits ``envelope`` (pass-through), ``envelopes`` (list-of-one on the
+# 1:1 path), and ``routing``; orchestrator only (no execution).
+- id: phase.concept.act_subgraph.act_fanout
+  name: phase_concept_act_subgraph_act_fanout
+  $module: lca.nodes.act.fanout
+  config: {}
+# PR-3.8.5: typed-boundary 1:1 receipt-join node. Reads ``receipts``
+# (list[EffectReceipt]) and emits ``receipt`` (singular) plus
+# ``routing``; orchestrator only (no execution). N:N reject branch
+# routes via kernel ``select_edge → None`` (terminal dispatch).
+- id: phase.concept.act_subgraph.act_join
+  name: phase_concept_act_subgraph_act_join
+  $module: lca.nodes.act.join
+  config: {}
+- id: phase.concept.act_subgraph.act_observe
+  name: phase_concept_act_subgraph_act_observe
+  $module: lca.nodes.act.observe.observe
+  config: {}
+# PR-3 close-out: the act.observe → commit_fact → terminate_decide split
+# (commit 0377d2ac4) shipped the two new @plugin(...) modules in
+# lca/nodes/act/observe/ but did not register them in base.yaml, so
+# plan_lift's node-executor coverage check rejected the subgraph with
+# "no enabled plugin provides act::act.observe.commit_fact" /
+# "act::act.observe.terminate_decide". These two entries close the
+# AGENTS.md §5 contract loop: split node → plugin module →
+# bundle manifest → enable via profile.
+- id: phase.concept.act_subgraph.act_observe_commit_fact
+  name: phase_concept_act_subgraph_act_observe_commit_fact
+  $module: lca.nodes.act.observe.commit_fact
+  config: {}
+- id: phase.concept.act_subgraph.act_observe_terminate_decide
+  name: phase_concept_act_subgraph_act_observe_terminate_decide
+  $module: lca.nodes.act.observe.terminate_decide
+  config: {}
+- id: phase.concept.effect_execute.effect_execute
+  name: phase_concept_effect_execute_effect_execute
+  $module: lca.nodes.concept.effect.execute
+  config: {}
+# ADR-0234 / PR-2: 5-gate atomic envelope check extracted from
+# PipelineSafeExecutor into a typed-port graph node. Sits before
+# act.dispatch in the act subgraph.
+- id: phase.concept.effect.pre_dispatch_envelope_check
+  name: phase_concept_effect_pre_dispatch_envelope_check
+  $module: lca.nodes.effect.pre_dispatch_envelope_check
+  config: {}
+# PR-2 close-out: provider for the ``permission_manifest.*`` capability
+# the envelope check requires. Deny-by-default; production profiles
+# ship their own ``permission_manifest.<name>`` provider and disable
+# this one.
+- id: lca-effect-permission-manifest-default
+  name: lca_effect_permission_manifest_default
+  $module: lca.nodes.effect.permission_manifest_default
+  config: {}
+- id: lca-memory-write-policy-simple
+  name: lca_memory_write_policy_simple
+  $module: lca.plugins.memory.policy.write_policy
+  config:
+    min_confidence: 0.5
+- id: lca-memory-compaction-policy-simple
+  name: lca_memory_compaction_policy_simple
+  $module: lca.plugins.memory.policy.compaction_policy
+  config: {}
+- id: lca-retrieval-layered
+  name: lca_retrieval_layered
+  $module: lca.plugins.memory.policy.layered_retrieval
+  config: {}
+- id: lca-memory-provider
+  name: lca_providers_memory
+  $module: lca.plugins.memory.providers.memory_provider
+  config:
+    providers:
+    - simple
+    - temporal
+- id: lca-state-store-provider
+  name: lca_providers_state_store
+  $module: lca.plugins.state.state.store_provider
+  config:
+    providers:
+    - memory
+    active_provider: memory
+- id: lca-search-provider
+  name: lca_providers_search
+  $module: lca.plugins.memory.providers.search_provider
+  config:
+    providers:
+    - tavily
+- id: lca-tools-provider
+  name: lca_providers_tools
+  $module: lca.plugins.act.tools.provider
+  config:
+    factories:
+    - g2a
+    - mcp
+    - tool_search
+- id: lca-transport-provider
+  name: lca_providers_transport
+  $module: lca.plugins.act.transport.provider
+  config:
+    providers:
+    - internal
+    - a2a
+    - mcp
+- id: lca-skills-provider
+  name: lca_providers_skills
+  $module: lca.plugins.memory.providers.skills_provider
+  config:
+    providers:
+    - disk
+- id: lca-file-store-provider
+  name: lca_providers_file_store
+  $module: lca.plugins.memory.providers.file_store_provider
+  config:
+    providers:
+    - local
+- id: lca-sandbox-provider
+  name: lca_providers_sandbox
+  $module: lca.plugins.act.sandbox.provider
+  config:
+    providers:
+    - local
+- id: lca-event-descriptor-registry
+  name: lca_seam_event_descriptor
+  $module: lca.plugins.observability.event.descriptor_seam
+  config: {}
+- id: lca-event-descriptor-bootstrap
+  name: lca_providers_event_descriptor
+  $module: lca.plugins.observability.event.descriptor_provider
+  config: {}
+- id: lca-journal-store-factory-registry
+  name: lca_seam_journal_store
+  $module: lca.plugins.journal.journal.store_factories_seam
+  config: {}
+- id: lca-fact-store-memory-factory
+  name: lca_providers_fact_store_memory
+  $module: lca.plugins.journal.fact.store_memory_provider
+  config: {}
+- id: lca-journal-seam
+  name: lca_seam_journal
+  $module: lca.plugins.observability.journal.seam
+  config: {}
+- id: lca-tracer-seam
+  name: lca_seam_tracer
+  $module: lca.plugins.observability.tracer.seam
+  config: {}
+- id: lca-attribute-policy-seam
+  name: lca_seam_attribute_policy
+  $module: lca.plugins.observability.attribute.policy_seam
+  config: {}
+- id: lca-fact-reader-seam
+  name: lca_seam_fact_reader
+  $module: lca.plugins.observability.fact_1.fact_reader_seam
+  config: {}
+- id: lca-fact-scorer-seam
+  name: lca_seam_fact_scorer
+  $module: lca.plugins.observability.fact_2.fact_scorer_seam
+  config: {}
+- id: lca-journal-memory-factory
+  name: lca_providers_journal_memory
+  $module: lca.plugins.memory.store.journal_memory_provider
+  config: {}
+- id: lca-tracer-otel-factory
+  name: lca_providers_tracer_otel
+  $module: lca.plugins.observability.tracer.otel_provider
+  config: {}
+- id: lca-attribute-policy-default-factory
+  name: lca_providers_attribute_policy
+  $module: lca.plugins.observability.attribute.policy_provider
+  config: {}
+- id: lca-fact-reader-console-factory
+  name: lca_providers_fact_reader_console
+  $module: lca.plugins.observability.fact_1.fact_reader_console_provider
+  config: {}
+- id: lca-fact-reader-otel-factory
+  name: lca_providers_fact_reader_otel
+  $module: lca.plugins.observability.fact_1.fact_reader_otel_provider
+  config: {}
+- id: lca-fact-reader-langfuse-factory
+  name: lca_providers_fact_reader_langfuse
+  $module: lca.plugins.observability.fact_1.fact_reader_langfuse_provider
+  config: {}
+- id: lca-langfuse-eval-scorer
+  name: lca_providers_fact_scorer_langfuse
+  $module: lca.plugins.observability.fact_1.fact_scorer_langfuse_provider
+  config: {}
+- id: lca-trace-tool-seam
+  name: lca_seam_trace_tool
+  $module: lca.plugins.observability.trace.tool_seam
+  config: {}
+- id: lca-trace-tool-provider
+  name: lca_providers_trace_tool
+  $module: lca.plugins.observability.trace.tool_provider
+  config: {}
+- id: lca-cli-debug-command-seam
+  name: lca_seam_cli_debug
+  $module: lca.plugins.observability.cli.debug_seam
+  config: {}
+- id: lca-cli-debug-trace
+  name: lca_providers_cli_debug_trace
+  $module: lca.plugins.observability.cli.debug_trace_provider
+  config: {}
+- id: lca-genai-semantic-mapper-seam
+  name: lca_seam_genai
+  $module: lca.plugins.observability.genai.seam
+  config: {}
+- id: lca-genai-llm-mapper
+  name: lca_providers_genai_llm
+  $module: lca.plugins.observability.genai.llm_provider
+  config: {}
+- id: lca-genai-tool-mapper
+  name: lca_providers_genai_tool
+  $module: lca.plugins.observability.genai.tool_provider
+  config: {}
+- id: lca-idempotency-store-seam
+  name: lca_seam_idempotency_store
+  $module: lca.plugins.journal.idempotency.store_seam
+  config: {}
+- id: lca-effect-handler-registry-seam
+  name: lca_seam_effect_handler_registry
+  $module: lca.plugins.act.effect.handler_seam
+  config: {}
+- id: lca-effect-handler-provider
+  name: lca_effect_handler_provider
+  $module: lca.plugins.act.effect.handlers_provider
+  config: {}
+- id: lca-delta-handler-registry-seam
+  name: lca_seam_delta_handler_registry
+  $module: lca.plugins.act.delta.handler_seam
+  config: {}
+- id: lca-delta-handler-provider
+  name: lca_delta_handler_provider
+  $module: lca.plugins.act.delta.handlers_provider
+  config: {}
+- id: lca-declarative-runtime-seams-provider
+  name: lca_declarative_runtime_seams_provider
+  $module: lca.plugins.journal.declarative.runtime_seams_provider
+  config: {}
+- id: lca-cognitive-runtime-factory
+  name: lca_cognitive_runtime_factory
+  $module: lca.plugins.journal.runtime.factory_provider
+  config: {}
+- id: lca-artifact-closure-provider
+  name: lca_artifact_closure_provider
+  $module: lca.plugins.journal.artifact.closure_provider
+  config: {}
+- id: lca-phase-observer-registry-seam
+  name: lca_phase_observer_registry_seam
+  $module: lca.plugins.perceive.phase.observer_registry_seam
+  config: {}
+- id: lca-phase-observer-tracing-provider
+  name: lca_phase_observer_tracing_provider
+  $module: lca.plugins.perceive.phase.observer_tracing_provider
+  config: {}
+- id: lca-phase-observer-provider
+  name: lca_phase_observer_provider
+  $module: lca.plugins.perceive.phase.observer_provider
+  config:
+    failure_mode: fail_open
+- id: lca-runtime-lifecycle-subscriber-registry-seam
+  name: lca_runtime_lifecycle_subscriber_registry_seam
+  $module: lca.plugins.state.runtime.lifecycle_registry_seam
+  config: {}
+- id: lca-runtime-lifecycle-logging-provider
+  name: lca_runtime_lifecycle_logging_provider
+  $module: lca.plugins.state.runtime.lifecycle_logging_provider
+  config:
+    priority: 100
+- id: lca-runtime-lifecycle-publisher
+  name: lca_runtime_lifecycle_publisher
+  $module: lca.plugins.state.runtime.lifecycle_provider
+  config:
+    failure_mode: fail_open
+- id: lca-team-shared-memory-default
+  name: lca_team_shared_memory_default
+  $module: lca.plugins.collaboration.team_2.team_shared_memory_seam
+  config: {}
+- id: lca-team-communication-default
+  name: lca_team_communication_default
+  $module: lca.plugins.collaboration.team_1.team_communication_seam
+  config: {}
+- id: lca-team-role-library-default
+  name: lca_team_role_library_default
+  $module: lca.plugins.collaboration.team_1.team_role_library_seam
+  config: {}
+- id: lca-team-casting-prompt-renderer-builtin
+  name: lca_team_casting_prompt_renderer_builtin
+  $module: lca.plugins.collaboration.team_1.team_casting_prompt_renderer_seam
+  config:
+    template_name: casting_prompt
+- id: lca-team-caster-default
+  name: lca_team_caster_default
+  $module: lca.plugins.collaboration.team_1.team_caster_seam
+  config: {}
+- id: lca-team-seam-seam
+  name: lca_seam_team_seam
+  $module: lca.plugins.collaboration.team_1.team_seam_seam
+  config: {}
+- id: lca-run-mode-registry-seam
+  name: lca_seam_run_mode_registry
+  $module: lca.plugins.state.run.mode_registry_seam
+  config: {}
+- id: lca-mode-solo-default
+  name: lca_mode_solo_default
+  $module: lca.plugins.collaboration.modes.solo
+  config: {}
+- id: lca-mode-team-default
+  name: lca_mode_team_default
+  $module: lca.plugins.collaboration.modes.team
+  config: {}
+- id: lca-evidence-store-seam
+  name: lca_seam_evidence_store
+  $module: lca.plugins.observability.evidence.store_seam
+  config: {}
+- id: lca-run-ledger-factory-seam
+  name: lca_seam_run_ledger_factory
+  $module: lca.plugins.observability.run.ledger_seam
+  config: {}
+- id: lca-default-reducer
+  name: lca_default_reducer
+  $module: lca.plugins.loop.reducer.plugin
+  config: {}
+# ADR-0228 §Decision 4: ``intervene.interrupt`` is the typed pause
+# primitive that projects an upstream ``Decision`` into a typed
+# ``Command`` and emits ``RoutingDecision(should_terminate=True)``.
+- id: lca.nodes.intervene.interrupt
+  name: lca_nodes_intervene_interrupt
+  $module: lca.nodes.intervene.interrupt
+  config: {}
+# PR-3.8.6: act.approve.gate is the act-side typed view of the HITL
+# pause/resume seam (ADR-0228 §Decision 4 + borrowed-nodes spec §2.6).
+# Lives under region:intervene (sibling subgraph, not a 7th phase);
+# reads decision + command ports; emits decision + routing ports.
+- id: lca.nodes.intervene.approve_gate
+  name: lca_nodes_intervene_approve_gate
+  $module: lca.nodes.intervene.approve_gate
+  config: {}

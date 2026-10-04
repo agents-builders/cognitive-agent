@@ -1,0 +1,2773 @@
+[project]
+name = "lca-framework"
+version = "0.1.0"
+description = "Layered Cognitive Agent Framework"
+requires-python = ">=3.11"
+dependencies = [
+    "aiofiles>=24.1.0",
+    "httpx>=0.28.1",
+    "openai>=2.0",
+    "opentelemetry-api>=1.44.0",
+    "opentelemetry-sdk>=1.44.0",
+    "pillow>=10.0.0",
+    "pydantic-settings>=2.14.2",
+    "python-dotenv>=1.0",
+    "python-multipart>=0.0.32",
+    "starlette>=0.46",
+    "structlog>=26.1.0",
+    "typer>=0.15.0",
+    "uvicorn[standard]>=0.30.0",
+    "websockets>=14.0",
+    "taiyi-cordis",
+    "taiyi-cosmokit",
+    "taiyi-schemastery",
+    "ulid-py>=1.0.0",
+    "redis>=8.1.0",
+    "cryptography>=50.0.1",
+]
+
+# Health deriver entry-point group (PR-1 / Task 1.2). Discovery goes
+# through ``importlib.metadata.entry_points(group="lca.health_derivers")``
+# in ``lca/plugins/observability/health/run_health_fold.py``. Adding a
+# new deriver = one new file in ``derivers/`` + one line here. No
+# contract change, no fold change, no consumer change. Spec:
+# docs/superpowers/specs/2026-09-16-run-health-and-execution-closure-design.md
+# §2.2 (derivers, entry-point pattern) and §4 (deriver table). Sandbox
+# is folded into ``tool`` as a sub-rule per spec §15 G-21.
+[project.entry-points."lca.health_derivers"]
+perceive = "lca.plugins.observability.health.derivers.perceive_deriver:PerceiveDeriver"
+think = "lca.plugins.observability.health.derivers.think_deriver:ThinkDeriver"
+act = "lca.plugins.observability.health.derivers.act_deriver:ActDeriver"
+tool = "lca.plugins.observability.health.derivers.tool_deriver:ToolDeriver"
+llm = "lca.plugins.observability.health.derivers.llm_deriver:LlmDeriver"
+reflect = "lca.plugins.observability.health.derivers.reflect_deriver:ReflectDeriver"
+remember = "lca.plugins.observability.health.derivers.remember_deriver:RememberDeriver"
+lifecycle = "lca.plugins.observability.health.derivers.lifecycle_deriver:LifecycleDeriver"
+
+[tool.uv.sources]
+taiyi-cordis      = { path = "vendor/cordis" }
+taiyi-cosmokit    = { path = "vendor/cosmokit" }
+taiyi-schemastery = { path = "vendor/schemastery" }
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["lca*", "gateway*", "lca_kernel"]
+exclude = ["tests*", "skills*", "roles*", "profiles*", "bundles*", "history*", "packages*", "deploy*", "vendor*"]
+
+[tool.setuptools.package-data]
+"lca.infrastructure.memory.contextfiles" = ["layout.toml"]
+
+[tool.importlinter]
+root_package = "lca"
+include_external_packages = true
+
+# ── 契约 1: L0→L1→L2→L3 + contracts 严格单向分层 ──
+# 每层只能 import 直接下方一层；contracts 是最底层
+[[tool.importlinter.contracts]]
+name = "严格分层: contracts → L0 → L1 → L2 → L3"
+type = "layers"
+layers = [
+    "lca.agent",
+    "lca.runtime",
+    "lca.cognition",
+    "lca.infrastructure",
+    "lca.contracts",
+]
+
+# ── 契约 2: L4 作为组合根，可依赖所有下层 ──
+# 但下层不得反向依赖 L4（用 forbidden 约束）
+[[tool.importlinter.contracts]]
+name = "L4 组合根: 下层禁止反向依赖"
+type = "forbidden"
+source_modules = [
+    "lca.contracts",
+    "lca.infrastructure",
+    "lca.cognition",
+    "lca.runtime",
+    "lca.agent",
+]
+forbidden_modules = ["lca.application"]
+
+# ── 契约 3: contracts 是纯数据契约层，不得 import 任何实现细节 ──
+[[tool.importlinter.contracts]]
+name = "contracts 纯净性: 不得依赖任何具体实现"
+type = "forbidden"
+source_modules = ["lca.contracts"]
+forbidden_modules = [
+    "lca.infrastructure",
+    "lca.cognition",
+    "lca.runtime",
+    "lca.agent",
+    "lca.application",
+    "lca.harness",
+    "lca.plugins",
+]
+
+# ── 契约 4: harness 实现不得反向依赖认知/运行时/组合根 ──
+[[tool.importlinter.contracts]]
+name = "harness: 不得依赖 L1–L4"
+type = "forbidden"
+source_modules = ["lca.harness"]
+forbidden_modules = [
+    "lca.cognition",
+    "lca.runtime",
+    "lca.agent",
+    "lca.application",
+]
+
+# ── 契约 5: LCA plugin 不得反向依赖 Gateway ──
+# Drivers live in gateway because they bind gateway protocol types
+# (RunSession, PlaneBindings, SOLO_MODE_KEY) to LCA runtime. LCA plugins
+# only provide/require capabilities; they never import gateway directly.
+# Gateway boot calls register_default_drivers() after the plugin tree
+# is up (ADR-0062 §6 / PR-5).
+[[tool.importlinter.contracts]]
+name = "plugins: 不得依赖 gateway (ADR-0119 followup 收紧)"
+type = "forbidden"
+source_modules = ["lca.plugins"]
+forbidden_modules = ["gateway"]
+# ADR-0119 决定 1 followup(本 commit):gateway/ 95 个业务文件全部迁出,
+# ``gateway/`` 目录物理删除,本 contract 永远满足(任何 plugin 不得 import gateway.*)。
+# 紧跟在 PR-2 后的 lca.* namespace 收敛(95 业务文件已迁),ignore_imports 不再需要。
+
+# ── 契约 6: 下层 (L0–L3) 不得 import lca_kernel 内部模块 ──
+# ADR-0115 决定 3: lca_kernel 是顶层 host 包,下层禁止 import。
+# 严格说应禁 lca_kernel 整包 + 公共面(application/cli 走 spawn 入口),
+# 但 CLI kernel command + transport lifespan_adapter 需要走公共面。
+# 用 forbidden (top-level lca_kernel) + ignore_imports 列白名单。
+# 真正对子模块(source/plan/...) 的访问,由
+# ``tests/lca_kernel/test_boundary.py`` AST 检查覆盖。
+[[tool.importlinter.contracts]]
+name = "kernel-domain-isolation: L0–L3 不得 import lca_kernel"
+type = "forbidden"
+source_modules = [
+    "lca.contracts",
+    "lca.infrastructure",
+    "lca.cognition",
+    "lca.runtime",
+    "lca.agent",
+]
+forbidden_modules = ["lca_kernel"]
+ignore_imports = [
+    # CLI 是 kernel 的合法调用方(``lca-ops kernel {boot,serve,stop,compose}``);
+    # 走公共面 import (compile_profile / run_kernel / stop_kernel)。
+    "lca.infrastructure.cli.commands.kernel -> lca_kernel",
+    # events-delivery 诊断命令只读 EventBus 公共面
+    # (default() + delivery_snapshot(), ADR-0184 D2),不触 kernel 内部。
+    "lca.infrastructure.cli.commands.events_delivery -> lca_kernel",
+]
+
+# ── 契约 7: transport plugin 不得 import kernel 内部 + cognition/agent/runtime ──
+# ADR-0115 决定 3: transport (lca/plugins/transport/**) 是独立 transport
+# namespace。通过 ctx.inject 跟 kernel 交互,不直接 import kernel 内部。
+# 公共面(lca_kernel.run_kernel_lifespan / run_kernel / Stage / PatchConfig)
+# 允许走 lifespan_adapter。
+[[tool.importlinter.contracts]]
+name = "transport-isolation: lca.plugins.transport 不得 import cognition / agent / runtime"
+type = "forbidden"
+source_modules = ["lca.plugins.transport"]
+forbidden_modules = [
+    "lca.cognition",
+    "lca.agent",
+    "lca.runtime",
+]
+# lca_kernel 公共面是 transport 的合法依赖,这里只禁认知/运行/Agent 实现。
+
+# ADR-0165.1: business-event-isolation (PR-1 dry-run, PR-5 hard-fail)
+# Business code (cognition / runtime / agent / application) must NOT
+# import the legacy journal backends or spine derivers directly. All
+# emission goes through EventSpine.
+[[tool.importlinter.contracts]]
+name = "business-event-isolation"
+type = "forbidden"
+source_modules = [
+    "lca.cognition",
+    "lca.runtime",
+    "lca.agent",
+    "lca.application",
+]
+forbidden_modules = [
+    "lca.infrastructure.observability.journal.engine",
+    "lca.infrastructure.observability.journal.backends",
+    "lca.infrastructure.observability.journal.stream",
+    "lca.infrastructure.observability.journal.step",
+    "lca.infrastructure.observability.spine.derivers",
+]
+
+[dependency-groups]
+dev = [
+    { include-group = "lint" },
+    { include-group = "typecheck" },
+    { include-group = "test" },
+    { include-group = "security" },
+]
+lint = [
+    "ruff>=0.16.0",
+]
+typecheck = [
+    "mypy>=1.13",
+    "pyright>=1.1.400",
+    "pydantic>=2.9",
+]
+test = [
+    "grimp>=3.0",
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "pytest-cov>=6.0",
+    "pyyaml>=6.0",
+]
+security = [
+    "import-linter>=2.1",
+    "pip-audit>=2.7",
+    "detect-secrets>=1.5",
+    "vulture>=2.13",
+    "interrogate>=1.7",
+]
+llm-openai = [
+    "openai>=2.0",
+    "python-dotenv>=1.0",
+]
+observability-langfuse = [
+    "langfuse>=3.0",
+]
+web = [
+    "starlette>=0.46",
+    "uvicorn>=0.34",
+    "httpx>=0.28",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+# SKILL.md files embed Python code blocks; ruff 0.16+ misinterprets the file as
+# Python when the embedded block parses cleanly. Treat all .md as out of scope.
+# vendor/ holds upstream Cordis/Cosmokit/Schemastery we patch locally; we import
+# them as packages (``from cordis import ...``) and treat the source as read-only
+# (AGENTS.md §7). Lint scope is the ``lca*/`` tree plus this file's own deps.
+extend-exclude = ["*.md", "vendor/*"]
+
+[tool.ruff.lint]
+select = [
+    "E",
+    "W",
+    "F",
+    "I",
+    "UP",
+    "B",
+    "C4",
+    "SIM",
+    "ASYNC",
+    "S",
+    "N",
+    "RUF",
+    "TCH",
+]
+ignore = [
+    "E501",
+    "RUF001",  # 中文全角标点（字符串）
+    "RUF002",  # 中文全角标点（docstring）
+    "RUF003",  # 中文全角标点（注释）
+    "TC001",   # 运行时 import 与 TYPE_CHECKING 混用，首版暂不强制
+    "TC003",   # 同上
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101"]
+# Infra-side test subdirs (e.g. lca/infrastructure/observability/stream/tests/) live
+# inside the package tree, not under tests/. Mirror the same allowance here.
+"lca/**/tests/*.py" = ["S101"]
+"tests/lca_plugins/transport/**/*.py" = ["TC002"]
+"gateway/*" = ["TC002"]
+"scripts/*" = ["S101"]
+"lca/contracts/protocols/**/*.py" = ["ARG002", "TC002"]
+"lca/contracts/mechanisms.py" = ["ARG002"]
+"lca/contracts/action.py" = ["ARG002"]
+# contracts/__init__ is a re-export barrel: __all__ is computed from globals() at
+# module load (see its docstring), so ruff cannot see the re-exports. F401 is a
+# false positive here by design.
+"lca/contracts/__init__.py" = ["F401"]
+# contracts/transport mirrors the native TS wire; camelCase JSON keys (assistantMessage,
+# toolCalling, ...) are intentional byte-compat with the TS source, not Python naming.
+"lca/contracts/transport/**/*.py" = ["N815", "N802"]
+# agent_gateway WS handlers intentionally swallow on reconnect/close/cancel paths
+# (the connection is gone, the call cannot proceed, retrying on the next loop tick
+# is the recovery — not logging).
+"lca/plugins/transport/webserver/handlers/runs/terminal/streaming/agent_gateway.py" = ["S110", "SIM105"]
+"lca/plugins/transport/**/*.py" = ["TC002"]
+"lca/infrastructure/cli/cli.py" = ["B008", "S603"]  # typer defaults + tail logs
+"lca/infrastructure/cli/commands/**/*.py" = ["B008", "S603"]  # typer + subprocess runners
+"lca/infrastructure/cli/config/config.py" = ["S105"]  # sudo_pass_file is a path, not a secret (dotted pattern never matched)
+"lca/infrastructure/cli/sudo/sudo.py" = ["S603"]  # privileged subprocess wrapper (dotted pattern never matched)
+"lca/infrastructure/cli/service/service.py" = ["S603", "S607", "S110", "SIM105"]  # subprocess for process management (dotted pattern never matched)
+"lca/infrastructure/cli/services/*.py" = ["S603", "S607", "S110", "SIM105"]  # subprocess for service management (dotted pattern never matched)
+"lca/infrastructure/cli/services/**/*.py" = ["S603", "S607", "S110", "SIM105"]  # nested service dirs (lobehub/daemon/kernel/...), same rationale
+"deploy/lobehub/engine.py" = ["S603", "S607"]  # git describe on .lobehub-upstream (controlled path)
+"lca_kernel/*" = ["N999", "TC002", "RUF006"]  # top-level pkg; Stage re-imported at runtime; fire-and-forget create_task
+"lca_kernel/events/persistence.py" = ["N818"]  # PersistenceFlushTimeout name mandated by ADR-0184 PR-2 (plan §PR-2.1)
+"lca/infrastructure/observability/spine/registry.py" = ["N818"]  # IncompleteRegistry / MissingWrapFn names mandated by Task 3.5 brief
+"lca/harness/declarative/compile/assembler.py" = ["N818"]  # UninstrumentedNode name mandated by Task 4.2 brief
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.mypy]
+python_version = "3.11"
+warn_unused_ignores = true
+warn_redundant_casts = true
+warn_return_any = true
+disallow_untyped_defs = true
+check_untyped_defs = true
+exclude = [
+    "^lca/contracts/protocols/.*",
+    "^lca/infrastructure/llm_adapter/openai_compat/.*",
+    "^lca/.*/tests/.*",
+]
+# contracts 层使用 stdlib dataclass，不迁移到 Pydantic
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+disallow_untyped_defs = false
+
+[[tool.mypy.overrides]]
+module = "lca.infrastructure.llm_adapter.openai_compat.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["openai", "dotenv", "yaml", "cordis", "cordis.*", "langfuse", "deepseek_harness"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["gateway.*", "starlette", "starlette.*", "uvicorn"]
+ignore_missing_imports = true
+
+# Pylance reads [tool.pyright] and ignores workspace typeCheckingMode.
+# Keep the editor off here; CLI/CI uses pyrightconfig.ci.json via lca-ops typecheck.
+[tool.pyright]
+pythonVersion = "3.11"
+typeCheckingMode = "off"
+venvPath = "."
+venv = ".venv"
+exclude = [
+    "vendor/**",
+    "lobehub-ui/**",
+    "tests/**",
+    "**/__pycache__",
+]
+reportMissingImports = false
+reportMissingModuleSource = false
+reportMissingTypeStubs = false
+
+[tool.basedpyright]
+typeCheckingMode = "off"
+reportMissingImports = false
+reportMissingModuleSource = false
+reportMissingTypeStubs = false
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+addopts = "-ra --cov=lca --cov-report=term-missing -m 'not real_llm'"
+testpaths = ["tests"]
+pythonpath = ["."]
+markers = [
+    "real_llm: 需要 LLM_API_KEY 才会执行的真实 LLM 集成测试",
+    "profile_integration: golden profile + PlanResolutionService 集成测试 (需要真实 profile YAML)",
+    "subprocess: 隔离 sys.modules 的子进程 purity 测试 (避开 sibling test pollution)",
+    "stability: 1 h stability smoke; runs in nightly job, not on every PR",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning:lca",
+]
+
+[tool.vulture]
+paths = ["lca"]
+exclude = [
+    "lca/contracts/protocols",
+    "lca/infrastructure/llm_adapter/anthropic_llm.py",
+    "lca/infrastructure/llm_adapter/openai_compat/",
+]
+ignore_names = ["n", "predicted_state", "version", "agent_card", "context_refs", "subtask"]
+
+[tool.lca.lint-checks]
+# Architecture / contract gates. Executed via pre-commit and standalone
+# ``uv run python <script>``. CI runs this list's newest ADR-0096 gate.
+checks = [
+    "scripts/check_protocol_impl.py",
+    "scripts/check_plugin_typing.py",
+    "scripts/check_no_any.py",
+    "scripts/check_no_bare_strings.py",
+    "scripts/check_assembly_purity.py",
+    "scripts/check_no_flat_runs.py",
+    "scripts/check_protocol_schema_version.py",
+    "scripts/check_patch_integrity.py",
+    # Package organization (2026-08-30 cleanup batch):
+    "scripts/check_package_size.py",
+    "scripts/check_cognitive_directory.py",
+    "scripts/check_package_contracts.py",
+    "scripts/check_package_noun.py",
+    "scripts/check_filename_boundaries.py",
+    "scripts/check_no_utility_modules.py",
+    "scripts/check_no_barrel_glob.py",
+    "scripts/check_package_integrity.py",
+    "scripts/check_readme_filled.py",
+    # Plugin metadata completeness (PR-4 gate):
+    "scripts/check_plugin_metadata.py",
+]
+
+[tool.lca.package_contracts]
+
+[tool.lca.package_contracts."lca"]
+responsibility = "LCA 一级包命名空间；根层"
+not_responsible_for = "具体业务（见各子包）"
+allowed_dependencies = []
+forbidden_dependencies = []
+side_effects = []
+public_api = [
+    "lca",
+]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.agent"]
+responsibility = "lca.agent: 单 Agent、Team、委派和编排。本 README 由脚手架生成，待包负责人补充具体细节。"
+not_responsible_for = "跨层职责（详见 spec §3.4 闭集纪律）"
+allowed_dependencies = [
+    "lca.contracts",
+    "lca.infrastructure",
+    "lca.cognition",
+    "lca.runtime",
+    "lca.agent",
+]
+forbidden_dependencies = [
+    "lca.application",
+    "lca.harness",
+    "lca.plugins",
+    "gateway",
+]
+side_effects = [
+    "log:emit",
+]
+public_api = [
+    "lca.agent",
+]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.application"]
+responsibility = "lca.application: 组合根、用例入口、依赖注入、命令处理。本 README 由脚手架生成，待包负责人补充具体细节。"
+not_responsible_for = "跨层职责（详见 spec §3.4 闭集纪律）"
+allowed_dependencies = [
+    "lca.contracts",
+    "lca.infrastructure",
+    "lca.cognition",
+    "lca.runtime",
+    "lca.agent",
+    "lca.application",
+]
+forbidden_dependencies = [
+    "lca.harness",
+    "lca.plugins",
+    "gateway",
+]
+side_effects = [
+    "log:emit",
+    "file:read",
+    "file:write",
+]
+public_api = [
+    "lca.application",
+]
+# filename_whitelist = ["all"]: per ADR-0105 §3.3, this package
+# is structurally inseparable (multiple data/protocol types in
+# one concept; splitting would fragment cross-cutting concerns).
+filename_whitelist = ["all"]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.cognition"]
+responsibility = "lca/cognition. 认知平面：感知、推理、批评、决策、记忆、协作。具体职责见各包 docstring；本 README 由脚手架生成。"
+not_responsible_for = "执行副作用、阶段编排、组合根、HTTP 路由"
+allowed_dependencies = [
+    "lca.contracts",
+    "lca.infrastructure",
+    "lca.cognition",
+]
+forbidden_dependencies = [
+    "lca.runtime",
+    "lca.agent",
+    "lca.application",
+    "lca.harness",
+    "lca.plugins",
+    "gateway",
+]
+side_effects = [
+    "llm:call",
+    "log:emit",
+]
+public_api = [
+    "lca.cognition",
+]
+# filename_whitelist = ["all"]: per ADR-0105 §3.3, this package
+# is structurally inseparable (multiple data/protocol types in
+# one concept; splitting would fragment cross-cutting concerns).
+filename_whitelist = ["all"]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.cognition.body"]
+responsibility = "lca/cognition/body. 认知平面：感知、推理、批评、决策、记忆、协作。具体职责见各包 docstring；本 README 由脚手架生成。"
+not_responsible_for = "执行副作用、阶段编排、组合根、HTTP 路由"
+allowed_dependencies = [
+    "lca.contracts",
+    "lca.infrastructure",
+    "lca.cognition",
+]
+forbidden_dependencies = [
+    "lca.runtime",
+    "lca.agent",
+    "lca.application",
+    "lca.harness",
+    "lca.plugins",
+    "gateway",
+]
+side_effects = [
+    "llm:call",
+    "log:emit",
+]
+public_api = [
+    "lca.cognition.body",
+]
+# filename_whitelist = ["all"]: per ADR-0105 §3.3, this package
+# is structurally inseparable (multiple data/protocol types in
+# one concept; splitting would fragment cross-cutting concerns).
+filename_whitelist = ["all"]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.cognition.brain"]
+responsibility = "lca/cognition/brain. 认知平面：感知、推理、批评、决策、记忆、协作。具体职责见各包 docstring；本 README 由脚手架生成。"
+not_responsible_for = "执行副作用、阶段编排、组合根、HTTP 路由"
+allowed_dependencies = [
+    "lca.contracts",
+    "lca.infrastructure",
+    "lca.cognition",
+]
+forbidden_dependencies = [
+    "lca.runtime",
+    "lca.agent",
+    "lca.application",
+    "lca.harness",
+    "lca.plugins",
+    "gateway",
+]
+side_effects = [
+    "llm:call",
+    "log:emit",
+]
+public_api = [
+    "lca.cognition.brain",
+]
+# filename_whitelist = ["all"]: per ADR-0105 §3.3, this package
+# is structurally inseparable (multiple data/protocol types in
+# one concept; splitting would fragment cross-cutting concerns).
+filename_whitelist = ["all"]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.cognition.collaboration"]
+responsibility = "lca/cognition/collaboration. 认知平面：感知、推理、批评、决策、记忆、协作。具体职责见各包 docstring；本 README 由脚手架生成。"
+not_responsible_for = "执行副作用、阶段编排、组合根、HTTP 路由"
+allowed_dependencies = [
+    "lca.contracts",
+    "lca.infrastructure",
+    "lca.cognition",
+]
+forbidden_dependencies = [
+    "lca.runtime",
+    "lca.agent",
+    "lca.application",
+    "lca.harness",
+    "lca.plugins",
+    "gateway",
+]
+side_effects = [
+    "llm:call",
+    "log:emit",
+]
+public_api = [
+    "lca.cognition.collaboration",
+]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.cognition.member_status"]
+responsibility = "lca/cognition/member_status. 认知平面：感知、推理、批评、决策、记忆、协作。具体职责见各包 docstring；本 README 由脚手架生成。"
+not_responsible_for = "执行副作用、阶段编排、组合根、HTTP 路由"
+allowed_dependencies = [
+    "lca.contracts",
+    "lca.infrastructure",
+    "lca.cognition",
+]
+forbidden_dependencies = [
+    "lca.runtime",
+    "lca.agent",
+    "lca.application",
+    "lca.harness",
+    "lca.plugins",
+    "gateway",
+]
+side_effects = [
+    "llm:call",
+    "log:emit",
+]
+public_api = [
+    "lca.cognition.member_status",
+]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.cognition.memory"]
+responsibility = "lca/cognition/memory. 认知平面：感知、推理、批评、决策、记忆、协作。具体职责见各包 docstring；本 README 由脚手架生成。"
+not_responsible_for = "执行副作用、阶段编排、组合根、HTTP 路由"
+allowed_dependencies = [
+    "lca.contracts",
+    "lca.infrastructure",
+    "lca.cognition",
+]
+forbidden_dependencies = [
+    "lca.runtime",
+    "lca.agent",
+    "lca.application",
+    "lca.harness",
+    "lca.plugins",
+    "gateway",
+]
+side_effects = [
+    "llm:call",
+    "log:emit",
+]
+public_api = [
+    "lca.cognition.memory",
+]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.cognition.sensors"]
+responsibility = "lca/cognition/sensors. 认知平面：感知、推理、批评、决策、记忆、协作。具体职责见各包 docstring；本 README 由脚手架生成。"
+not_responsible_for = "执行副作用、阶段编排、组合根、HTTP 路由"
+allowed_dependencies = [
+    "lca.contracts",
+    "lca.infrastructure",
+    "lca.cognition",
+]
+forbidden_dependencies = [
+    "lca.runtime",
+    "lca.agent",
+    "lca.application",
+    "lca.harness",
+    "lca.plugins",
+    "gateway",
+]
+side_effects = [
+    "llm:call",
+    "log:emit",
+]
+public_api = [
+    "lca.cognition.sensors",
+]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.contracts"]
+responsibility = "数据契约层：Protocol、枚举、dataclass、事件"
+not_responsible_for = "实现细节、I/O、配置解析"
+allowed_dependencies = []
+forbidden_dependencies = [
+    "lca.infrastructure",
+    "lca.cognition",
+    "lca.runtime",
+    "lca.agent",
+    "lca.application",
+    "lca.harness",
+    "lca.plugins",
+]
+side_effects = []
+public_api = [
+    "lca.contracts.models",
+    "lca.contracts.protocols",
+]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.contracts.atoms"]
+responsibility = "lca/contracts/atoms. 职责见各包 docstring 与 .py 文件注释；本 README 由脚手架生成，等待包负责人补充具体职责描述"
+not_responsible_for = "实现细节、I/O、配置解析、业务编排"
+allowed_dependencies = [
+    "lca.contracts",
+]
+forbidden_dependencies = [
+    "lca.infrastructure",
+    "lca.cognition",
+    "lca.runtime",
+    "lca.agent",
+    "lca.application",
+    "lca.harness",
+    "lca.plugins",
+]
+side_effects = []
+public_api = [
+    "lca.contracts.atoms",
+]
+# filename_whitelist = ["all"]: per ADR-0105 §3.3, this package
+# is structurally inseparable (multiple data/protocol types in
+# one concept; splitting would fragment cross-cutting concerns).
+filename_whitelist = ["all"]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.contracts.harness"]
+responsibility = "lca/contracts/harness. 职责见各包 docstring 与 .py 文件注释；本 README 由脚手架生成，等待包负责人补充具体职责描述"
+not_responsible_for = "实现细节、I/O、配置解析、业务编排"
+allowed_dependencies = [
+    "lca.contracts",
+]
+forbidden_dependencies = [
+    "lca.infrastructure",
+    "lca.cognition",
+    "lca.runtime",
+    "lca.agent",
+    "lca.application",
+    "lca.harness",
+    "lca.plugins",
+]
+side_effects = []
+public_api = [
+    "lca.contracts.harness",
+]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.contracts.mechanisms"]
+responsibility = "lca/contracts/mechanisms. 职责见各包 docstring 与 .py 文件注释；本 README 由脚手架生成，等待包负责人补充具体职责描述"
+not_responsible_for = "实现细节、I/O、配置解析、业务编排"
+allowed_dependencies = [
+    "lca.contracts",
+]
+forbidden_dependencies = [
+    "lca.infrastructure",
+    "lca.cognition",
+    "lca.runtime",
+    "lca.agent",
+    "lca.application",
+    "lca.harness",
+    "lca.plugins",
+]
+side_effects = []
+public_api = [
+    "lca.contracts.mechanisms",
+]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.contracts.models"]
+responsibility = "lca/contracts/models. 职责见各包 docstring 与 .py 文件注释；本 README 由脚手架生成，等待包负责人补充具体职责描述"
+not_responsible_for = "实现细节、I/O、配置解析、业务编排"
+allowed_dependencies = [
+    "lca.contracts",
+]
+forbidden_dependencies = [
+    "lca.infrastructure",
+    "lca.cognition",
+    "lca.runtime",
+    "lca.agent",
+    "lca.application",
+    "lca.harness",
+    "lca.plugins",
+]
+side_effects = []
+public_api = [
+    "lca.contracts.models",
+]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.contracts.observability"]
+responsibility = "lca/contracts/observability. 职责见各包 docstring 与 .py 文件注释；本 README 由脚手架生成，等待包负责人补充具体职责描述"
+not_responsible_for = "实现细节、I/O、配置解析、业务编排"
+allowed_dependencies = [
+    "lca.contracts",
+]
+forbidden_dependencies = [
+    "lca.infrastructure",
+    "lca.cognition",
+    "lca.runtime",
+    "lca.agent",
+    "lca.application",
+    "lca.harness",
+    "lca.plugins",
+]
+side_effects = []
+public_api = [
+    "lca.contracts.observability",
+]
+# filename_whitelist = ["all"]: per ADR-0105 §3.3, this package
+# is structurally inseparable (multiple data/protocol types in
+# one concept; splitting would fragment cross-cutting concerns).
+filename_whitelist = ["all"]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.contracts.protocols"]
+responsibility = "lca/contracts/protocols. 职责见各包 docstring 与 .py 文件注释；本 README 由脚手架生成，等待包负责人补充具体职责描述"
+not_responsible_for = "实现细节、I/O、配置解析、业务编排"
+allowed_dependencies = [
+    "lca.contracts",
+]
+forbidden_dependencies = [
+    "lca.infrastructure",
+    "lca.cognition",
+    "lca.runtime",
+    "lca.agent",
+    "lca.application",
+    "lca.harness",
+    "lca.plugins",
+]
+side_effects = []
+public_api = [
+    "lca.contracts.protocols",
+]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.harness"]
+responsibility = "lca.harness: Agent Session、Profile、Boot、声明式阶段和运行骨架。本 README 由脚手架生成，待包负责人补充具体细节。"
+not_responsible_for = "跨层职责（详见 spec §3.4 闭集纪律）"
+allowed_dependencies = [
+    "lca.contracts",
+]
+forbidden_dependencies = [
+    "lca.cognition",
+    "lca.runtime",
+    "lca.agent",
+    "lca.application",
+]
+side_effects = [
+    "log:emit",
+]
+public_api = [
+    "lca.harness",
+]
+# filename_whitelist = ["all"]: per ADR-0105 §3.3, this package
+# is structurally inseparable (multiple data/protocol types in
+# one concept; splitting would fragment cross-cutting concerns).
+filename_whitelist = ["all"]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.harness.agent"]
+responsibility = "lca.harness.agent: Agent session harness。本 README 由脚手架生成，待包负责人补充具体细节。"
+not_responsible_for = "跨层职责（详见 spec §3.4 闭集纪律）"
+allowed_dependencies = [
+    "lca.contracts",
+    "lca.harness",
+]
+forbidden_dependencies = [
+    "lca.cognition",
+    "lca.runtime",
+    "lca.agent",
+    "lca.application",
+]
+side_effects = [
+    "log:emit",
+]
+public_api = [
+    "lca.harness.agent",
+]
+# filename_whitelist = ["all"]: per ADR-0105 §3.3, this package
+# is structurally inseparable (multiple data/protocol types in
+# one concept; splitting would fragment cross-cutting concerns).
+filename_whitelist = ["all"]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.harness.command"]
+responsibility = "lca.harness.command: 命令处理 harness。本 README 由脚手架生成，待包负责人补充具体细节。"
+not_responsible_for = "跨层职责（详见 spec §3.4 闭集纪律）"
+allowed_dependencies = [
+    "lca.contracts",
+    "lca.harness",
+]
+forbidden_dependencies = [
+    "lca.cognition",
+    "lca.runtime",
+    "lca.agent",
+    "lca.application",
+]
+side_effects = [
+    "log:emit",
+]
+public_api = [
+    "lca.harness.command",
+]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.harness.declarative"]
+responsibility = "lca.harness.declarative: 声明式阶段图 harness。本 README 由脚手架生成，待包负责人补充具体细节。"
+not_responsible_for = "跨层职责（详见 spec §3.4 闭集纪律）"
+allowed_dependencies = [
+    "lca.contracts",
+    "lca.harness",
+]
+forbidden_dependencies = [
+    "lca.cognition",
+    "lca.runtime",
+    "lca.agent",
+    "lca.application",
+]
+side_effects = [
+    "log:emit",
+]
+public_api = [
+    "lca.harness.declarative",
+]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.harness.diagnostics"]
+responsibility = "lca.harness.diagnostics: 诊断 harness。本 README 由脚手架生成，待包负责人补充具体细节。"
+not_responsible_for = "跨层职责（详见 spec §3.4 闭集纪律）"
+allowed_dependencies = [
+    "lca.contracts",
+    "lca.harness",
+]
+forbidden_dependencies = [
+    "lca.cognition",
+    "lca.runtime",
+    "lca.agent",
+    "lca.application",
+]
+side_effects = [
+    "log:emit",
+    "file:read",
+]
+public_api = [
+    "lca.harness.diagnostics",
+]
+# filename_whitelist = ["all"]: per ADR-0105 §3.3, this package
+# is structurally inseparable (multiple data/protocol types in
+# one concept; splitting would fragment cross-cutting concerns).
+filename_whitelist = ["all"]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.harness.middleware"]
+responsibility = "lca.harness.middleware: 中间件 harness。本 README 由脚手架生成，待包负责人补充具体细节。"
+not_responsible_for = "跨层职责（详见 spec §3.4 闭集纪律）"
+allowed_dependencies = [
+    "lca.contracts",
+    "lca.harness",
+]
+forbidden_dependencies = [
+    "lca.cognition",
+    "lca.runtime",
+    "lca.agent",
+    "lca.application",
+]
+side_effects = [
+    "log:emit",
+]
+public_api = [
+    "lca.harness.middleware",
+]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.harness.observability"]
+responsibility = "lca.harness.observability: 观测 harness。本 README 由脚手架生成，待包负责人补充具体细节。"
+not_responsible_for = "跨层职责（详见 spec §3.4 闭集纪律）"
+allowed_dependencies = [
+    "lca.contracts",
+    "lca.harness",
+]
+forbidden_dependencies = [
+    "lca.cognition",
+    "lca.runtime",
+    "lca.agent",
+    "lca.application",
+]
+side_effects = [
+    "log:emit",
+]
+public_api = [
+    "lca.harness.observability",
+]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.harness.profile"]
+responsibility = "lca.harness.profile: Profile 解析与启动。本 README 由脚手架生成，待包负责人补充具体细节。"
+not_responsible_for = "跨层职责（详见 spec §3.4 闭集纪律）"
+allowed_dependencies = [
+    "lca.contracts",
+    "lca.harness",
+]
+forbidden_dependencies = [
+    "lca.cognition",
+    "lca.runtime",
+    "lca.agent",
+    "lca.application",
+]
+side_effects = [
+    "log:emit",
+    "file:read",
+]
+public_api = [
+    "lca.harness.profile",
+]
+# filename_whitelist = ["all"]: per ADR-0105 §3.3, this package
+# is structurally inseparable (multiple data/protocol types in
+# one concept; splitting would fragment cross-cutting concerns).
+filename_whitelist = ["all"]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.harness.projection"]
+responsibility = "lca.harness.projection: 投影 harness。本 README 由脚手架生成，待包负责人补充具体细节。"
+not_responsible_for = "跨层职责（详见 spec §3.4 闭集纪律）"
+allowed_dependencies = [
+    "lca.contracts",
+    "lca.harness",
+]
+forbidden_dependencies = [
+    "lca.cognition",
+    "lca.runtime",
+    "lca.agent",
+    "lca.application",
+]
+side_effects = [
+    "log:emit",
+]
+public_api = [
+    "lca.harness.projection",
+]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.harness.sdk"]
+responsibility = "lca.harness.sdk: 外部 SDK 接入。本 README 由脚手架生成，待包负责人补充具体细节。"
+not_responsible_for = "跨层职责（详见 spec §3.4 闭集纪律）"
+allowed_dependencies = [
+    "lca.contracts",
+    "lca.harness",
+]
+forbidden_dependencies = [
+    "lca.cognition",
+    "lca.runtime",
+    "lca.agent",
+    "lca.application",
+]
+side_effects = [
+    "log:emit",
+]
+public_api = [
+    "lca.harness.sdk",
+]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.harness.session"]
+responsibility = "lca.harness.session: Session harness。本 README 由脚手架生成，待包负责人补充具体细节。"
+not_responsible_for = "跨层职责（详见 spec §3.4 闭集纪律）"
+allowed_dependencies = [
+    "lca.contracts",
+    "lca.harness",
+]
+forbidden_dependencies = [
+    "lca.cognition",
+    "lca.runtime",
+    "lca.agent",
+    "lca.application",
+]
+side_effects = [
+    "log:emit",
+    "file:read",
+    "file:write",
+]
+public_api = [
+    "lca.harness.session",
+]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.harness.skills"]
+responsibility = "lca.harness.skills: 技能 harness。本 README 由脚手架生成，待包负责人补充具体细节。"
+not_responsible_for = "跨层职责（详见 spec §3.4 闭集纪律）"
+allowed_dependencies = [
+    "lca.contracts",
+    "lca.harness",
+]
+forbidden_dependencies = [
+    "lca.cognition",
+    "lca.runtime",
+    "lca.agent",
+    "lca.application",
+]
+side_effects = [
+    "log:emit",
+    "file:read",
+]
+public_api = [
+    "lca.harness.skills",
+]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.harness.subagents"]
+responsibility = "lca.harness.subagents: 子代理 harness。本 README 由脚手架生成，待包负责人补充具体细节。"
+not_responsible_for = "跨层职责（详见 spec §3.4 闭集纪律）"
+allowed_dependencies = [
+    "lca.contracts",
+    "lca.harness",
+]
+forbidden_dependencies = [
+    "lca.cognition",
+    "lca.runtime",
+    "lca.agent",
+    "lca.application",
+]
+side_effects = [
+    "log:emit",
+]
+public_api = [
+    "lca.harness.subagents",
+]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.harness.workflow"]
+responsibility = "lca.harness.workflow: 工作流 harness。本 README 由脚手架生成，待包负责人补充具体细节。"
+not_responsible_for = "跨层职责（详见 spec §3.4 闭集纪律）"
+allowed_dependencies = [
+    "lca.contracts",
+    "lca.harness",
+]
+forbidden_dependencies = [
+    "lca.cognition",
+    "lca.runtime",
+    "lca.agent",
+    "lca.application",
+]
+side_effects = [
+    "log:emit",
+]
+public_api = [
+    "lca.harness.workflow",
+]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.infrastructure"]
+responsibility = "lca/infrastructure. 外部世界：文件、LLM、网络、进程、存储、观测、插件内核。具体职责见各包 docstring；本 README 由脚手架生成，待包负责人补充。"
+not_responsible_for = "认知决策、阶段编排、组合根"
+allowed_dependencies = [
+    "lca.contracts",
+    "lca.infrastructure",
+]
+forbidden_dependencies = [
+    "lca.cognition",
+    "lca.runtime",
+    "lca.agent",
+    "lca.application",
+    "lca.harness",
+    "lca.plugins",
+    "gateway",
+]
+side_effects = [
+    "file:read",
+    "file:write",
+    "network:openai",
+    "log:emit",
+    "subprocess:spawn",
+]
+public_api = [
+    "lca.infrastructure",
+]
+# filename_whitelist = ["all"]: per ADR-0105 §3.3, this package
+# is structurally inseparable (multiple data/protocol types in
+# one concept; splitting would fragment cross-cutting concerns).
+filename_whitelist = ["all"]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.infrastructure.attachment"]
+responsibility = "lca/infrastructure/attachment. 外部世界：文件、LLM、网络、进程、存储、观测、插件内核。具体职责见各包 docstring；本 README 由脚手架生成，待包负责人补充。"
+not_responsible_for = "认知决策、阶段编排、组合根"
+allowed_dependencies = [
+    "lca.contracts",
+    "lca.infrastructure",
+]
+forbidden_dependencies = [
+    "lca.cognition",
+    "lca.runtime",
+    "lca.agent",
+    "lca.application",
+    "lca.harness",
+    "lca.plugins",
+    "gateway",
+]
+side_effects = [
+    "file:read",
+    "file:write",
+    "network:openai",
+    "log:emit",
+    "subprocess:spawn",
+]
+public_api = [
+    "lca.infrastructure.attachment",
+]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.infrastructure.capability"]
+responsibility = "lca/infrastructure/capability. 外部世界：文件、LLM、网络、进程、存储、观测、插件内核。具体职责见各包 docstring；本 README 由脚手架生成，待包负责人补充。"
+not_responsible_for = "认知决策、阶段编排、组合根"
+allowed_dependencies = [
+    "lca.contracts",
+    "lca.infrastructure",
+]
+forbidden_dependencies = [
+    "lca.cognition",
+    "lca.runtime",
+    "lca.agent",
+    "lca.application",
+    "lca.harness",
+    "lca.plugins",
+    "gateway",
+]
+side_effects = [
+    "file:read",
+    "file:write",
+    "network:openai",
+    "log:emit",
+    "subprocess:spawn",
+]
+public_api = [
+    "lca.infrastructure.capability",
+]
+# filename_whitelist = ["all"]: per ADR-0105 §3.3, this package
+# is structurally inseparable (multiple data/protocol types in
+# one concept; splitting would fragment cross-cutting concerns).
+filename_whitelist = ["all"]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.infrastructure.computer"]
+responsibility = "lca/infrastructure/computer. 外部世界：文件、LLM、网络、进程、存储、观测、插件内核。具体职责见各包 docstring；本 README 由脚手架生成，待包负责人补充。"
+not_responsible_for = "认知决策、阶段编排、组合根"
+allowed_dependencies = [
+    "lca.contracts",
+    "lca.infrastructure",
+]
+forbidden_dependencies = [
+    "lca.cognition",
+    "lca.runtime",
+    "lca.agent",
+    "lca.application",
+    "lca.harness",
+    "lca.plugins",
+    "gateway",
+]
+side_effects = [
+    "file:read",
+    "file:write",
+    "network:openai",
+    "log:emit",
+    "subprocess:spawn",
+]
+public_api = [
+    "lca.infrastructure.computer",
+]
+# filename_whitelist = ["all"]: per ADR-0105 §3.3, this package
+# is structurally inseparable (multiple data/protocol types in
+# one concept; splitting would fragment cross-cutting concerns).
+filename_whitelist = ["all"]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.infrastructure.credentials"]
+responsibility = "lca/infrastructure/credentials. 外部世界：文件、LLM、网络、进程、存储、观测、插件内核。具体职责见各包 docstring；本 README 由脚手架生成，待包负责人补充。"
+not_responsible_for = "认知决策、阶段编排、组合根"
+allowed_dependencies = [
+    "lca.contracts",
+    "lca.infrastructure",
+]
+forbidden_dependencies = [
+    "lca.cognition",
+    "lca.runtime",
+    "lca.agent",
+    "lca.application",
+    "lca.harness",
+    "lca.plugins",
+    "gateway",
+]
+side_effects = [
+    "file:read",
+    "file:write",
+    "network:openai",
+    "log:emit",
+    "subprocess:spawn",
+]
+public_api = [
+    "lca.infrastructure.credentials",
+]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.infrastructure.device_hub"]
+responsibility = "lca/infrastructure/device_hub. 外部世界：文件、LLM、网络、进程、存储、观测、插件内核。具体职责见各包 docstring；本 README 由脚手架生成，待包负责人补充。"
+not_responsible_for = "认知决策、阶段编排、组合根"
+allowed_dependencies = [
+    "lca.contracts",
+    "lca.infrastructure",
+]
+forbidden_dependencies = [
+    "lca.cognition",
+    "lca.runtime",
+    "lca.agent",
+    "lca.application",
+    "lca.harness",
+    "lca.plugins",
+    "gateway",
+]
+side_effects = [
+    "file:read",
+    "file:write",
+    "network:openai",
+    "log:emit",
+    "subprocess:spawn",
+]
+public_api = [
+    "lca.infrastructure.device_hub",
+]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.infrastructure.host_runtime"]
+responsibility = "lca/infrastructure/host_runtime. 外部世界：文件、LLM、网络、进程、存储、观测、插件内核。具体职责见各包 docstring；本 README 由脚手架生成，待包负责人补充。"
+not_responsible_for = "认知决策、阶段编排、组合根"
+allowed_dependencies = [
+    "lca.contracts",
+    "lca.infrastructure",
+]
+forbidden_dependencies = [
+    "lca.cognition",
+    "lca.runtime",
+    "lca.agent",
+    "lca.application",
+    "lca.harness",
+    "lca.plugins",
+    "gateway",
+]
+side_effects = [
+    "file:read",
+    "file:write",
+    "network:openai",
+    "log:emit",
+    "subprocess:spawn",
+]
+public_api = [
+    "lca.infrastructure.host_runtime",
+]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.infrastructure.learning"]
+responsibility = "lca/infrastructure/learning. 外部世界：文件、LLM、网络、进程、存储、观测、插件内核。具体职责见各包 docstring；本 README 由脚手架生成，待包负责人补充。"
+not_responsible_for = "认知决策、阶段编排、组合根"
+allowed_dependencies = [
+    "lca.contracts",
+    "lca.infrastructure",
+]
+forbidden_dependencies = [
+    "lca.cognition",
+    "lca.runtime",
+    "lca.agent",
+    "lca.application",
+    "lca.harness",
+    "lca.plugins",
+    "gateway",
+]
+side_effects = [
+    "file:read",
+    "file:write",
+    "network:openai",
+    "log:emit",
+    "subprocess:spawn",
+]
+public_api = [
+    "lca.infrastructure.learning",
+]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.infrastructure.llm"]
+responsibility = "lca/infrastructure/llm. 外部世界：文件、LLM、网络、进程、存储、观测、插件内核。具体职责见各包 docstring；本 README 由脚手架生成，待包负责人补充。"
+not_responsible_for = "认知决策、阶段编排、组合根"
+allowed_dependencies = [
+    "lca.contracts",
+    "lca.infrastructure",
+]
+forbidden_dependencies = [
+    "lca.cognition",
+    "lca.runtime",
+    "lca.agent",
+    "lca.application",
+    "lca.harness",
+    "lca.plugins",
+    "gateway",
+]
+side_effects = [
+    "file:read",
+    "file:write",
+    "network:openai",
+    "log:emit",
+    "subprocess:spawn",
+]
+public_api = [
+    "lca.infrastructure.llm",
+]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.infrastructure.llm_adapter"]
+responsibility = "lca/infrastructure/llm_adapter. 外部世界：文件、LLM、网络、进程、存储、观测、插件内核。具体职责见各包 docstring；本 README 由脚手架生成，待包负责人补充。"
+not_responsible_for = "认知决策、阶段编排、组合根"
+allowed_dependencies = [
+    "lca.contracts",
+    "lca.infrastructure",
+]
+forbidden_dependencies = [
+    "lca.cognition",
+    "lca.runtime",
+    "lca.agent",
+    "lca.application",
+    "lca.harness",
+    "lca.plugins",
+    "gateway",
+]
+side_effects = [
+    "file:read",
+    "file:write",
+    "network:openai",
+    "log:emit",
+    "subprocess:spawn",
+]
+public_api = [
+    "lca.infrastructure.llm_adapter",
+]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.infrastructure.observability"]
+responsibility = "lca/infrastructure/observability. 外部世界：文件、LLM、网络、进程、存储、观测、插件内核。具体职责见各包 docstring；本 README 由脚手架生成，待包负责人补充。"
+not_responsible_for = "认知决策、阶段编排、组合根"
+allowed_dependencies = [
+    "lca.contracts",
+    "lca.infrastructure",
+]
+forbidden_dependencies = [
+    "lca.cognition",
+    "lca.runtime",
+    "lca.agent",
+    "lca.application",
+    "lca.harness",
+    "lca.plugins",
+    "gateway",
+]
+side_effects = [
+    "file:read",
+    "file:write",
+    "network:openai",
+    "log:emit",
+    "subprocess:spawn",
+]
+public_api = [
+    "lca.infrastructure.observability",
+]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.infrastructure.cli"]
+responsibility = "lca.infrastructure.cli. 外部世界：文件、LLM、网络、进程、存储、观测、插件内核。具体职责见各包 docstring；本 README 由脚手架生成，待包负责人补充。"
+not_responsible_for = "认知决策、阶段编排、组合根"
+allowed_dependencies = [
+    "lca.contracts",
+    "lca.infrastructure",
+]
+forbidden_dependencies = [
+    "lca.cognition",
+    "lca.runtime",
+    "lca.agent",
+    "lca.application",
+    "lca.harness",
+    "lca.plugins",
+    "gateway",
+]
+side_effects = [
+    "file:read",
+    "file:write",
+    "network:openai",
+    "log:emit",
+    "subprocess:spawn",
+]
+public_api = [
+    "lca.infrastructure.cli",
+]
+# filename_whitelist = ["all"]: per ADR-0105 §3.3, this package
+# is structurally inseparable (multiple data/protocol types in
+# one concept; splitting would fragment cross-cutting concerns).
+filename_whitelist = ["all"]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.infrastructure.runtime_plane"]
+responsibility = "lca.infrastructure.runtime_plane. 外部世界：文件、LLM、网络、进程、存储、观测、插件内核。具体职责见各包 docstring；本 README 由脚手架生成，待包负责人补充。"
+not_responsible_for = "认知决策、阶段编排、组合根"
+allowed_dependencies = [
+    "lca.contracts",
+    "lca.infrastructure",
+]
+forbidden_dependencies = [
+    "lca.cognition",
+    "lca.runtime",
+    "lca.agent",
+    "lca.application",
+    "lca.harness",
+    "lca.plugins",
+    "gateway",
+]
+side_effects = [
+    "file:read",
+    "file:write",
+    "network:openai",
+    "log:emit",
+    "subprocess:spawn",
+]
+public_api = [
+    "lca.infrastructure.runtime_plane",
+]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.infrastructure.sandbox"]
+responsibility = "lca/infrastructure/sandbox. 外部世界：文件、LLM、网络、进程、存储、观测、插件内核。具体职责见各包 docstring；本 README 由脚手架生成，待包负责人补充。"
+not_responsible_for = "认知决策、阶段编排、组合根"
+allowed_dependencies = [
+    "lca.contracts",
+    "lca.infrastructure",
+]
+forbidden_dependencies = [
+    "lca.cognition",
+    "lca.runtime",
+    "lca.agent",
+    "lca.application",
+    "lca.harness",
+    "lca.plugins",
+    "gateway",
+]
+side_effects = [
+    "file:read",
+    "file:write",
+    "network:openai",
+    "log:emit",
+    "subprocess:spawn",
+]
+public_api = [
+    "lca.infrastructure.sandbox",
+]
+filename_whitelist = ["all"]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.infrastructure.search"]
+responsibility = "lca/infrastructure/search. 外部世界：文件、LLM、网络、进程、存储、观测、插件内核。具体职责见各包 docstring；本 README 由脚手架生成，待包负责人补充。"
+not_responsible_for = "认知决策、阶段编排、组合根"
+allowed_dependencies = [
+    "lca.contracts",
+    "lca.infrastructure",
+]
+forbidden_dependencies = [
+    "lca.cognition",
+    "lca.runtime",
+    "lca.agent",
+    "lca.application",
+    "lca.harness",
+    "lca.plugins",
+    "gateway",
+]
+side_effects = [
+    "file:read",
+    "file:write",
+    "network:openai",
+    "log:emit",
+    "subprocess:spawn",
+]
+public_api = [
+    "lca.infrastructure.search",
+]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.infrastructure.skills"]
+responsibility = "lca/infrastructure/skills. 外部世界：文件、LLM、网络、进程、存储、观测、插件内核。具体职责见各包 docstring；本 README 由脚手架生成，待包负责人补充。"
+not_responsible_for = "认知决策、阶段编排、组合根"
+allowed_dependencies = [
+    "lca.contracts",
+    "lca.infrastructure",
+]
+forbidden_dependencies = [
+    "lca.cognition",
+    "lca.runtime",
+    "lca.agent",
+    "lca.application",
+    "lca.harness",
+    "lca.plugins",
+    "gateway",
+]
+side_effects = [
+    "file:read",
+    "file:write",
+    "network:openai",
+    "log:emit",
+    "subprocess:spawn",
+]
+public_api = [
+    "lca.infrastructure.skills",
+]
+filename_whitelist = ["all"]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.infrastructure.state_store"]
+responsibility = "lca/infrastructure/state_store. 外部世界：文件、LLM、网络、进程、存储、观测、插件内核。具体职责见各包 docstring；本 README 由脚手架生成，待包负责人补充。"
+not_responsible_for = "认知决策、阶段编排、组合根"
+allowed_dependencies = [
+    "lca.contracts",
+    "lca.infrastructure",
+]
+forbidden_dependencies = [
+    "lca.cognition",
+    "lca.runtime",
+    "lca.agent",
+    "lca.application",
+    "lca.harness",
+    "lca.plugins",
+    "gateway",
+]
+side_effects = [
+    "file:read",
+    "file:write",
+    "network:openai",
+    "log:emit",
+    "subprocess:spawn",
+]
+public_api = [
+    "lca.infrastructure.state_store",
+]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.infrastructure.tool_defer"]
+responsibility = "lca/infrastructure/tool_defer. Muse 式延迟工具加载：run 级 defer 会话（ContextVar 三件套）、每 turn 命名空间视图刷新与目录渲染、tool_search 加载工具本体。"
+not_responsible_for = "工具定义与实例化、fork 过滤与包装、prompt 模板与工具目录渲染"
+allowed_dependencies = [
+    "lca.contracts",
+]
+forbidden_dependencies = [
+    "lca.cognition",
+    "lca.runtime",
+    "lca.agent",
+    "lca.application",
+    "lca.harness",
+    "lca.plugins",
+    "gateway",
+]
+side_effects = [
+    "log:emit",
+]
+public_api = [
+    "lca.infrastructure.tool_defer",
+]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.infrastructure.tools"]
+responsibility = "lca/infrastructure/tools. 外部世界：文件、LLM、网络、进程、存储、观测、插件内核。具体职责见各包 docstring；本 README 由脚手架生成，待包负责人补充。"
+not_responsible_for = "认知决策、阶段编排、组合根"
+allowed_dependencies = [
+    "lca.contracts",
+    "lca.infrastructure",
+]
+forbidden_dependencies = [
+    "lca.cognition",
+    "lca.runtime",
+    "lca.agent",
+    "lca.application",
+    "lca.harness",
+    "lca.plugins",
+    "gateway",
+]
+side_effects = [
+    "file:read",
+    "file:write",
+    "network:openai",
+    "log:emit",
+    "subprocess:spawn",
+]
+public_api = [
+    "lca.infrastructure.tools",
+]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.infrastructure.transport"]
+responsibility = "lca/infrastructure/transport. 外部世界：文件、LLM、网络、进程、存储、观测、插件内核。具体职责见各包 docstring；本 README 由脚手架生成，待包负责人补充。"
+not_responsible_for = "认知决策、阶段编排、组合根"
+allowed_dependencies = [
+    "lca.contracts",
+    "lca.infrastructure",
+]
+forbidden_dependencies = [
+    "lca.cognition",
+    "lca.runtime",
+    "lca.agent",
+    "lca.application",
+    "lca.harness",
+    "lca.plugins",
+    "gateway",
+]
+side_effects = [
+    "file:read",
+    "file:write",
+    "network:openai",
+    "log:emit",
+    "subprocess:spawn",
+]
+public_api = [
+    "lca.infrastructure.transport",
+]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.infrastructure.workspace"]
+responsibility = "lca/infrastructure/workspace. 外部世界：文件、LLM、网络、进程、存储、观测、插件内核。具体职责见各包 docstring；本 README 由脚手架生成，待包负责人补充。"
+not_responsible_for = "认知决策、阶段编排、组合根"
+allowed_dependencies = [
+    "lca.contracts",
+    "lca.infrastructure",
+]
+forbidden_dependencies = [
+    "lca.cognition",
+    "lca.runtime",
+    "lca.agent",
+    "lca.application",
+    "lca.harness",
+    "lca.plugins",
+    "gateway",
+]
+side_effects = [
+    "file:read",
+    "file:write",
+    "network:openai",
+    "log:emit",
+    "subprocess:spawn",
+]
+public_api = [
+    "lca.infrastructure.workspace",
+]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.plugins"]
+responsibility = "lca.plugins: 可装配行为单元（Seam / Provider / Loop Driver 实现），每个插件以 @plugin 自描述并由 bundles/*.yaml 以 id 激活"
+not_responsible_for = "PluginSpec 声明与 Profile 解析（lca/harness/profile）、运行时调度（lca/loop、lca/framework/graph）、事实定义（lca/session）、组合根装配（lca/application）"
+allowed_dependencies = [
+    "lca.contracts",
+]
+forbidden_dependencies = [
+    "gateway",
+    "lca.application",
+    "lca.agent",
+]
+side_effects = [
+    "log:emit",
+]
+public_api = [
+    "lca.plugins",
+]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.plugins.body"]
+responsibility = "lca.plugins.body: Body 插件。本 README 由脚手架生成，待包负责人补充具体细节。"
+not_responsible_for = "跨层职责（详见 spec §3.4 闭集纪律）"
+allowed_dependencies = [
+    "lca.contracts",
+    "lca.plugins",
+]
+forbidden_dependencies = [
+    "gateway",
+]
+side_effects = [
+    "log:emit",
+]
+public_api = [
+    "lca.plugins.body",
+]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.plugins.brain"]
+responsibility = "lca.plugins.brain: Brain 插件。本 README 由脚手架生成，待包负责人补充具体细节。"
+not_responsible_for = "跨层职责（详见 spec §3.4 闭集纪律）"
+allowed_dependencies = [
+    "lca.contracts",
+    "lca.plugins",
+]
+forbidden_dependencies = [
+    "gateway",
+]
+side_effects = [
+    "llm:call",
+    "log:emit",
+]
+public_api = [
+    "lca.plugins.brain",
+]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.plugins.collaboration"]
+responsibility = "lca.plugins.collaboration: 协作插件。本 README 由脚手架生成，待包负责人补充具体细节。"
+not_responsible_for = "跨层职责（详见 spec §3.4 闭集纪律）"
+allowed_dependencies = [
+    "lca.contracts",
+    "lca.plugins",
+]
+forbidden_dependencies = [
+    "gateway",
+]
+side_effects = [
+    "log:emit",
+]
+public_api = [
+    "lca.plugins.collaboration",
+]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.plugins.factories"]
+responsibility = "lca.plugins.factories: 组合插件。本 README 由脚手架生成，待包负责人补充具体细节。"
+not_responsible_for = "跨层职责（详见 spec §3.4 闭集纪律）"
+allowed_dependencies = [
+    "lca.contracts",
+    "lca.plugins",
+]
+forbidden_dependencies = [
+    "gateway",
+]
+side_effects = [
+    "log:emit",
+]
+public_api = [
+    "lca.plugins.factories",
+]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.plugins.control_contributions"]
+responsibility = "lca.plugins.control_contributions: 控制贡献。本 README 由脚手架生成，待包负责人补充具体细节。"
+not_responsible_for = "跨层职责（详见 spec §3.4 闭集纪律）"
+allowed_dependencies = [
+    "lca.contracts",
+    "lca.plugins",
+]
+forbidden_dependencies = [
+    "gateway",
+]
+side_effects = [
+    "log:emit",
+]
+public_api = [
+    "lca.plugins.control_contributions",
+]
+filename_whitelist = ["all"]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.plugins.critic"]
+responsibility = "lca.plugins.critic: Critic 插件。本 README 由脚手架生成，待包负责人补充具体细节。"
+not_responsible_for = "跨层职责（详见 spec §3.4 闭集纪律）"
+allowed_dependencies = [
+    "lca.contracts",
+    "lca.plugins",
+]
+forbidden_dependencies = [
+    "gateway",
+]
+side_effects = [
+    "llm:call",
+    "log:emit",
+]
+public_api = [
+    "lca.plugins.critic",
+]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.plugins.gates"]
+responsibility = "lca.plugins.gates: Gate 插件。本 README 由脚手架生成，待包负责人补充具体细节。"
+not_responsible_for = "跨层职责（详见 spec §3.4 闭集纪律）"
+allowed_dependencies = [
+    "lca.contracts",
+    "lca.plugins",
+]
+forbidden_dependencies = [
+    "gateway",
+]
+side_effects = [
+    "log:emit",
+]
+public_api = [
+    "lca.plugins.gates",
+]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.plugins.insight"]
+responsibility = "lca.plugins.insight: 洞察插件。本 README 由脚手架生成，待包负责人补充具体细节。"
+not_responsible_for = "跨层职责（详见 spec §3.4 闭集纪律）"
+allowed_dependencies = [
+    "lca.contracts",
+    "lca.plugins",
+]
+forbidden_dependencies = [
+    "gateway",
+]
+side_effects = [
+    "log:emit",
+]
+public_api = [
+    "lca.plugins.insight",
+]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.plugins.learning"]
+responsibility = "lca.plugins.learning: 学习插件。本 README 由脚手架生成，待包负责人补充具体细节。"
+not_responsible_for = "跨层职责（详见 spec §3.4 闭集纪律）"
+allowed_dependencies = [
+    "lca.contracts",
+    "lca.plugins",
+]
+forbidden_dependencies = [
+    "gateway",
+]
+side_effects = [
+    "log:emit",
+]
+public_api = [
+    "lca.plugins.learning",
+]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.plugins.loop_drivers"]
+responsibility = "lca.plugins.loop_drivers: 循环驱动插件。本 README 由脚手架生成，待包负责人补充具体细节。"
+not_responsible_for = "跨层职责（详见 spec §3.4 闭集纪律）"
+allowed_dependencies = [
+    "lca.contracts",
+    "lca.plugins",
+]
+forbidden_dependencies = [
+    "gateway",
+]
+side_effects = [
+    "log:emit",
+]
+public_api = [
+    "lca.plugins.loop_drivers",
+]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.plugins.perceive"]
+responsibility = "lca.plugins.perceive: 感知插件。本 README 由脚手架生成，待包负责人补充具体细节。"
+not_responsible_for = "跨层职责（详见 spec §3.4 闭集纪律）"
+allowed_dependencies = [
+    "lca.contracts",
+    "lca.plugins",
+]
+forbidden_dependencies = [
+    "gateway",
+]
+side_effects = [
+    "log:emit",
+]
+public_api = [
+    "lca.plugins.perceive",
+]
+schema_version = "1.0.0"
+
+
+
+
+
+[tool.lca.package_contracts."lca.plugins.profile"]
+responsibility = "lca.plugins.profile: Profile 插件。本 README 由脚手架生成，待包负责人补充具体细节。"
+not_responsible_for = "跨层职责（详见 spec §3.4 闭集纪律）"
+allowed_dependencies = [
+    "lca.contracts",
+    "lca.plugins",
+]
+forbidden_dependencies = [
+    "gateway",
+]
+side_effects = [
+    "log:emit",
+]
+public_api = [
+    "lca.plugins.profile",
+]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.plugins.providers"]
+responsibility = "lca.plugins.providers: Provider 插件。本 README 由脚手架生成，待包负责人补充具体细节。"
+not_responsible_for = "跨层职责（详见 spec §3.4 闭集纪律）"
+allowed_dependencies = [
+    "lca.contracts",
+    "lca.plugins",
+]
+forbidden_dependencies = [
+    "gateway",
+]
+side_effects = [
+    "log:emit",
+]
+public_api = [
+    "lca.plugins.providers",
+]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.plugins.reasoner"]
+responsibility = "lca.plugins.reasoner: Reasoner 插件。本 README 由脚手架生成，待包负责人补充具体细节。"
+not_responsible_for = "跨层职责（详见 spec §3.4 闭集纪律）"
+allowed_dependencies = [
+    "lca.contracts",
+    "lca.plugins",
+]
+forbidden_dependencies = [
+    "gateway",
+]
+side_effects = [
+    "llm:call",
+    "log:emit",
+]
+public_api = [
+    "lca.plugins.reasoner",
+]
+schema_version = "1.0.0"
+
+
+[tool.lca.package_contracts."lca.plugins.roles"]
+responsibility = "lca.plugins.roles: 角色插件。本 README 由脚手架生成，待包负责人补充具体细节。"
+not_responsible_for = "跨层职责（详见 spec §3.4 闭集纪律）"
+allowed_dependencies = [
+    "lca.contracts",
+    "lca.plugins",
+]
+forbidden_dependencies = [
+    "gateway",
+]
+side_effects = [
+    "log:emit",
+]
+public_api = [
+    "lca.plugins.roles",
+]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.plugins.runtime"]
+responsibility = "lca.plugins.runtime: 运行时插件。本 README 由脚手架生成，待包负责人补充具体细节。"
+not_responsible_for = "跨层职责（详见 spec §3.4 闭集纪律）"
+allowed_dependencies = [
+    "lca.contracts",
+    "lca.plugins",
+]
+forbidden_dependencies = [
+    "gateway",
+]
+side_effects = [
+    "log:emit",
+]
+public_api = [
+    "lca.plugins.runtime",
+]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.plugins.seams"]
+responsibility = "lca.plugins.seams: Tier-1 seam definitions (cordis @plugin modules), grouped by cognitive plane."
+not_responsible_for = "跨层职责（详见 spec §3.4 闭集纪律）"
+allowed_dependencies = [
+    "lca.contracts",
+    "lca.plugins",
+]
+forbidden_dependencies = [
+    "gateway",
+]
+side_effects = [
+    "log:emit",
+]
+public_api = [
+    "lca.plugins.seams",
+]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.plugins.sensors"]
+responsibility = "lca.plugins.sensors: Sensor 插件。本 README 由脚手架生成，待包负责人补充具体细节。"
+not_responsible_for = "跨层职责（详见 spec §3.4 闭集纪律）"
+allowed_dependencies = [
+    "lca.contracts",
+    "lca.plugins",
+]
+forbidden_dependencies = [
+    "gateway",
+]
+side_effects = [
+    "log:emit",
+]
+public_api = [
+    "lca.plugins.sensors",
+]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.plugins.skill"]
+responsibility = "lca.plugins.skill: Skill 插件。本 README 由脚手架生成，待包负责人补充具体细节。"
+not_responsible_for = "跨层职责（详见 spec §3.4 闭集纪律）"
+allowed_dependencies = [
+    "lca.contracts",
+    "lca.plugins",
+]
+forbidden_dependencies = [
+    "gateway",
+]
+side_effects = [
+    "log:emit",
+]
+public_api = [
+    "lca.plugins.skill",
+]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.plugins.state"]
+responsibility = "lca.plugins.state: State 插件。本 README 由脚手架生成，待包负责人补充具体细节。"
+not_responsible_for = "跨层职责（详见 spec §3.4 闭集纪律）"
+allowed_dependencies = [
+    "lca.contracts",
+    "lca.plugins",
+]
+forbidden_dependencies = [
+    "gateway",
+]
+side_effects = [
+    "log:emit",
+]
+public_api = [
+    "lca.plugins.state",
+]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.plugins.strategies"]
+responsibility = "lca.plugins.strategies: 策略插件。本 README 由脚手架生成，待包负责人补充具体细节。"
+not_responsible_for = "跨层职责（详见 spec §3.4 闭集纪律）"
+allowed_dependencies = [
+    "lca.contracts",
+    "lca.infrastructure",
+    "lca.cognition",
+    "lca.agent",
+    "lca.harness",
+    "lca.plugins",
+]
+forbidden_dependencies = [
+    "gateway",
+]
+side_effects = [
+    "log:emit",
+]
+public_api = [
+    "lca.plugins.strategies",
+]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.plugins.synthesizer"]
+responsibility = "lca.plugins.synthesizer: Synthesizer 插件。本 README 由脚手架生成，待包负责人补充具体细节。"
+not_responsible_for = "跨层职责（详见 spec §3.4 闭集纪律）"
+allowed_dependencies = [
+    "lca.contracts",
+    "lca.plugins",
+]
+forbidden_dependencies = [
+    "gateway",
+]
+side_effects = [
+    "llm:call",
+    "log:emit",
+]
+public_api = [
+    "lca.plugins.synthesizer",
+]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.plugins.team_lead"]
+responsibility = "lca.plugins.team_lead: Team lead 插件。本 README 由脚手架生成，待包负责人补充具体细节。"
+not_responsible_for = "跨层职责（详见 spec §3.4 闭集纪律）"
+allowed_dependencies = [
+    "lca.contracts",
+    "lca.plugins",
+]
+forbidden_dependencies = [
+    "gateway",
+]
+side_effects = [
+    "log:emit",
+]
+public_api = [
+    "lca.plugins.team_lead",
+]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.plugins.tools"]
+responsibility = "lca.plugins.tools: Tools 插件。本 README 由脚手架生成，待包负责人补充具体细节。"
+not_responsible_for = "跨层职责（详见 spec §3.4 闭集纪律）"
+allowed_dependencies = [
+    "lca.contracts",
+    "lca.plugins",
+]
+forbidden_dependencies = [
+    "gateway",
+]
+side_effects = [
+    "log:emit",
+    "subprocess:spawn",
+    "network:openai",
+]
+public_api = [
+    "lca.plugins.tools",
+]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.plugins.transport"]
+responsibility = "lca.plugins.transport: 外部 transport 适配（Starlette webserver / ACP / CLI）。本 README 由脚手架生成，待包负责人补充具体细节。"
+not_responsible_for = "认知决策、阶段编排、组合根、kernel 内部实现"
+allowed_dependencies = [
+    "lca.contracts",
+    "lca.infrastructure",
+    "lca.plugins",
+]
+forbidden_dependencies = [
+    "lca.cognition",
+    "lca.agent",
+    "lca.runtime",
+    "lca.application",
+    "lca.harness",
+    "gateway",
+]
+side_effects = [
+    "log:emit",
+    "http:listen",
+]
+public_api = [
+    "lca.plugins.transport",
+]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.runtime"]
+responsibility = "lca.runtime: 运行循环、阶段驱动、停止、恢复、中间件、结果。本 README 由脚手架生成，待包负责人补充具体细节。"
+not_responsible_for = "跨层职责（详见 spec §3.4 闭集纪律）"
+allowed_dependencies = [
+    "lca.contracts",
+    "lca.infrastructure",
+    "lca.cognition",
+    "lca.runtime",
+]
+forbidden_dependencies = [
+    "lca.agent",
+    "lca.application",
+    "lca.harness",
+    "lca.plugins",
+    "gateway",
+]
+side_effects = [
+    "log:emit",
+]
+public_api = [
+    "lca.runtime",
+]
+filename_whitelist = ["all"]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.runtime.agent_runtime"]
+responsibility = "lca.runtime.agent_runtime: Agent 运行时实例。本 README 由脚手架生成，待包负责人补充具体细节。"
+not_responsible_for = "跨层职责（详见 spec §3.4 闭集纪律）"
+allowed_dependencies = [
+    "lca.contracts",
+    "lca.infrastructure",
+    "lca.cognition",
+    "lca.runtime",
+]
+forbidden_dependencies = [
+    "lca.agent",
+    "lca.application",
+    "lca.harness",
+    "lca.plugins",
+    "gateway",
+]
+side_effects = [
+    "log:emit",
+]
+public_api = [
+    "lca.runtime.agent_runtime",
+]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."gateway"]
+responsibility = "gateway: HTTP/OpenAI/设备等外部入口，薄适配层。本 README 由脚手架生成，待包负责人补充具体细节。"
+not_responsible_for = "跨层职责（详见 spec §3.4 闭集纪律）"
+allowed_dependencies = [
+    "lca.contracts",
+]
+forbidden_dependencies = [
+    "lca.infrastructure",
+    "lca.cognition",
+    "lca.runtime",
+    "lca.agent",
+    "lca.application",
+    "lca.harness",
+    "lca.plugins",
+]
+side_effects = [
+    "network:http",
+    "log:emit",
+]
+public_api = [
+    "gateway",
+]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."gateway.device_gateway"]
+responsibility = "gateway.device_gateway: 设备网关。本 README 由脚手架生成，待包负责人补充具体细节。"
+not_responsible_for = "跨层职责（详见 spec §3.4 闭集纪律）"
+allowed_dependencies = [
+    "lca.contracts",
+    "gateway",
+]
+forbidden_dependencies = [
+    "lca.infrastructure",
+    "lca.cognition",
+    "lca.runtime",
+    "lca.agent",
+    "lca.application",
+    "lca.harness",
+    "lca.plugins",
+]
+side_effects = [
+    "network:http",
+    "log:emit",
+]
+public_api = [
+    "gateway.device_gateway",
+]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."gateway.plugins"]
+responsibility = "gateway.plugins: Gateway 插件。本 README 由脚手架生成，待包负责人补充具体细节。"
+not_responsible_for = "跨层职责（详见 spec §3.4 闭集纪律）"
+allowed_dependencies = [
+    "lca.contracts",
+    "gateway",
+]
+forbidden_dependencies = [
+    "lca.infrastructure",
+    "lca.cognition",
+    "lca.runtime",
+    "lca.agent",
+    "lca.application",
+    "lca.harness",
+    "lca.plugins",
+]
+side_effects = [
+    "log:emit",
+]
+public_api = [
+    "gateway.plugins",
+]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."gateway.runs"]
+responsibility = "gateway.runs: 运行入口与执行。本 README 由脚手架生成，待包负责人补充具体细节。"
+not_responsible_for = "跨层职责（详见 spec §3.4 闭集纪律）"
+allowed_dependencies = [
+    "lca.contracts",
+    "gateway",
+]
+forbidden_dependencies = [
+    "lca.infrastructure",
+    "lca.cognition",
+    "lca.runtime",
+    "lca.agent",
+    "lca.application",
+    "lca.harness",
+    "lca.plugins",
+]
+side_effects = [
+    "log:emit",
+    "file:read",
+    "file:write",
+]
+public_api = [
+    "gateway.runs",
+]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.contracts.models.core"]
+responsibility = "lca.contracts.models.core: 25 core data types. Structurally inseparable per ADR-0105 §3.3 (multiple atomic types co-evolve)."
+not_responsible_for = "see ADR-0105 §3.3 exception channel"
+allowed_dependencies = []
+forbidden_dependencies = []
+side_effects = []
+public_api = ["lca.contracts.models.core"]
+# filename_whitelist = ["all"]: per ADR-0105 §3.3, this package
+# is structurally inseparable (multiple data/protocol types in
+# one concept; splitting would fragment cross-cutting concerns).
+filename_whitelist = ["all"]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.contracts.models.team"]
+responsibility = "lca.contracts.models.team: 11 team data types. Structurally inseparable per ADR-0105 §3.3."
+not_responsible_for = "see ADR-0105 §3.3 exception channel"
+allowed_dependencies = []
+forbidden_dependencies = []
+side_effects = []
+public_api = ["lca.contracts.models.team"]
+# filename_whitelist = ["all"]: per ADR-0105 §3.3, this package
+# is structurally inseparable (multiple data/protocol types in
+# one concept; splitting would fragment cross-cutting concerns).
+filename_whitelist = ["all"]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.infrastructure.cli.commands"]
+responsibility = "lca.infrastructure.cli.commands: CLI command implementations. Structurally inseparable per ADR-0105 §3.3 (single CLI group)."
+not_responsible_for = "see ADR-0105 §3.3 exception channel"
+allowed_dependencies = []
+forbidden_dependencies = []
+side_effects = []
+public_api = ["lca.infrastructure.cli.commands"]
+# filename_whitelist = ["all"]: per ADR-0105 §3.3, this package
+# is structurally inseparable (multiple data/protocol types in
+# one concept; splitting would fragment cross-cutting concerns).
+filename_whitelist = ["all"]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.infrastructure.tools.lca_computer.apis"]
+responsibility = "lca.infrastructure.tools.lca_computer.apis: 13 LCA Computer API tools. Structurally inseparable per ADR-0105 §3.3 (single integration surface)."
+not_responsible_for = "see ADR-0105 §3.3 exception channel"
+allowed_dependencies = []
+forbidden_dependencies = []
+side_effects = []
+public_api = ["lca.infrastructure.tools.lca_computer.apis"]
+# filename_whitelist = ["all"]: per ADR-0105 §3.3, this package
+# is structurally inseparable (multiple data/protocol types in
+# one concept; splitting would fragment cross-cutting concerns).
+filename_whitelist = ["all"]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.plugins.composer.runtime"]
+responsibility = "lca.plugins.composer.runtime: Runtime composer plugins. Structurally inseparable per ADR-0105 §3.3."
+not_responsible_for = "see ADR-0105 §3.3 exception channel"
+allowed_dependencies = []
+forbidden_dependencies = []
+side_effects = []
+public_api = ["lca.plugins.composer.runtime"]
+# filename_whitelist = ["all"]: per ADR-0105 §3.3, this package
+# is structurally inseparable (multiple data/protocol types in
+# one concept; splitting would fragment cross-cutting concerns).
+filename_whitelist = ["all"]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.plugins.providers.observability"]
+responsibility = "lca.plugins.providers.observability: 13 observability providers. Structurally inseparable per ADR-0105 §3.3 (single provider family)."
+not_responsible_for = "see ADR-0105 §3.3 exception channel"
+allowed_dependencies = []
+forbidden_dependencies = []
+side_effects = []
+public_api = ["lca.plugins.providers.observability"]
+# filename_whitelist = ["all"]: per ADR-0105 §3.3, this package
+# is structurally inseparable (multiple data/protocol types in
+# one concept; splitting would fragment cross-cutting concerns).
+filename_whitelist = ["all"]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.plugins.seams.observability"]
+responsibility = "lca.plugins.seams.observability: 16 observability seams. Structurally inseparable per ADR-0105 §3.3 (single seam family)."
+not_responsible_for = "see ADR-0105 §3.3 exception channel"
+allowed_dependencies = []
+forbidden_dependencies = []
+side_effects = []
+public_api = ["lca.plugins.seams.observability"]
+# filename_whitelist = ["all"]: per ADR-0105 §3.3, this package
+# is structurally inseparable (multiple data/protocol types in
+# one concept; splitting would fragment cross-cutting concerns).
+filename_whitelist = ["all"]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.infrastructure.text"]
+responsibility = "lca.infrastructure.text: utility string functions (truncate, safe_boundary); flat utility module per package-organization-discipline §3.2"
+not_responsible_for = "see ADR-0105 §3.3 exception channel"
+allowed_dependencies = []
+forbidden_dependencies = []
+side_effects = []
+public_api = ["lca.infrastructure.text"]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.plugins.memory"]
+responsibility = "lca.plugins.memory: memory provider plugins (4-layer, compaction policy, retrieval, write policy, tree cache)"
+not_responsible_for = "see ADR-0105 §3.3 exception channel"
+allowed_dependencies = []
+forbidden_dependencies = []
+side_effects = []
+public_api = ["lca.plugins.memory"]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.loop"]
+responsibility = "lca.loop: Loop 机制层（R1）—— DeclarativeRuntimeDriver / TurnExecutor 推进一次 iteration，FactGateway 门面把 EP 事实投递到 Session.append"
+not_responsible_for = "认知算法（lca.cognition）、控制面 State 单写（Reducer/RunCommitter）、图构建与遍历（lca/framework/graph）、HTTP/SSE（lca.plugins.transport）"
+allowed_dependencies = [
+    "lca.contracts",
+    "lca.framework",
+    "lca.harness",
+    "lca.infrastructure",
+    "lca.runtime",
+    "lca_kernel.events",
+    "lca_kernel.plan",
+]
+forbidden_dependencies = [
+    "lca.agent",
+    "lca.application",
+    "lca.plugins",
+]
+side_effects = [
+    "fact:session-append",
+    "log:emit",
+]
+public_api = [
+    "lca.loop",
+    "lca.loop.driver",
+    "lca.loop.fact_gateway",
+    "lca.loop.emit",
+    "lca.loop.commit",
+    "lca.loop.control",
+    "lca.loop.transport",
+]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.session"]
+responsibility = "lca.session: Run 级唯一 durable 事实的 append 与 fold 入口（事实平面 SSOT）"
+not_responsible_for = "认知决策（lca.cognition）、HTTP 路由（lca.plugins.transport）、控制面 State 单写（Reducer/RunCommitter）、把投影当事实源写回（C7）"
+allowed_dependencies = [
+    "lca.contracts",
+    "lca_kernel.events",
+    "lca.infrastructure",
+    "lca.plugins",
+    "lca.runtime",
+]
+forbidden_dependencies = [
+    "lca.agent",
+    "lca.application",
+    "lca.cognition",
+    "lca.harness",
+    "lca.loop",
+]
+side_effects = [
+    "fact:session-append",
+    "file:write",
+    "log:emit",
+]
+public_api = ["lca.session"]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.nodes"]
+responsibility = "lca.nodes: 六语义 phase 闭集的 typed-boundary 节点实现与外循环 graph_node_executor"
+not_responsible_for = "图的构建与遍历（lca/framework/graph、bundles/*.yaml）、插件 Manifest 词汇（lca/plugins、lca/harness）、认知算法本体（lca/cognition）、控制面 State 单写（C4）"
+allowed_dependencies = [
+    "lca.contracts",
+    "lca.harness",
+    "lca.cognition",
+    "lca.infrastructure",
+    "lca.plugins",
+]
+forbidden_dependencies = [
+    "lca.application",
+    "lca.agent",
+    "lca.runtime",
+    "lca.session",
+    "lca.loop",
+]
+side_effects = [
+    "log:emit",
+]
+public_api = ["lca.nodes"]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.plugins.session"]
+responsibility = "lca.plugins.session: Session runtime store、投影 fold、标题与遥测的薄 plugin（事实 API 已提升到 lca.session）"
+not_responsible_for = "事实平面 API 本体（append/catalog/fold/repair/bind/recovery 属 lca.session）、认知决策、phase 图遍历、第二事实写入口"
+allowed_dependencies = [
+    "lca.contracts",
+    "lca_kernel.events",
+    "lca.plugins",
+    "lca.harness",
+    "lca.infrastructure",
+    "lca.session",
+]
+forbidden_dependencies = [
+    "lca.agent",
+    "lca.application",
+    "lca.cognition",
+    "lca.loop",
+    "lca.runtime",
+    "lca.nodes",
+]
+side_effects = [
+    "file:write",
+    "network:http",
+    "log:emit",
+]
+public_api = ["lca.plugins.session"]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.plugins.observability"]
+responsibility = "lca.plugins.observability: 观测链插件（deriver / exporter / sink / provider），只派生与外发，不写第二事实源"
+not_responsible_for = "事实定义与写入（Session.append 单入口）、事件词表与 catalog SSOT（lca_kernel/events/config）、控制面决策与 State 单写"
+allowed_dependencies = [
+    "lca.contracts",
+    "lca.infrastructure",
+    "lca.harness",
+    "lca.plugins",
+    "lca_kernel.events",
+]
+forbidden_dependencies = [
+    "lca.agent",
+    "lca.application",
+    "lca.cognition",
+    "lca.loop",
+    "lca.runtime",
+    "lca.session",
+    "lca.nodes",
+]
+side_effects = [
+    "file:write",
+    "network:http",
+    "log:emit",
+]
+public_api = ["lca.plugins.observability"]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.plugins.think"]
+responsibility = "lca.plugins.think: Think 原语的 provider / seam plugin（cognitive、reasoner、role profile、system、null 兜底）"
+not_responsible_for = "认知算法本体（lca.cognition/brain）、图遍历与调度（lca/framework/graph、lca/loop）、组合根装配（lca.application）"
+allowed_dependencies = [
+    "lca.contracts",
+    "lca.harness",
+    "lca.cognition",
+    "lca.infrastructure",
+    "lca.plugins",
+    "lca.application",
+]
+forbidden_dependencies = [
+    "lca.agent",
+    "lca.session",
+    "lca.loop",
+    "lca.nodes",
+    "gateway",
+]
+side_effects = [
+    "llm:call",
+    "log:emit",
+]
+public_api = ["lca.plugins.think"]
+schema_version = "1.0.0"
+
+[tool.lca.package_contracts."lca.harness.composition"]
+responsibility = "lca.harness.composition: 把 ResolvedProfile 编译成 boot 产物的编译期投影（profile boot / observability plan / resource registry）"
+not_responsible_for = "run 期调度与 phase 遍历、认知算法、事实写入（Session.append 单入口）、插件业务 setup"
+allowed_dependencies = [
+    "lca.contracts",
+    "lca_kernel.plan",
+    "lca_kernel.events",
+]
+forbidden_dependencies = [
+    "lca.cognition",
+    "lca.agent",
+    "lca.application",
+    "lca.plugins",
+    "lca.session",
+    "lca.loop",
+    "lca.runtime",
+    "lca.nodes",
+]
+side_effects = [
+    "log:emit",
+]
+public_api = ["lca.harness.composition"]
+schema_version = "1.0.0"
+
+# === PER-PACKAGE FORBIDDEN RULES (auto-generated by scaffold_importlinter_rules.py) ===
+[[tool.importlinter.contracts]]
+name = "Per-package forbidden: lca.contracts.atoms"
+type = "forbidden"
+source_modules = ["lca.contracts.atoms"]
+forbidden_modules = [
+    "lca.infrastructure.llm",
+    "lca.infrastructure.tools",
+    "lca.infrastructure.sandbox",
+]
+
+[[tool.importlinter.contracts]]
+name = "Per-package forbidden: lca.contracts.models"
+type = "forbidden"
+source_modules = ["lca.contracts.models"]
+forbidden_modules = [
+    "lca.infrastructure.llm",
+    "lca.infrastructure.tools",
+    "lca.infrastructure.state_store",
+]
+
+[[tool.importlinter.contracts]]
+name = "Per-package forbidden: lca.contracts.models.core"
+type = "forbidden"
+source_modules = ["lca.contracts.models.core"]
+forbidden_modules = [
+    "lca.infrastructure.llm",
+    "lca.infrastructure.tools",
+]
+
+[[tool.importlinter.contracts]]
+name = "Per-package forbidden: lca.contracts.models.observability"
+type = "forbidden"
+source_modules = ["lca.contracts.models.observability"]
+forbidden_modules = [
+    "lca.infrastructure.llm",
+    "lca.infrastructure.cli",
+]
+
+[[tool.importlinter.contracts]]
+name = "Per-package forbidden: lca.contracts.models.team"
+type = "forbidden"
+source_modules = ["lca.contracts.models.team"]
+forbidden_modules = [
+    "lca.infrastructure.llm",
+    "lca.infrastructure.tools",
+]
+
+[[tool.importlinter.contracts]]
+name = "Per-package forbidden: lca.contracts.observability"
+type = "forbidden"
+source_modules = ["lca.contracts.observability"]
+forbidden_modules = [
+    "lca.infrastructure.llm",
+    "lca.infrastructure.tools",
+    "lca.infrastructure.cli",
+]
+
+[[tool.importlinter.contracts]]
+name = "Per-package forbidden: lca.contracts.observability.schemas"
+type = "forbidden"
+source_modules = ["lca.contracts.observability.schemas"]
+forbidden_modules = [
+    "lca.infrastructure.llm",
+    "lca.infrastructure.tools",
+]
+
+[[tool.importlinter.contracts]]
+name = "Per-package forbidden: lca.contracts.protocols"
+type = "forbidden"
+source_modules = ["lca.contracts.protocols"]
+forbidden_modules = [
+    "lca.infrastructure.llm",
+    "lca.infrastructure.tools",
+    "lca.infrastructure.sandbox",
+]
+
+[[tool.importlinter.contracts]]
+name = "Per-package forbidden: lca.contracts.mechanisms"
+type = "forbidden"
+source_modules = ["lca.contracts.mechanisms"]
+forbidden_modules = [
+    "lca.infrastructure.llm",
+    "lca.infrastructure.tools",
+]
+
+[[tool.importlinter.contracts]]
+name = "Per-package forbidden: lca.contracts.harness"
+type = "forbidden"
+source_modules = ["lca.contracts.harness"]
+forbidden_modules = [
+    "lca.infrastructure.llm",
+    "lca.infrastructure.tools",
+]
+
+[[tool.importlinter.contracts]]
+name = "lca.plugins 子包互不依赖"
+type = "independence"
+modules = []
+# === END PER-PACKAGE ===

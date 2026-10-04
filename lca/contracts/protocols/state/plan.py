@@ -1,0 +1,102 @@
+"""不可变的 ``CompiledRunPlan`` 数据契约（ADR-0068 / ADR-0075）。
+
+计划的构建、散列、序列化和解释均由 ``lca.harness.plan`` 拥有；本模块只定义
+跨层交换的稳定数据形状。运行期不得修改计划，任何变更都必须重新编译为新的
+plan reference。
+
+控制面只以原生 ``PluginSpec.contributes`` 投影出的 ``control_entries`` 表示。
+旧 ``ControlPlan`` 不再进入运行计划，避免同一控制决策同时拥有两套事实源。
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any
+
+from lca.contracts.models.assistant.plan_overlay import SectionOverride
+from lca.contracts.protocols.declarative.declarative_1.declarative_common import (
+    DECLARATIVE_PLAN_VERSION,
+)
+from lca.contracts.protocols.declarative.declarative_1.declarative_graph import (
+    ActionAuthorityPlan,
+    EffectPolicyPlan,
+    PlanProvenance,
+    ReplacementDecision,
+    ValidationReport,
+)
+from lca.contracts.protocols.declarative.declarative_2.declarative_plugin import PluginSpec
+from lca.contracts.protocols.perceive.capability_plan import CapabilityPlan, ProviderBinding
+from lca.contracts.protocols.state.scope_plan import ScopePlan
+
+# PhaseBinding / ControlEntry / CognitivePhaseGraphPlan retired in ADR-0221 P3:
+# the v2 runtime builds its executable plan directly from
+# ``PlanInterpreter`` + NodeExecutor subgraphs, so the plan no longer
+# carries the v1 declarative phase graph region. The v1 element type of
+# ``control_entries`` no longer exists; the v2 runtime never populates
+# this region (always the empty tuple), so its element type is ``Any``.
+
+# Schema version for CompiledRunPlan. v2 evolves v1; it is not a parallel plan.
+COMPILED_RUN_PLAN_VERSION: str = DECLARATIVE_PLAN_VERSION
+
+
+@dataclass(frozen=True, slots=True)
+class CompiledRunPlan:
+    """The immutable plan data consumed by the runtime.
+
+    ``capability`` and ``scope`` retain the ADR-0068 data regions.  The
+    ADR-0075 declarations, including the sole executable control projection,
+    travel with them as one immutable value. ``phase_graph`` is ``None`` only
+    for direct-construction tests; production ``compile_plan`` supplies the
+    complete declarative region.
+    """
+
+    profile_path: str
+    capability: CapabilityPlan
+    scope: ScopePlan
+    plan_version: str = COMPILED_RUN_PLAN_VERSION
+    input_provenance: tuple[tuple[str, str], ...] = ()
+    revision: str = "v2"
+    plugin_specs: tuple[PluginSpec, ...] = ()
+    # ADR-0221 P3: populated from ``CapabilityPlan.provider_bindings``
+    # (``ProviderBinding``: owner_plugin / fallback_policy / effect_class).
+    # The v1 ``CapabilityBinding`` (provider / cardinality / grant) is retired
+    # from this region; no producer assigns it here anymore.
+    capability_bindings: tuple[ProviderBinding, ...] = ()
+    control_entries: tuple[Any, ...] = ()
+    replacement_map: tuple[ReplacementDecision, ...] = ()
+    effect_policy: EffectPolicyPlan | None = None
+    action_authority: ActionAuthorityPlan | None = None
+    provenance: PlanProvenance | None = None
+    validation_report: ValidationReport = field(default_factory=ValidationReport)
+    prompt_template_id: str | None = None
+    """per-agent ``plan.yaml`` 选择的模板 id（ADR-0242 D10）；None = 继承 profile 默认。"""
+    prompt_section_overrides: tuple[SectionOverride, ...] = ()
+    """per-agent ``plan.yaml`` 的 section 内容覆盖（ADR-0242 D10）。
+
+    只携带数据覆盖；渲染期消费由 prompt 装配层读取。空 = 无覆盖。"""
+
+    def __post_init__(self) -> None:
+        if not self.profile_path:
+            raise ValueError("CompiledRunPlan.profile_path must be non-empty")
+        if not isinstance(self.input_provenance, tuple):
+            object.__setattr__(self, "input_provenance", tuple(self.input_provenance))
+        normalized: list[tuple[str, str]] = []
+        for item in self.input_provenance:
+            if not isinstance(item, tuple) or len(item) != 2:
+                raise ValueError(f"input_provenance item must be (kind, path) tuple, got {item!r}")
+            kind, path = item
+            normalized.append((str(kind), str(path)))
+        object.__setattr__(self, "input_provenance", tuple(normalized))
+        for name in (
+            "plugin_specs",
+            "capability_bindings",
+            "control_entries",
+            "replacement_map",
+            "prompt_section_overrides",
+        ):
+            value = getattr(self, name)
+            if not isinstance(value, tuple):
+                object.__setattr__(self, name, tuple(value))
+
+
+__all__ = ["COMPILED_RUN_PLAN_VERSION", "CompiledRunPlan"]

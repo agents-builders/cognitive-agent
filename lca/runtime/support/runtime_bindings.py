@@ -1,0 +1,373 @@
+"""声明式 Turn 的已验证运行绑定。
+
+组合根在这里选择并封装每个可替换依赖；运行入口只负责创建或恢复状态，再把
+状态交给这份不可变绑定创建的 driver。这样一份 ``CompiledRunPlan`` 所需的
+解释、效果、Reducer、Journal 与终态依赖拥有单一的可导航事实源。
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from dataclasses import dataclass, field, replace
+from types import MappingProxyType
+from typing import TYPE_CHECKING, cast
+
+from lca.contracts.mechanisms import HookRegistry
+from lca.contracts.models.core.state.state import AgentState, Budget
+from lca.contracts.models.team.team.awareness import TeamAwareness
+from lca.contracts.protocols.act.effect.handler import EffectHandlerRegistry
+from lca.contracts.protocols.act.embodiment.embodiment import Body
+from lca.contracts.protocols.declarative.declarative_1.declarative_execution import (
+    DeltaReducer,
+    EffectDispatcher,
+)
+from lca.contracts.protocols.declarative.declarative_1.node_executor import NodeExecutor
+from lca.contracts.protocols.journal.artifact.closure import ArtifactClosure
+from lca.contracts.protocols.journal.idempotency.idempotency import IdempotencyStore
+from lca.contracts.protocols.journal.phase.observation import PhaseObserver
+from lca.contracts.protocols.memory.memory import MemorySystem
+from lca.contracts.protocols.runtime.infra.infra import StateStore
+from lca.contracts.protocols.runtime.runtime.composition import (
+    CheckpointStateResolver,
+    CheckpointStateResolverFactory,
+    DeclarativeInterpreter,
+    DeclarativeInterpreterFactory,
+    DeltaReducerFactory,
+    EffectDispatcherFactory,
+    ResultFinalizer,
+    ResultFinalizerFactory,
+    RuntimeJournal,
+    RuntimeJournalFactory,
+)
+from lca.contracts.protocols.runtime.runtime.lifecycle import RuntimeLifecyclePublisher
+from lca.contracts.protocols.session.resume.input import ResumeInputAdapter
+from lca.contracts.protocols.state.delta_handler import DeltaHandlerRegistry
+from lca.contracts.protocols.state.plan import CompiledRunPlan
+from lca.contracts.protocols.state.reducer import Reducer
+from lca.contracts.protocols.think.cognition import Brain, PerceiveHub
+from lca.harness.plan import compiled_run_plan_ref
+from lca.infrastructure.memory.contextfiles.service.assembly import refresh_standing_backstory
+from lca.runtime.loop.runtime_event_publisher import NullRuntimeLifecyclePublisher
+
+if TYPE_CHECKING:
+    from lca.loop.driver import DeclarativeRuntimeDriver
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimePhaseCapabilities:
+    """Frozen, composition-provided capability view for phase executors.
+
+    The runtime does not enumerate standard phase dependencies.  Instead, each
+    cognitive cluster contributes the capabilities required while closing
+    ``AgentGraph``; custom executors can consume additional declared keys.
+
+    ADR-0221 P3: ``PhaseCapabilityReader`` Protocol retired. ``values``
+    exposes the underlying mapping for any caller that still needs
+    duck-typed capability lookup.
+    """
+
+    values: Mapping[str, object]
+
+    def __post_init__(self) -> None:
+        """Snapshot the contribution map before phase interpretation begins."""
+
+        object.__setattr__(self, "values", MappingProxyType(dict(self.values)))
+
+    def with_extra(self, extra: Mapping[str, object]) -> RuntimePhaseCapabilities:
+        """Return a new instance with *extra* merged over ``self.values``.
+
+        Runtime node executors resolve their declared ports via
+        ``context.runtime.<port>`` (see
+        :class:`lca.framework.graph.adapter.PlanInterpreterAdapter._AdapterScope`),
+        and the runtime scope is exactly this :class:`RuntimePhaseCapabilities`.
+        Composition populates the static fields (``brain``, ``body``,
+        ``phase.think.*``, etc.); per-run values that arrive after
+        composition — most notably the per-run :class:`RunSessionWriter`
+        bound by ``bind_run_event_session_from_store`` — have no other
+        carrier, so we expose this seam so the run loop can layer them
+        in without mutating the composition-time closure.
+        """
+        if not extra:
+            return self
+        merged: dict[str, object] = dict(self.values)
+        merged.update(extra)
+        return RuntimePhaseCapabilities(merged)
+
+    def get(self, name: str) -> object | None:
+        """Return a named capability from the graph's explicit contribution map."""
+
+        return self.values.get(name)
+
+    def require(self, name: str) -> object:
+        """Return a declared capability or fail at the restricted seam."""
+
+        value = self.get(name)
+        if value is None:
+            raise KeyError(f"phase capability is not declared: {name}")
+        return value
+
+    @property
+    def brain(self) -> Brain:
+        """Expose the composed Brain through the legacy runtime facade."""
+
+        return cast("Brain", self.require("brain"))
+
+    @property
+    def body(self) -> Body:
+        """Expose the capability required by the existing body effect protocol."""
+
+        return cast("Body", self.require("body"))
+
+    @property
+    def memory(self) -> MemorySystem:
+        """Expose the capability required by the existing memory effect protocol."""
+
+        return cast("MemorySystem", self.require("memory"))
+
+    @property
+    def perceive_hub(self) -> PerceiveHub:
+        """Expose the composed perception hub through the legacy runtime facade."""
+
+        return cast("PerceiveHub", self.require("perceive_hub"))
+
+
+@dataclass(frozen=True, slots=True)
+class DeclarativeRuntimeBindings:
+    """解释一个声明式 Turn 的完整且已经选择好的依赖闭包。
+
+    该 module 的 interface 有意只暴露一个主要操作 ``new_driver``。它隐藏
+    driver 创建、Journal 的逐 Turn 生命周期，以及这些依赖在 fresh/resume
+    两种路径中的重复装配；所有字段仍是组合根可审计的显式事实。
+    """
+
+    plan: CompiledRunPlan | None
+    node_executors: Mapping[str, NodeExecutor]
+    capabilities: RuntimePhaseCapabilities
+    reducer: Reducer
+    hooks: HookRegistry
+    effect_handler_registry: EffectHandlerRegistry
+    delta_handler_registry: DeltaHandlerRegistry
+    artifact_closure: ArtifactClosure
+    idempotency_store: IdempotencyStore
+    resume_input_adapter: ResumeInputAdapter
+    state_store: StateStore
+    effect_dispatcher_factory: EffectDispatcherFactory
+    delta_reducer_factory: DeltaReducerFactory
+    journal_factory: RuntimeJournalFactory
+    interpreter_factory: DeclarativeInterpreterFactory
+    checkpoint_state_resolver_factory: CheckpointStateResolverFactory
+    result_finalizer_factory: ResultFinalizerFactory
+    phase_observer: PhaseObserver
+    lifecycle_publisher: RuntimeLifecyclePublisher = field(
+        default_factory=NullRuntimeLifecyclePublisher
+    )
+
+    @classmethod
+    def assemble(
+        cls,
+        *,
+        plan: CompiledRunPlan | None,
+        node_executors: Mapping[str, NodeExecutor],
+        capabilities: RuntimePhaseCapabilities,
+        reducer: Reducer,
+        hooks: HookRegistry,
+        effect_handler_registry: EffectHandlerRegistry,
+        delta_handler_registry: DeltaHandlerRegistry,
+        artifact_closure: ArtifactClosure,
+        idempotency_store: IdempotencyStore,
+        resume_input_adapter: ResumeInputAdapter,
+        state_store: StateStore,
+        effect_dispatcher_factory: EffectDispatcherFactory,
+        delta_reducer_factory: DeltaReducerFactory,
+        journal_factory: RuntimeJournalFactory,
+        interpreter_factory: DeclarativeInterpreterFactory,
+        checkpoint_state_resolver_factory: CheckpointStateResolverFactory,
+        result_finalizer_factory: ResultFinalizerFactory,
+        phase_observer: PhaseObserver,
+        lifecycle_publisher: RuntimeLifecyclePublisher | None = None,
+    ) -> DeclarativeRuntimeBindings:
+        """冻结节点 executor 映射，防止运行开始后出现环境式重新绑定。"""
+
+        return cls(
+            plan=plan,
+            node_executors=MappingProxyType(dict(node_executors)),
+            capabilities=capabilities,
+            reducer=reducer,
+            hooks=hooks,
+            effect_handler_registry=effect_handler_registry,
+            delta_handler_registry=delta_handler_registry,
+            artifact_closure=artifact_closure,
+            idempotency_store=idempotency_store,
+            resume_input_adapter=resume_input_adapter,
+            state_store=state_store,
+            effect_dispatcher_factory=effect_dispatcher_factory,
+            delta_reducer_factory=delta_reducer_factory,
+            journal_factory=journal_factory,
+            interpreter_factory=interpreter_factory,
+            checkpoint_state_resolver_factory=checkpoint_state_resolver_factory,
+            result_finalizer_factory=result_finalizer_factory,
+            phase_observer=phase_observer,
+            lifecycle_publisher=lifecycle_publisher or NullRuntimeLifecyclePublisher(),
+        )
+
+    def plan_ref(self) -> str:
+        """Return the stable identity of the selected executable plan."""
+        return compiled_run_plan_ref(self.require_executable_plan())
+
+    def with_writer(self, writer: object) -> DeclarativeRuntimeBindings:
+        """Return a copy with ``writer`` injected into the phase capabilities.
+
+        Think subgraph node executors (e.g. ``history.derive``,
+        ``llm.call``) declare a ``writer`` port that flows in from
+        the per-run :class:`RunSessionWriter` bound by
+        :func:`lca.session.lifecycle.bind.bind_run_event_session_from_store`.
+        Composition only fills the static phase capability map
+        (``brain``, ``body``, ``phase.think.*``); the writer is bound
+        later, when the run actually starts. This seam lets the run
+        loop layer the writer in without mutating the composition-time
+        closure.
+        """
+        return replace(self, capabilities=self.capabilities.with_extra({"writer": writer}))
+
+    def with_vocal_gate(self, vocal_gate: object) -> DeclarativeRuntimeBindings:
+        """Return a copy with ``vocal_gate`` injected into the phase capabilities (ADR-0248)."""
+        return replace(self, capabilities=self.capabilities.with_extra({"vocal_gate": vocal_gate}))
+
+    def require_executable_plan(self) -> CompiledRunPlan:
+        """Return the selected plan once the bindings carry its node executors."""
+        if self.plan is None or not self.node_executors:
+            raise ValueError(
+                "DeclarativeRuntimeBindings requires a compiled_plan and node_executors."
+            )
+        return self.plan
+
+    def new_checkpoint_state_resolver(self) -> CheckpointStateResolver:
+        """Create the profile-selected recovery seam from the frozen binding closure."""
+        return self.checkpoint_state_resolver_factory.create(state_store=self.state_store)
+
+    def new_result_finalizer(self) -> ResultFinalizer:
+        """Create the profile-selected terminal seam from the frozen binding closure."""
+        return self.result_finalizer_factory.create(
+            reducer=self.reducer,
+            hooks=self.hooks,
+            artifact_closure=self.artifact_closure,
+            state_store=self.state_store,
+        )
+
+    # Construct the profile-selected interpreter from this verified closure.
+    def new_interpreter(self, *, journal: RuntimeJournal) -> DeclarativeInterpreter:
+        graph_observer = self._build_graph_observer()
+        interpreter = self.interpreter_factory.create(
+            journal=journal,
+            effect_gateway=self.new_effect_dispatcher(),
+            reducer=self.new_delta_reducer(),
+            phase_observer=self.phase_observer,
+            lifecycle_publisher=self.lifecycle_publisher,
+            node_executors=dict(self.node_executors),
+            node_executor_runtime_scope=self.capabilities.with_extra(
+                {
+                    "reducer": self.reducer,
+                    "state_store": self.state_store,
+                    "standing_refresher": refresh_standing_backstory,
+                }
+            ),
+            graph_observer=graph_observer,
+        )
+        # ADR-0221 P3: the v2 interpreter is the kernel-native
+        # ``PlanInterpreter`` dataclass. The Protocol-level
+        # ``isinstance`` check is retired — the factory's return type
+        # is the contract; consumers are duck-typed at the call site.
+        _ = interpreter  # explicit acknowledgement
+        # 注意:Default factory 已经在 create() 里 bind_cordis_seams(含 think subgraph 默认 fallback)。
+        # runtime_bindings 不重复 bind,以免覆盖 Default factory 的 _DefaultSubgraphRuntime。
+        # 顶层老 phase subgraph 仍走 self.subgraph_scope(set_subgraph_scope() 设)。
+        return interpreter
+
+    def _build_graph_observer(self) -> object | None:
+        """Build a SpineGraphObserver wired to the active EventSpine.
+
+        Production runs install a process-local spine accessor via
+        spine.core; the observer reuses the same accessor so every
+        graph event flows through the existing single-writer path
+        (EventSpine.append -> SpineFileSink). When no spine is
+        active (unit tests, fixture adapters, pre-boot),
+        PlanInterpreterAdapter falls back to its NullGraphObserver.
+        """
+        from lca.framework.graph.observer_impls import SpineGraphObserver
+        from lca.harness.declarative.compile.instrument.wrap import _safe_append
+        from lca.plugins.observability.spine.runtime_hooks import (
+            resolve_active_spine,
+        )
+
+        spine = resolve_active_spine()
+        if spine is None:
+            return None
+
+        def emit(ep: str, payload: dict) -> None:
+            _safe_append(
+                spine=spine,
+                execution_point=ep,
+                channel="control",
+                payload=payload,
+                outcome=None,
+                span=None,
+            )
+
+        return SpineGraphObserver(emit=emit)
+
+    def new_effect_dispatcher(self) -> EffectDispatcher:
+        """Create the profile-selected effect seam from the frozen binding closure."""
+        return self.effect_dispatcher_factory.create(
+            capabilities=self.capabilities,
+            effect_handler_registry=self.effect_handler_registry,
+            idempotency_store=self.idempotency_store,
+        )
+
+    def new_delta_reducer(self) -> DeltaReducer:
+        """Create the profile-selected delta seam from the frozen binding closure."""
+        return self.delta_reducer_factory.create(
+            reducer=self.reducer,
+            delta_handler_registry=self.delta_handler_registry,
+        )
+
+    def new_driver(self) -> DeclarativeRuntimeDriver:
+        """为一次 fresh 或 resume Turn 创建隔离的声明式 driver。"""
+
+        from lca.loop.driver import DeclarativeRuntimeDriver
+
+        return DeclarativeRuntimeDriver(self, journal=self.journal_factory.create())
+
+    def new_state(
+        self,
+        *,
+        trace_id: str,
+        task: str,
+        budget: Budget,
+        agent_role: str,
+        from_role: str,
+        team_awareness: TeamAwareness | None,
+    ) -> AgentState:
+        """Create the complete fresh-run state from the declared runtime inputs.
+
+        Keeping this constructor typed makes the runtime's only fresh-state
+        transition auditable: callers cannot pass arbitrary state fields or
+        bypass the explicit trace, task, budget, and team-context contract.
+        """
+
+        return AgentState(
+            trace_id=trace_id,
+            task=task,
+            budget=budget,
+            agent_role=agent_role,
+            from_role=from_role,
+            team_awareness=team_awareness,
+        )
+
+
+RuntimeBindings = DeclarativeRuntimeBindings  # ADR-0110 D5 — public alias; see commit 99010f35.
+
+__all__ = [
+    "DeclarativeRuntimeBindings",
+    "RuntimeBindings",
+    "RuntimePhaseCapabilities",
+]

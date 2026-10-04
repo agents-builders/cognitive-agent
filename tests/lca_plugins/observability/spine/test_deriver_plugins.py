@@ -1,0 +1,147 @@
+"""Tests for spine deriver plugins (narrative / graph / live_tail).
+
+ADR-0167 D11 / ADR-0186 PR-3g: spine.deriver.step_tree 已删除(plugin 是
+boot-scope 但 deriver 必须 per-run);生产 step_tree 由 RunSessionBuilder
+装配 StepTreeFoldDeriver。本测试覆盖仍在的 deriver plugin: manifest 声明
++ on_event FD-2 安全性 + live_tail SSE carrier 契约。
+"""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime
+from pathlib import Path
+
+from lca.harness.plugin.declaration import definition_from_plugin
+from lca.infrastructure.observability.spine.derivers.graph.graph import GraphDeriver
+from lca.infrastructure.observability.spine.event.record import EventRecord
+from lca.plugins.observability.spine.derivers import (
+    graph,
+    live_tail,
+    narrative,
+)
+
+_BASE_KWARGS: dict[str, object] = {
+    "execution_point": "think.gate.start",
+    "channel": "fact",
+    "span_id": "lca-span-00000001",
+    "parent_span_id": None,
+    "sequence": 1,
+    "epoch": 1,
+    "causality_id": "sha256:abc",
+    "outcome": None,
+    "when": datetime(2026, 9, 1, 12, 0, 0, tzinfo=UTC),
+    "when_corrected": datetime(2026, 9, 1, 12, 0, 0, tzinfo=UTC),
+    "prev_event_hash": None,
+    "run_id": "r-test",
+    "step_id": "s-test",
+    "payload": {},
+}
+
+
+def _make_event(**overrides: object) -> EventRecord:
+    kwargs = dict(_BASE_KWARGS)
+    kwargs.update(overrides)
+    return EventRecord(**kwargs)  # type: ignore[arg-type]
+
+
+# ── Manifest declarations ────────────────────────────────────────────
+
+
+def test_narrative_module_declares_plugin() -> None:
+    assert hasattr(narrative, "setup")
+    definition = definition_from_plugin(narrative.setup, module=__name__)
+    assert definition.id == "spine.deriver.narrative"
+    assert "narrative" in tuple(definition.provided_capability_keys)
+
+
+def test_graph_module_declares_plugin() -> None:
+    assert hasattr(graph, "setup")
+    definition = definition_from_plugin(graph.setup, module=__name__)
+    assert definition.id == "spine.deriver.graph"
+    assert "graph" in tuple(definition.provided_capability_keys)
+
+
+def test_live_tail_module_declares_plugin() -> None:
+    assert hasattr(live_tail, "setup")
+    definition = definition_from_plugin(live_tail.setup, module=__name__)
+    assert definition.id == "spine.deriver.live_tail"
+    assert "live_tail" in tuple(definition.provided_capability_keys)
+
+
+# ── GraphDeriver behaviour ───────────────────────────────────────────
+
+
+def test_graph_deriver_on_event_and_flush_writes_digraph(tmp_path: Path) -> None:
+    out = tmp_path / "phase_graph.dot"
+    deriver = GraphDeriver(output_path=out)
+    deriver.on_event(_make_event(execution_point="think.gate.start", sequence=1))
+    deriver.on_event(_make_event(execution_point="think.gate.end", sequence=2))
+    deriver.on_event(_make_event(execution_point="think.gate.start", sequence=3))
+    written = deriver.flush()
+    assert written == out
+    text = out.read_text(encoding="utf-8")
+    assert "digraph" in text
+    assert "think.gate.start" in text
+    assert "->" in text
+
+
+def test_graph_deriver_terminal_event_auto_flushes(tmp_path: Path) -> None:
+    out = tmp_path / "phase_graph.dot"
+    deriver = GraphDeriver(output_path=out)
+    deriver.on_event(_make_event(execution_point="kernel.run.start", sequence=1))
+    deriver.on_event(_make_event(execution_point="kernel.run.stop", sequence=2, channel="control"))
+    assert out.exists()
+    assert "digraph" in out.read_text(encoding="utf-8")
+
+
+# ── on_event does not raise ──────────────────────────────────────────
+
+
+def test_narrative_on_event_does_not_raise(tmp_path: Path) -> None:
+    from lca.infrastructure.observability.journal.step.narrative_writer import (
+        StepNarrativeWriter,
+    )
+    from lca.infrastructure.observability.spine.derivers.narrative.narrative import (
+        NarrativeDeriver,
+    )
+
+    deriver = NarrativeDeriver(writer=StepNarrativeWriter(tmp_path / "n.md"))
+    deriver.on_event(_make_event())
+
+
+def test_live_tail_on_event_does_not_raise() -> None:
+    from lca.infrastructure.observability.journal.stream.live_tail import LiveTail
+    from lca.infrastructure.observability.spine.derivers.live.tail import (
+        LiveTailDeriver,
+    )
+
+    deriver = LiveTailDeriver(tail=LiveTail())
+    deriver.on_event(_make_event())
+
+
+def test_live_tail_subscribe_is_carrier_passthrough_not_event_spine() -> None:
+    """LiveTailDeriver.subscribe is SSE fan-out to LiveTail, not EventSpine.subscribe.
+
+    I-SESSION-5 / ADR-0186 PR-3g: presence of subscribe() here must not be
+    read as unfinished fold derivation.
+    """
+    from lca.infrastructure.observability.journal.stream.live_tail import LiveTail
+    from lca.infrastructure.observability.spine.derivers.live.tail import (
+        LiveTailDeriver,
+    )
+
+    class _SpyTail(LiveTail):
+        def __init__(self) -> None:
+            super().__init__()
+            self.subscribe_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+        def subscribe(self, *args: object, **kwargs: object):  # type: ignore[override]
+            self.subscribe_calls.append((args, kwargs))
+            return "passthrough-iter"
+
+    spy = _SpyTail()
+    deriver = LiveTailDeriver(tail=spy)
+    result = deriver.subscribe(after_seq=3)
+    assert result == "passthrough-iter"
+    # 生产为 positional 透传 self._tail.subscribe(after_seq)；不断言 kwarg 形态。
+    assert spy.subscribe_calls == [((3,), {})]

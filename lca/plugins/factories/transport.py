@@ -1,0 +1,70 @@
+"""Transport Compose Service plugin — named factory ``transport.compose_service``.
+
+Returns a fresh :class:`TransportService` per composition (per-compose
+transport table; one per agent pipeline). Composer no longer instantiates
+``TransportService()`` inline; it resolves a factory through this plugin.
+"""
+
+from __future__ import annotations
+
+from pydantic import BaseModel
+
+from lca.contracts.atoms.control.slot import ControlSlot
+from lca.contracts.atoms.functional.group import FunctionalGroup
+from lca.contracts.atoms.scope.scope import Scope
+from lca.contracts.harness.composition.plugin_contract import (
+    ArchitectureContract,
+    AuthorityContract,
+    EvidenceContract,
+    LifecycleContract,
+    PluginContract,
+    PluginIdentity,
+)
+from lca.contracts.protocols.declarative.declarative_2.declarative_plugin import (
+    OwnershipDeclaration,
+)
+from lca.contracts.protocols.runtime.infra.infra import TransportRegistryProtocol
+from lca.harness.plugin_api import PluginContext, PluginKind, plugin
+
+
+class Config(BaseModel):
+    model_config = {"extra": "forbid"}
+
+
+def build_transport_service_compose() -> TransportRegistryProtocol:
+    from lca.infrastructure.capability.transport.transport import TransportService
+
+    return TransportService()
+
+
+@plugin(
+    id="transport.compose_service",
+    provides=["transport.compose_service"],
+    requires=[],
+    implements=[TransportRegistryProtocol],
+    layer="L1",
+    effects="none",
+    description="Compose-time TransportService factory (one fresh instance per compose).",
+    test_suite="tests/scenario/plugin/test_plugin_alignment.py::test_compose_root_no_inline_instantiation",
+    kind=PluginKind.PRIMITIVE,
+    contract=PluginContract(
+        identity=PluginIdentity(version="v1"),
+        architecture=ArchitectureContract(
+            group=FunctionalGroup.G10_COMPOSITION, control_slots=(ControlSlot.OBSERVE_WILDCARD,)
+        ),
+        lifecycle=LifecycleContract(allowed_scopes=(Scope.RUN,)),
+        authority=AuthorityContract(grants=("plugin.serve",)),
+        observability=EvidenceContract(
+            descriptors=("transport_compose_service.checked", "transport_compose_service.served")
+        ),
+    ),
+    relations=(),
+    ownership=OwnershipDeclaration(
+        reads=("transport.compose_service",),
+        emits=("transport.compose_service.checked",),
+        state_mutation="forbidden",
+    ),
+)
+async def setup(ctx: PluginContext, config: Config) -> None:
+    """Provide the named factory ``transport.compose_service``."""
+    ctx.provide("transport.compose_service", build_transport_service_compose)

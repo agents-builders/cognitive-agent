@@ -1,0 +1,188 @@
+"""Dry-run-only profile candidate application Tool for the learning scenario."""
+
+from __future__ import annotations
+
+import time
+from typing import Any, ClassVar, Literal
+
+from pydantic import BaseModel, ConfigDict
+
+from lca.contracts.atoms.control.slot import ControlSlot
+from lca.contracts.atoms.functional.group import FunctionalGroup
+from lca.contracts.atoms.ids.ids import new_id
+from lca.contracts.atoms.scope.scope import Scope
+from lca.contracts.atoms.semantic.keys import FAILURE_KIND, FAILURE_KIND_VALIDATION
+from lca.contracts.harness.composition.plugin_contract import (
+    ArchitectureContract,
+    AuthorityContract,
+    EvidenceContract,
+    LifecycleContract,
+    PluginContract,
+    PluginIdentity,
+)
+from lca.contracts.models.core.execution.decision import Observation
+from lca.contracts.models.core.execution.tool import ParameterSpec, ToolApi, ToolManifest, ToolMeta
+from lca.contracts.protocols import Tool
+from lca.contracts.protocols.declarative.declarative_2.declarative_plugin import (
+    OwnershipDeclaration,
+)
+from lca.harness.plugin_api import PluginContext, PluginKind, plugin
+
+
+class ProfileApplyTool(Tool):
+    """Validate a profile candidate and produce a promotion preview only.
+
+    The tool has no filesystem, Composer, or profile-resolver handle. A request
+    with ``dry_run=false`` is rejected instead of silently turning an online
+    learning loop into an unreviewed production write path.
+    """
+
+    name = "profile_apply"
+    effect_kind: ClassVar[Literal["ephemeral", "persistent", "stateful_once"]] = "ephemeral"
+    namespace = "core"  # ADR-0256: 与 MANIFEST.api[0].namespace 一致
+    description = "Preview an approved profile candidate; production application is disabled."
+    parameters: ClassVar[dict[str, Any]] = {
+        "type": "object",
+        "properties": {
+            "candidate": {"type": "object", "description": "Versioned profile candidate metadata"},
+            "dry_run": {
+                "type": "boolean",
+                "description": "Must remain true; this tool never applies production changes",
+                "default": True,
+            },
+        },
+        "required": ["candidate"],
+    }
+    is_idempotent = True
+    default_timeout_s = 5
+
+    def validate(self, args: dict[str, Any]) -> str | None:
+        candidate = args.get("candidate")
+        if not isinstance(candidate, dict) or not str(candidate.get("candidate_id", "")).strip():
+            return "candidate must be an object with a non-empty candidate_id"
+        if args.get("dry_run", True) is not True:
+            return "profile_apply only supports dry_run=true; production promotion requires an external approval gate"
+        return None
+
+    async def execute(self, args: dict[str, Any]) -> Observation:
+        started = time.monotonic()
+        error = self.validate(args)
+        if error is not None:
+            return Observation(
+                observation_id=new_id("obs"),
+                success=False,
+                payload=None,
+                error=error,
+                latency_ms=int((time.monotonic() - started) * 1000),
+                extra={FAILURE_KIND: FAILURE_KIND_VALIDATION},
+            )
+        candidate = args["candidate"]
+        return Observation(
+            observation_id=new_id("obs"),
+            success=True,
+            payload={
+                "candidate_id": candidate["candidate_id"],
+                "promotion_status": "requires_external_approval",
+                "applied": False,
+                "next_gate": "resolve_profile -> compile_plan -> isolated regression -> human approval",
+            },
+            latency_ms=int((time.monotonic() - started) * 1000),
+        )
+
+
+class Config(BaseModel):
+    """Bundle switch for registration of the dry-run-only tool."""
+
+    model_config = ConfigDict(extra="forbid")
+    allowed: bool = True
+
+
+MANIFEST = ToolManifest(
+    identifier="profile_apply",
+    type="builtin",
+    api=(
+        ToolApi(
+            name="profile_apply",
+            description=ProfileApplyTool.description,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "candidate": {
+                        "type": "object",
+                        "description": "Versioned profile candidate metadata",
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "Must remain true; this tool never applies production changes",
+                        "default": True,
+                    },
+                },
+                "required": ["candidate"],
+            },
+            is_idempotent=True,
+            default_timeout_ms=5_000,
+            # PR-3 G-21 (ADR-0232): dry-run-only preview; declare ``read``
+            # so a batch of profile_apply calls parallelises.
+            effects="read",
+            namespace="core",
+        ),
+    ),
+    meta=ToolMeta(
+        avatar="📋",
+        title="profile_apply",
+        description="Preview an approved profile candidate; production application is disabled.",
+    ),
+    parameters={
+        "candidate": ParameterSpec(
+            type="object",
+            required=True,
+            ui_hint="object",
+            description="Versioned profile candidate metadata",
+        ),
+        "dry_run": ParameterSpec(
+            type="boolean",
+            required=False,
+            default=True,
+            ui_hint="boolean",
+            description="Must remain true; this tool never applies production changes",
+        ),
+    },
+)
+
+
+@plugin(
+    id="lca-tool-profile-apply",
+    provides=["tools.profile_apply"],
+    requires=["tools"],
+    implements=["Tool"],
+    layer="L1",
+    effects="none",
+    description="Register a dry-run-only profile candidate promotion preview Tool.",
+    test_suite="tests/architecture/test_self_improving_plugins.py",
+    kind=PluginKind.PRIMITIVE,
+    contract=PluginContract(
+        identity=PluginIdentity(version="v1"),
+        architecture=ArchitectureContract(
+            group=FunctionalGroup.G7_EXECUTION, control_slots=(ControlSlot.OBSERVE_WILDCARD,)
+        ),
+        lifecycle=LifecycleContract(allowed_scopes=(Scope.TURN,)),
+        authority=AuthorityContract(grants=("tool.invoke",)),
+        observability=EvidenceContract(
+            descriptors=("lca-tool-profile-apply.checked", "lca-tool-profile-apply.served")
+        ),
+    ),
+    relations=(),
+    ownership=OwnershipDeclaration(
+        reads=("tool.invoke", "tools.profile_apply"),
+        emits=("tools.profile_apply.checked",),
+        state_mutation="forbidden",
+    ),
+)
+async def setup(ctx: PluginContext, config: Config) -> None:
+    """Register only when the scenario explicitly enables this safe preview tool."""
+
+    if config.allowed:
+        ctx.require("tools").register(ProfileApplyTool())
+
+
+__all__ = ["Config", "ProfileApplyTool"]

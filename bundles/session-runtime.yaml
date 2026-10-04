@@ -1,0 +1,90 @@
+# bundles/session-runtime.yaml — Session runtime plugin（ADR-0186 PR-3c）。
+#
+# DSH 风格 in-memory Session runtime：append-only 日志真值 +
+# observer contained fire + reentry 拒绝 + 增量 request_header fold。
+#
+# Profile 装配：profiles/web-standard.yaml 在 event-bus-components 之前
+# 引用本 bundle，使 session.store 在 event-bus plugin boot 前可用。
+# RunSessionBuilder 按 run_id create Session，绑定 publish/observe 槽位与
+# spine→Session 转发钩子；缺 session.store 时 fail-loud（不再回退 legacy spine）。
+#
+# 持久化经 Session.observe：SpineFileSink（event-bus-components 装载）写
+# *.spine.jsonl —— 唯一 durable 真值流（ADR-0183 I-FW-SSOT-1）。
+# *.session.jsonl 镜像（persistence_jsonl plugin）已退役删除。
+# Pipeline sinks / consumer_rules 不写 durable spine
+# （web-standard event-pipeline 已空）。
+
+name: session-runtime
+description: |
+  Session runtime skeleton: in-memory SessionStore + DSH 风格 Session 实体。
+
+entries:
+  - id: lca.plugins.session.runtime
+    name: session_runtime
+    $module: lca.plugins.session.runtime.plugin.plugin
+    config: {}
+
+  - id: lca.plugins.session.spine_anomaly
+    name: session_spine_anomaly
+    $module: lca.plugins.session.spine_anomaly.spine_anomaly
+    config: {}
+
+  - id: lca.plugins.session.checkpoint_policy
+    name: session_checkpoint_policy
+    $module: lca.plugins.session.checkpoint_policy.checkpoint_policy
+    config: {}
+
+  # ── 投影家族（DSH session-projection 对齐）────────────────────────
+  - id: lca.plugins.session.projection_registry
+    name: session_projection_registry
+    $module: lca.plugins.session.projection_registry.projection_registry
+    config: {}
+
+  - id: lca.plugins.session.projection_cache
+    name: session_projection_cache
+    $module: lca.plugins.session.projection_cache.projection_cache
+    config: {}
+
+  - id: lca.plugins.session.model_visible
+    name: session_model_visible
+    $module: lca.plugins.session.session_model_visible.session_model_visible
+    config: {}
+
+  - id: lca.plugins.session.session_stats
+    name: session_projection_stats
+    $module: lca.plugins.session.session_stats.session_stats
+    config: {}
+
+  - id: lca.plugins.session.session_turn_outline
+    name: session_projection_turn_outline
+    $module: lca.plugins.session.session_turn_outline.session_turn_outline
+    config: {}
+
+  - id: lca.plugins.session.token_usage
+    name: session_token_usage
+    $module: lca.plugins.session.token_usage.token_usage
+    config: {}
+
+  - id: lca.plugins.session.turn_control
+    name: session_turn_control
+    $module: lca.plugins.session.session_turn_control.session_turn_control
+    config: {}
+
+  # ── 标题家族（DSH session-title 对齐；LLM provider 按部署选挂）────
+  - id: lca.plugins.session.title_service
+    name: session_title_service
+    $module: lca.plugins.session.title_service.title_service
+    config: {}
+
+  # ── 遥测家族（DSH session-telemetry 对齐；默认 DISABLED 不出站）──
+  - id: lca.plugins.session.telemetry_capture
+    name: session_telemetry_capture
+    $module: lca.plugins.session.telemetry_capture.telemetry_capture
+    config: {}
+
+  - id: lca.plugins.session.telemetry_otel
+    name: session_telemetry_otel
+    $module: lca.plugins.session.telemetry_otel.telemetry_otel
+    config:
+      mode: DISABLED
+

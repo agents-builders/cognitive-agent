@@ -1,0 +1,44 @@
+# bundles/perceive_subgraph.yaml — perceive 多节点子图
+# ADR-0217 Bundle Graph Schema v2 + ADR-0221 six-phase subgraph cutover.
+#
+# 拓扑:observe → fold(双节点 typed port pipeline)。
+# observe 调 PerceiveHub 拉 raw manifest;fold 把 manifest 投影到 closed
+# ``observation`` port,作为下游 think.main 的 typed boundary。
+#
+# D4 typed-port cutover: each node emits a ``routing`` port carrying
+# :class:`RoutingDecision` for downstream edge predicate evaluation.
+
+id: perceive.subgraph
+region: perceive
+purpose: perceive 三步执行 — observe (PerceiveHub) → memory_retrieve (Context Memories) → fold (manifest → observation)
+
+nodes:
+  - id: phase.perceive.observe
+    factory: phase.perceive.observe
+    outputs: [manifest, routing]
+    config:
+
+  - id: phase.perceive.memory_retrieve
+    factory: phase.perceive.memory_retrieve
+    inputs: [manifest]
+    outputs: [manifest, memories, routing]
+    config:
+
+  - id: phase.perceive.fold
+    factory: phase.perceive.fold
+    inputs: [manifest, memories]
+    # ``in_assembled_manifest`` is the typed boundary that
+    # ``think.shortcut`` consumes (per ThinkShortcutExecutor's
+    # declared_inputs); naming it here keeps the inner-emit
+    # aligned with the outer ``think.main.declared_inputs``.
+    outputs: [in_assembled_manifest, observation]
+    terminal: true
+    config:
+      emit_on_exit: [phase.perceive.fold]
+
+edges:
+  - from: phase.perceive.observe
+    to: phase.perceive.memory_retrieve
+
+  - from: phase.perceive.memory_retrieve
+    to: phase.perceive.fold

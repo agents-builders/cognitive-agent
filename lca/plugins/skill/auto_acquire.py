@@ -1,0 +1,130 @@
+"""Candidate-only procedural-skill acquisition plugin.
+
+This first implementation deliberately does not write to the installed skill
+store.  It converts sufficiently evidenced successful episodes into immutable
+drafts; a separately evaluated and approved promotion path must materialize any
+candidate as a reusable skill package.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from pydantic import BaseModel, ConfigDict, Field
+
+from lca.contracts.atoms.control.slot import ControlSlot
+from lca.contracts.atoms.functional.group import FunctionalGroup
+from lca.contracts.atoms.scope.scope import Scope
+from lca.contracts.capabilities import LEARNING_SKILL_ACQUIRER
+from lca.contracts.harness.composition.plugin_contract import (
+    ArchitectureContract,
+    AuthorityContract,
+    EvidenceContract,
+    LifecycleContract,
+    PluginContract,
+    PluginIdentity,
+)
+from lca.contracts.observability.canonical_digest import canonical_digest
+from lca.contracts.protocols.declarative.declarative_2.declarative_plugin import (
+    OwnershipDeclaration,
+)
+from lca.contracts.protocols.think.learning import (
+    SKILL_ACQUISITION_MIN_CONFIDENCE,
+    SKILL_ACQUISITION_MIN_EVIDENCE,
+    SkillAcquirer,
+    SkillAcquisitionCandidate,
+)
+from lca.harness.plugin_api import PluginContext, PluginKind, plugin
+
+
+@dataclass(frozen=True, slots=True)
+class AutoAcquireSkillService(SkillAcquirer):
+    """Create skill candidates only when configured evidence gates are met."""
+
+    enabled: bool
+    min_confidence: float
+    min_evidence: int
+
+    def propose(
+        self,
+        *,
+        task_ref: str,
+        procedure: str,
+        success: bool,
+        confidence: float,
+        evidence_refs: tuple[str, ...],
+    ) -> SkillAcquisitionCandidate | None:
+        """Return a draft candidate or ``None`` without changing any skill store."""
+
+        if (
+            not self.enabled
+            or not success
+            or not task_ref.strip()
+            or not procedure.strip()
+            or confidence < self.min_confidence
+            or len(evidence_refs) < self.min_evidence
+        ):
+            return None
+        digest = canonical_digest(
+            f"{task_ref}\0{procedure}\0{'|'.join(evidence_refs)}",
+            length=16,
+            prefix="",
+        )
+        return SkillAcquisitionCandidate(
+            candidate_id=f"skill-candidate-{digest}",
+            task_ref=task_ref,
+            procedure=procedure,
+            confidence=confidence,
+            evidence_refs=tuple(evidence_refs),
+        )
+
+
+class Config(BaseModel):
+    """Evidence gates declared by the owning learning scenario bundle."""
+
+    model_config = ConfigDict(extra="forbid")
+    enabled: bool = True
+    min_confidence: float = Field(default=SKILL_ACQUISITION_MIN_CONFIDENCE, ge=0.0, le=1.0)
+    min_evidence: int = Field(default=SKILL_ACQUISITION_MIN_EVIDENCE, ge=1)
+
+
+@plugin(
+    id="lca-skill-auto-acquire",
+    provides=[LEARNING_SKILL_ACQUIRER.key],
+    requires=[],
+    implements=[SkillAcquirer],
+    layer="L1",
+    effects="none",
+    description="Produce evidence-gated procedural-skill candidates without auto-promotion.",
+    test_suite="tests/architecture/test_self_improving_plugins.py",
+    kind=PluginKind.PRIMITIVE,
+    functional_group=FunctionalGroup.G11_CREATION,
+    contract=PluginContract(
+        identity=PluginIdentity(version="v1"),
+        architecture=ArchitectureContract(
+            group=FunctionalGroup.G11_CREATION, control_slots=(ControlSlot.OBSERVE_CHECKPOINT,)
+        ),
+        lifecycle=LifecycleContract(allowed_scopes=(Scope.RUN,)),
+        authority=AuthorityContract(grants=(LEARNING_SKILL_ACQUIRER.key, "evidence.read")),
+        observability=EvidenceContract(descriptors=("learning.skill-candidate.proposed",)),
+    ),
+    ownership=OwnershipDeclaration(
+        reads=("plugin.serve",),
+        emits=("plugin.served",),
+        state_mutation="forbidden",
+    ),
+)
+async def setup(ctx: PluginContext, config: Config) -> None:
+    """Provide the candidate generator selected by this scenario profile."""
+
+    ctx.provide(
+        LEARNING_SKILL_ACQUIRER.key,
+        AutoAcquireSkillService(
+            enabled=config.enabled,
+            min_confidence=config.min_confidence,
+            min_evidence=config.min_evidence,
+        ),
+    )
+
+
+__all__ = ["AutoAcquireSkillService", "Config", "SkillAcquisitionCandidate"]

@@ -1,0 +1,75 @@
+"""Explicit fixture inputs for exercising the production runtime closure.
+
+This module deliberately contains data only. Fixture defaults and the translation
+into production bindings belong to ``fixture_runtime_adapter`` so callers can see
+where the test-only adaptation seam lives.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+
+from lca.contracts.mechanisms import HookRegistry
+from lca.contracts.models.team.role.team import ToolPermissionManifest
+from lca.contracts.protocols import (
+    ArtifactClosure,
+    Body,
+    Brain,
+    LLMAdapter,
+    MemorySystem,
+    PerceiveHub,
+    Reducer,
+    StateStore,
+)
+from lca.contracts.protocols.act.effect.handler import EffectHandlerRegistry
+from lca.contracts.protocols.declarative.declarative_1.node_executor import NodeExecutor
+from lca.contracts.protocols.journal.idempotency.idempotency import IdempotencyStore
+from lca.contracts.protocols.runtime.runtime.composition import (
+    CheckpointStateResolverFactory,
+    DeclarativeInterpreterFactory,
+    DeltaReducerFactory,
+    EffectDispatcherFactory,
+    ResultFinalizerFactory,
+    RuntimeJournalFactory,
+)
+from lca.contracts.protocols.session.resume.input import ResumeInputAdapter
+from lca.contracts.protocols.state.delta_handler import DeltaHandlerRegistry
+from lca.contracts.protocols.state.plan import CompiledRunPlan
+from lca.harness.declarative.lifecycle.phase_observation import PhaseObserver, TracingPhaseObserver
+from lca.infrastructure.observability import span
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeDeps:
+    """Partial fixture input; no defaulting or production translation is owned here."""
+
+    brain: Brain
+    body: Body
+    memory: MemorySystem
+    hooks: HookRegistry
+    state_store: StateStore
+    perceive_hub: PerceiveHub
+    llm: LLMAdapter
+    phase_capabilities: Mapping[str, object]
+    permission_manifest: ToolPermissionManifest | None = None
+    reducer: Reducer | None = None
+    compiled_plan: CompiledRunPlan | None = None
+    node_executors: Mapping[str, NodeExecutor] = field(default_factory=dict)
+    effect_handler_registry: EffectHandlerRegistry | None = None
+    delta_handler_registry: DeltaHandlerRegistry | None = None
+    artifact_closure: ArtifactClosure | None = None
+    idempotency_store: IdempotencyStore | None = None
+    resume_input_adapter: ResumeInputAdapter | None = None
+    effect_dispatcher_factory: EffectDispatcherFactory | None = None
+    delta_reducer_factory: DeltaReducerFactory | None = None
+    journal_factory: RuntimeJournalFactory | None = None
+    interpreter_factory: DeclarativeInterpreterFactory | None = None
+    checkpoint_state_resolver_factory: CheckpointStateResolverFactory | None = None
+    result_finalizer_factory: ResultFinalizerFactory | None = None
+    phase_observer: PhaseObserver = field(
+        default_factory=lambda: TracingPhaseObserver(span_opener=span)
+    )
+
+
+__all__ = ["RuntimeDeps"]

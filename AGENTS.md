@@ -1,0 +1,191 @@
+# LCA Coding Agent Contract
+
+LCA 是基于 vendored Cordis 的 Python 插件化认知 Agent 框架。**本仓库专属于 LCA 认知智能体系统本身。哪怕当前工作目录在 LCA 下修改了外部资产，也严禁提交到本 Git；只有与 LCA 项目本身直接相关的变更才允许提交（宿主机运维与外部资产归属于 `~/everything-library`）。**
+
+## 0. 权威入口
+
+| 关注点 | 入口 |
+|---|---|
+| 文档导航与归属 | [docs/specs/documentation-map.md](docs/specs/documentation-map.md) |
+| 文档写作规则 | [docs/AGENTS.md](docs/AGENTS.md) |
+| 架构检查脚本 | [docs/architecture/checks.md](docs/architecture/checks.md) |
+| 观测架构 | [docs/observability/architecture-overview.md](docs/observability/architecture-overview.md) |
+| 结构化认知模型 | [docs/specs/lca-structured-cognition-guide.md](docs/specs/lca-structured-cognition-guide.md) |
+| Agent Notes 决策 | [docs/notes/README.md](docs/notes/README.md) |
+| ADR 索引 | [docs/adr/README.md](docs/adr/README.md) |
+| SSOT 矩阵 | [ADR-0195 §4](docs/adr/0195-platform-architecture-convergence.md) · [platform-directory-architecture.md](docs/specs/platform-directory-architecture.md) |
+| 调试 runbook | [docs/debug/README.md](docs/debug/README.md) |
+| 代码工程守则 | [docs/agent-contract/coding-guardrails.md](docs/agent-contract/coding-guardrails.md) |
+| 个人智库与参考库 | [~/everything-library](file://~/everything-library) (内网: 192.0.2.10:1889; 选型/设计/找API/模板前必查) |
+
+**迁移态 disclaimer:** Durable 事实经 `FactGateway` → `Session.append` 单轨(ADR-0186/0191/0194 P1–P5 已落地);`spine_reflector_*` 已从 bundle 退役。插件 legacy 顶层目录与 reflector COMPAT shim 仍保留 import 回退;delete-when 见 [0194-0195-implementation-plan.md](docs/specs/0194-0195-implementation-plan.md) §P5 与 ADR-0195 §2.5。
+
+## 1. 接任务前 7 问(必答,不答不写)
+
+1. **问题是什么?** 用业务/系统行为描述,不含实现名词。
+2. **受影响的事实或契约是什么?** 指出 Protocol、事件、Schema、能力、Profile 或副作用。
+3. **唯一真值在哪里?** 谁拥有事实,谁只是 projection。
+4. **改变哪个边界?** 层、seam、控制面/观察面、进程或外部系统。
+5. **现有 Protocol / ADR / Note 能否表达?** 能则扩展,勿新开平行机制。
+6. **失败、重试、恢复和幂等语义是什么?** 覆盖成功、拒绝、部分完成和重复调用。
+7. **如何验证?** 给出实际命令和测试。兼容 shim 必须同 PR 可删,不留跨 PR 后门。
+
+| 情况 | 动作 |
+|---|---|
+| 1–4,不改变契约 | 直接改代码,补测试,跑局部门禁 |
+| 改变已有契约,ADR/Protocol 可表达 | 先改契约,同变更闭环实现、消费者、测试和文档 |
+| 改变闭集/层边界/SSOT/能力模型 | 停止编码,先提交 ADR/Note 草案 |
+
+**优先(递减):** 不变量与契约正确 → 依赖方向与单一职责 → 可观测真值 → 可删的兼容 → 局部性能 → "少改几行"的幻觉。
+
+## 1.5 代码工程守则(常驻提醒,每次写代码前自检)
+
+写代码任务的 standing rule,§1 7 问回答**做什么**,本节回答**怎么写**。LCA 落地点与反例见 [docs/agent-contract/coding-guardrails.md](docs/agent-contract/coding-guardrails.md)。
+
+1. **第一性原理:** 用业务行为重述需求(不含实现名词);标出所有跨越的边界(层/seam/控制面·观察面/进程/外部系统/信任);标出可逆与不可逆选择。缺这一步 = 后面都在凭习惯。
+2. **直击本质:** 找根因,不在表面包装;同一根因第二次出现 = 上次没修对;一次修一处根因,不附带"顺手优化"。LCA 落点:§2.2 六分类,分类错了 = 没找到本质。
+3. **架构优雅:** 跨边界前先写 seam(网络/进程/信任/所有权);单一职责,模块一句话能说清"干嘛的";依赖单向,不通过兄弟绕公开 API;按领域分组,不按技术层。LCA 落点:§2.1 单向层;lint-imports + check_package_contracts.py 守护。
+4. **模块化:** 一个模块一个概念、暴露小而稳定的 surface;真正需要插件点的位置才抽(至少两个实现,或能想象第二个);一起改的代码挨着放。LCA 落点:§3 C6 最小化;§5 plugin 硬约束。
+5. **设计模式:** 只在模式能消解具体成本时引入;组合优于继承、数据优于控制流、能选标准库就选标准库;两个相似是巧合,第三个才抽;模式让代码更易读,不是用来"显得专业"。失败信号:类名带 Manager/Helper/Utils/Handler 但说不清负责什么。
+6. **长期可维护:** 注释只解释 *为什么*,不解释 *是什么*(需要解释 *是什么* = 重写代码);测试是设计的一部分,无法独立测试 = 耦合太紧;每个新依赖/抽象/配置项必有 owner + delete-when,无 owner = 永久债。LCA 落点:§5 变更闭环;§6 验证矩阵;每个 bugfix 至少一个回归测试。
+7. **不做临时代码:** "先这样以后再改" = 不;兼容 shim 引入的同一 PR 必须同时删除,无 delete-when = 红灯;双写 SSOT 只在 COMPAT 期内允许,新代码默认 `to`;离开前无新增无期限 TODO、无死代码/死 import、类型标注完整、提交信息说清"做了什么/为什么"。LCA 落点:§4 COMPAT 原则;§5 离开前卫生。
+
+## 2. 架构模型
+
+### 2.1 领域依赖层(单向)
+
+```text
+contracts → infrastructure → cognition → runtime → agent
+```
+
+`application` 是组合根,装配具体实现;下层不得反向 import。`harness` 只依赖 `contracts`,承载 Session/Profile/Boot/声明式阶段。`plugins` 是 Seam/Provider/Loop Driver 实现。`lca_kernel` 是顶层 host 包,下层禁止 import 其内部。transport plugin 独立于认知/运行/Agent。分层由 `lint-imports` 和 `pyproject.toml` 契约检查。
+
+### 2.2 事实/状态/决策/许可/回执/投影
+
+**先分类,再修改。** 任何新字段、对象、事件或副作用,先判断属于哪一类,再决定写入边界。
+
+| 类别 | 代表 | 拥有者 | 写入边界 |
+|---|---|---|---|
+| 事实 | Journal / Session log / Event | Session | 唯一生产入口(`Session.append`),仅追加 |
+| 状态 | `AgentState` | Reducer / 指定 projection | 业务组件不得直接写;按新值替换 |
+| 决策 | `Decision` | cognition | 认知阶段产生;候选意图,非已授权 |
+| 许可 | `Verdict` | Gate/Policy/Approval | 授权控制面产生 |
+| 回执 | Effect Receipt | Body/执行边界 | 副作用执行器产生;追加/不可变 |
+| 投影 | Projection / Trace / Metrics | fold/deriver/view | 可缓存可重建;不得反向写事实 |
+
+**核心判定:** 任何对象不能同时承担事实源和投影职责。
+
+### 2.3 控制面与观察面
+
+```
+控制面: Command / Approval / Policy / CapabilityGrant → 改变系统行为
+观察面: Session / Journal / Trace / Metrics / Projection → 记录或派生
+```
+
+- 观察面不得触发控制面副作用。控制面必须留下可追溯事实。
+- 诊断命令默认只读;禁止"为展示状态而顺便修复/重启/补写事件"。
+
+## 3. 不变量
+
+| ID | 不变量 | 要求 |
+|---|---|---|
+| C1 | 认知闭集 | 改变循环或核心事件语义必须先有 ADR,默认否决 |
+| C2 | 双平面 | 认知不直接写世界;执行不私自改变认知状态 |
+| C3 | 事实可追溯 | 输入、工具调用、协作报告和关键变化可追溯;复用现有事件目录 |
+| C4 | Reducer 单写 | 业务路径不直接写 State;projection 不得成为新事实源 |
+| C5 | 能力单调(三维) | capability/scope/effects 三维都必须 ⊆ 调用者 grant;`CommandEnvelope` 是副作用唯一出口(frozen,不可绕过);违反抛 `CapabilityGrantExceededError` |
+| C6 | 最小化 | 原语默认 no-op;优先组合已有原语 |
+| C7 | 控制/观察分离 | 见 §2.3 |
+| C8 | 确定性 | Profile resolve、fold、projection 必须确定;时间/随机/PID/env 通过 seam 注入 |
+| C9 | 幂等/重入 | 启动、恢复、append、observer、teardown 必须定义幂等边界;禁止靠"通常没事" |
+| C10 | 执行窄门 | cognition → Body → SafeExecutor → Sandbox 是唯一副作用路径;tool 错误分确定性(不重试)/瞬时(可重试)两类 |
+| C11 | 事件闭集 | `EXECUTION_POINTS` 是白名单;新事件必须同时加入白名单 + 注册 SpineHandler + 有测试 + ADR;双事件系统迁移中新事件只走 `Session.append` |
+| C12 | Reducer 合约 | `apply_*` 必须 `@_instrument_apply` 装饰;`apply_stop` 先于 `apply_terminal_outcome`;新方法同步更新 `AgentStateProjection` fold |
+| C13 | 信息血统闭合 | 任一跨边界传递(emit / fold / slot / transport / dispatch)必能静态回答 D1 定义点 / D2 约束 / D3 转换链 / D4 消费者四问,且必经 typed Contract(Pydantic frozen, `extra="forbid"`);无 Contract 跨边界 = fail-loud;详见 ADR-0195 §1.4 |
+| C14 | 图与业务隔离 | 图框架不知道业务，业务不感知图框架，互不侵入 |
+
+**闭集(五语义 phase):** `perceive → think → act → reflect → remember`;Gate 是 Think 原语子链(`DecisionGate`,非 graph node)。插件可替换实现,不能无 ADR 增加步骤或核心事件词表。
+
+**扩展路径:** `Protocol → Seam → Provider / Adapter → Registry → Plugin → Profile / Bundle`。密钥只能经 Profile `{from_env: ...}` 进入;插件不得自行读取 `os.environ`。
+
+**错误分类:** 认知层错误产生 Decision(rejected);Gate 错误产生 Verdict(rejected);Body 错误产生 Effect Receipt(error)。确定性错误(ValueError/TypeError 等)不重试;瞬时错误(Timeout/Connection)指数退避。Observer 失败 contained,不回滚已 commit 的 append。
+
+## 4. 禁止事项与迁移态
+
+**禁止:**
+- 提交宿主机/非 LCA 资产 — 本工程专属于 Agent 系统本身，严禁提交宿主机级运维脚本、目录结构调整、非 LCA 业务计划或测试；整台机器的运维、全局拓扑、SOP 与全局测试一律归属于 `~/everything-library`
+- 反向依赖 `application`;绕过 Reducer 改 State;绕过 Body 执行副作用
+- 业务路径直接写 Journal/Spine/Session 后端;只能调唯一公共生产入口
+- 把 projection/trace/metrics/view 当事实源
+- `contracts` 引入实现层、I/O、日志、环境读取或第三方依赖
+- 用动态 import、全局注册、反射字符串或 context 属性绕过 import 边界
+- 用异常吞没、空 catch、隐式 fallback 或默认放行掩盖契约缺失
+- 新增平行事件词表、平行 schema、平行 plugin manifest 或第二套 Profile 解析
+- **新增平行 ADR/Note/Proposal** — 任何"新提方案"必须先查 `docs/adr/` 与 `docs/notes/` 是否已有覆盖机制;能扩展就扩展,不能平行;特别检查 ADR-0186/0191/0192/0193/0194/0195/0196 与对应 implemented Note(`grep -l '<本方案核心概念>' docs/adr/*.{,zh.}md docs/notes/implemented/**/*.md`)
+- 在诊断/观测路径执行修复性副作用(除非命令名和测试明确表达)
+- 插件自行读取凭证;Gateway 绑定具体认知实现
+- 不直接改 `lobehub-ui/` 或 `vendor/`
+- Plugin setup() 只能调 Manifest 声明的 provide/require/register/emit;未声明调用触发 `UndeclaredInteractionError`
+- Plugin 间禁止直接 import;只通过 capability key 交互
+- 业务代码禁止直接 import journal backends 或 spine derivers(由 import-linter business-event-isolation 守护)
+- Session recovery 禁止 checkpoint `working` 状态;`waiting_input` 必须恰好有一个未解决 approval
+- env 三层白名单:`BOOTSTRAP_NAMES`(覆盖已有)/`BOOTSTRAP_PREFIXES`(新增)/`BOOTSTRAP_FORBIDDEN`(禁止);`LCA_PROFILE` 必须来自 argv
+
+**COMPAT shim 原则(一次性到位):** 引入兼容 shim 的同一 PR 必须同时删除它,不允许跨 PR 留后门。如果旧入口确实需要过渡期,必须在引入时就写明 owner、验证命令和删除时间点,且该时间点必须在同一 PR 的范围内(如同一 PR 的后续 commit)。无 delete-when 的兼容分支 = 红灯。
+
+新代码默认用 `to`。同一变更不能既新增旧用法又声称收敛迁移。
+
+## 5. 变更闭环
+
+**契约改动必须闭环(漏一端 = 未完成,不是 follow-up):**
+
+| 改了 | 必须同 PR 改 |
+|---|---|
+| Protocol / 公共签名 | 全部实现 + 测试 + 必要时 mypy |
+| 枚举 / close-set / EP 名 | whitelist、catalog、emit 方、消费方、文档 |
+| Schema / Journal 字段 | consumer + migration 说明 + 测试 |
+| 注册表 key / Plugin id | Profile/Bundle、`why-plugin`、装配测试 |
+
+**默认要求:** 新公共接口先写 Protocol/DTO;新副作用先写 capability/effects;新状态转移先定义合法/拒绝/恢复状态;每个 bugfix 至少一个回归测试;引入兼容 shim 的同一 PR 必须同时删除它。
+
+**离开前卫生:** 无新增无期限 TODO;无双写同一 SSOT(除非 COMPAT 写满);死代码/死 import 已清;类型标注完整;`ruff check --fix`;`git diff --check`;提交信息说明"做了什么 / 为什么"。
+
+**Plugin 硬约束:** 每个 plugin 一个 `.py` 文件;`@plugin(...)` 为唯一入口;`effects` 必声明;setup() 只能调 Manifest 声明的 provide/require/register/emit(未声明触发 `UndeclaredInteractionError`);Plugin 间禁止直接 import;`bundles/*.yaml:plugins:` 列短 id 不引路径;校验 `./scripts/lca-ops audit-plugin-shape`。
+
+## 6. 验证矩阵
+
+| 变更类型 | 最低验证 | 必须追加 |
+|---|---|---|
+| 普通实现,单 seam | `ruff check` + `ruff format` + 相关 pytest | 回归测试 |
+| Protocol/公共签名 | 上述 | 全部实现 + 消费者 + mypy + 契约测试 |
+| contracts/枚举/事件 | 上述 | catalog/whitelist + 序列化兼容 + 重放测试 |
+| Profile/Plugin/Bundle | plugin shape + resolve 测试 | DAG + 能力归属 + effects 审计 |
+| 分层/import/组合根 | `lint-imports` + package contracts | 依赖方向 + 禁止绕过扫描 |
+| Journal/Session/Projection | fold + 持久化 + 恢复测试 | SSOT + 幂等 + flush 隔离 |
+| 并发/生命周期 | 单元 + 集成 | 重入 + 取消 + teardown + 资源释放 |
+
+**基线失败协议:** `lint-imports` 和 `check_package_contracts.py` 当前存在既有失败。提交报告必须区分**本次引入** vs **既有失败**;禁止用"全量通过"描述未通过的门禁;只有退出码为 0 的命令才能写为"通过"。完整推送前检查 [.agents/skills/lca-pre-push-checks](.agents/skills/lca-pre-push-checks/SKILL.md)。`real_llm` 默认不运行。
+
+## 7. 最小命令入口
+
+`./scripts/lca-ops` 不带参数打印分层手册;`./scripts/lca-ops <cmd> --help` 看子命令。
+
+| 场景 | 命令 |
+|---|---|
+| 服务状态 / 重启 / 触发 run | `status --json` / `kernel-restart` / `runs create --user-text "..."` |
+| run 图观测(第一步) | `timeline <run_id>`(=`observation run-replay --show-graph`) |
+| run 失败摘要 / E2E 冒烟 | `debug-run <run_id>` / `e2e timeline`(仅命令腿;live 腿按 ADR-0200 退役,exit 2,待 PR-5 迁 WS) |
+| notes 体检 / ADR 审计 | `notes-check` / `notes-audit` |
+| 审计 Reducer 单写 / 能力归属 | `audit-state-writers` / `why <capability>` |
+| 声明图编译/逐层 inflate | `plan compile <p>` / `plan validate <json>` / `plan tree <p>` |
+
+**Before X,读 Y:** 调试 → [docs/debug/README.md](docs/debug/README.md);选型/找API/模板/云服务 → [~/everything-library/data/items](file://~/everything-library/data/items);Journal/Trace → [docs/specs/harness-spine-spec.md](docs/specs/harness-spine-spec.md);散文 → [.agents/skills/lca-prose-standard](.agents/skills/lca-prose-standard/SKILL.md);新 Note → [.agents/skills/lca-write-note](.agents/skills/lca-write-note/SKILL.md);CI 测试可靠性 → [.agents/skills/lca-ci-test-reliability](.agents/skills/lca-ci-test-reliability/SKILL.md)。
+
+## 8. Git 与文档卫生
+
+**范围铁律:** 哪怕当前工作目录在 LCA，顺带修改了外部资产，也严禁提交到本仓库！只有与本 Agent 框架直接相关的代码/测试/文档才允许提交。外部资产必须切换至对应仓（如 `~/everything-library`）提交。
+Conventional Commits:`<type>(<scope>): <subject>`,正文说"做了什么 / 为什么"。一个提交一个主题;不用 `--no-verify`;不提交密钥或运行产物;远程 `git pull --rebase`。
+
+Prose:直接具体,不复述代码,不留 review 答辩痕迹;slop 由 `scripts/verify_doc_slop.py` 检查。详见 [.agents/skills/lca-prose-standard](.agents/skills/lca-prose-standard/SKILL.md) + [.agents/skills/lca-trim-cot-leakage](.agents/skills/lca-trim-cot-leakage/SKILL.md)。
+
+**改本文件:** 只装 standing rule — 决策闸门、当前不变量、禁止事项、变更闭环、验证矩阵、权威入口。满足任一才放根:① 每次任务第 0 步必答;② 每次提交前必过;③ 改了代码立即影响;④ agent 接任务第一查询。改后跑 `git diff --check` + `wc -l AGENTS.md`(目标 ≤ 220 行)。

@@ -1,0 +1,26 @@
+# Cognitive directory gate — strict mode scans entire lca/ + lca_kernel/ (every directory, every file).
+
+[defaults]
+max_direct_py = 5
+max_direct_py_warn = 6
+max_file_loc = 300
+max_file_loc_legacy = 400
+plugin_py_max_loc = 500
+
+[scan]
+roots = ["lca", "lca_kernel"]
+
+[[legacy_loc_allow]]
+path = "lca/harness/plugin/declaration.py"
+max_loc = 538
+delete_when = "split declaration adapter from @plugin decorator core"
+
+[[legacy_loc_allow]]
+path = "lca/loop/commit/tool_journal.py"
+max_loc = 314
+delete_when = "extract tool phase helpers to commit/tool_phase.py"
+
+[[legacy_loc_allow]]
+path = "lca/session/append.py"
+max_loc = 400
+delete_when = "split Session.append core"

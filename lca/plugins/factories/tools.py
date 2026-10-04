@@ -1,0 +1,70 @@
+"""Tools Compose Service plugin — named factory ``tools.compose_service``.
+
+Returns a fresh :class:`ToolsService` per composition. The Composer no
+longer instantiates ``ToolsService()`` inline; it resolves a factory
+through this plugin (``ctx.require("tools.compose_service")()``).
+"""
+
+from __future__ import annotations
+
+from pydantic import BaseModel
+
+from lca.contracts.atoms.control.slot import ControlSlot
+from lca.contracts.atoms.functional.group import FunctionalGroup
+from lca.contracts.atoms.scope.scope import Scope
+from lca.contracts.harness.composition.plugin_contract import (
+    ArchitectureContract,
+    AuthorityContract,
+    EvidenceContract,
+    LifecycleContract,
+    PluginContract,
+    PluginIdentity,
+)
+from lca.contracts.protocols.declarative.declarative_2.declarative_plugin import (
+    OwnershipDeclaration,
+)
+from lca.contracts.protocols.runtime.infra.infra import ToolRegistry
+from lca.harness.plugin_api import PluginContext, PluginKind, plugin
+
+
+class Config(BaseModel):
+    model_config = {"extra": "forbid"}
+
+
+def build_tools_service_compose() -> ToolRegistry:
+    from lca.infrastructure.capability.tools.tools import ToolsService
+
+    return ToolsService()
+
+
+@plugin(
+    id="tools.compose_service",
+    provides=["tools.compose_service"],
+    requires=[],
+    implements=[ToolRegistry],
+    layer="L1",
+    effects="tools",
+    description="Compose-time ToolsService factory (one fresh instance per compose).",
+    test_suite="tests/scenario/plugin/test_plugin_alignment.py::test_compose_root_no_inline_instantiation",
+    kind=PluginKind.PRIMITIVE,
+    contract=PluginContract(
+        identity=PluginIdentity(version="v1"),
+        architecture=ArchitectureContract(
+            group=FunctionalGroup.G10_COMPOSITION, control_slots=(ControlSlot.OBSERVE_WILDCARD,)
+        ),
+        lifecycle=LifecycleContract(allowed_scopes=(Scope.RUN,)),
+        authority=AuthorityContract(grants=("tool.invoke",)),
+        observability=EvidenceContract(
+            descriptors=("tools_compose_service.checked", "tools_compose_service.served")
+        ),
+    ),
+    relations=(),
+    ownership=OwnershipDeclaration(
+        reads=("tool.invoke", "tools.compose_service"),
+        emits=("tools.compose_service.checked",),
+        state_mutation="forbidden",
+    ),
+)
+async def setup(ctx: PluginContext, config: Config) -> None:
+    """Provide the named factory ``tools.compose_service``."""
+    ctx.provide("tools.compose_service", build_tools_service_compose)

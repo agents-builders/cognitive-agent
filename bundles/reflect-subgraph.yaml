@@ -1,0 +1,23 @@
+# Edge-level subgraph reference — minimum experiment bundle.
+#
+# Referenced from ``bundles/declarative-phase-graph.yaml`` via one
+# ``PhaseEdge.subgraph_ref`` pointing at this bundle's plan_ref. The
+# ``binding_edge`` in that reference names ``reflect.main`` — which is
+# the id of the outer edge — and one edge in this bundle below
+# carries a matching ``subgraph_ref.plan_ref: reflect.main`` to satisfy
+# the two-graph mutual-reference invariant (PG-004 at compile time).
+#
+# This is a deliberately small bundle: one entry topology plus one
+# entry edges. The interpreter recurses into this plan from the outer
+# ``reflect.main → remember.main`` edge and returns to the outer graph
+# when the subgraph terminates.
+#
+# delete-when: the experiment moves to a fuller nested-graph runtime
+# (depth > 1 or node-level refs); this bundle becomes the smallest
+# regression fixture rather than a runtime entry.
+
+entries:
+  - id: phase.reflect.standard
+    name: phase_reflect_standard
+    $module: lca.plugins.loop.phase.reflect.standard.plugin
+    config: {}

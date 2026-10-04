@@ -1,0 +1,292 @@
+# bundles/outer/phase_main.yaml — outer plan, explicit phase topology (M1 SSOT).
+#
+# ADR-0221 P3 cutover: the v2 driver no longer reads
+# ``phase.topology.standard`` / ``phase.topology.standard`` Cordis
+# providers. Topology is declared here as a v2 BundleGraphSpec
+# (ADR-0217) — the runtime kernel reads this yaml directly.
+#
+# D4 typed-port cutover: all edge ``when:`` predicates are typed
+# :class:`Predicate` dicts (no string DSL). Cross-node reads go through
+# :class:`PortReader` which resolves :class:`PortRef` against declared
+# output ports. The ``routing`` port carries a :class:`RoutingDecision`
+# that replaces the legacy ``result_kind`` / ``next_hint`` / ``next_hints``
+# ad-hoc fields.
+
+id: phase.main.outer
+region: agent
+purpose: Six-phase outer plan (perceive → think → act → reflect → remember → terminal.commit) wired through sub_spec_ref into per-phase subgraphs.
+
+nodes:
+  - id: perceive.main
+    region: phase:perceive
+    entry: true
+    sub_spec_ref:
+      plan_ref: bundles/perceive/perceive_subgraph.yaml
+      entry_node: phase.perceive.observe
+      binding_edge: perceive.main
+    declared_inputs: []
+    # ``in_assembled_manifest`` is what ``think.main`` consumes next;
+    # ``observation`` is the closed-port projection that downstream
+    # reflect nodes may also need. Both are produced by the inner
+    # ``perceive.subgraph`` fold node.
+    declared_outputs: [in_assembled_manifest, observation, routing]
+
+  - id: think.main
+    region: phase:think
+    sub_spec_ref:
+      plan_ref: bundles/think/think_subgraph.yaml
+      entry_node: think.shortcut
+      binding_edge: think.main
+    # think.subgraph's entry ``think.shortcut`` declares inputs:
+    # ``[in_assembled_manifest]`` (per ThinkShortcutExecutor's
+    # declared_inputs). The outer-facing name matches the inner
+    # entry's input so SubgraphStrategy's name-based fallback
+    # forwards the registry value into the inner.
+    declared_inputs: [in_assembled_manifest]
+    # Inner think.subgraph emits ``decision`` (the typed Decision
+    # produced by decision.compose.action). SubgraphStrategy's
+    # positional translation maps inner_outputs[0] to the outer
+    # ``decision`` port. terminal.commit and act.main read this
+    # port via the kernel-wide port registry.
+    #
+    # ``routing`` is the typed ``RoutingDecision`` from whichever inner
+    # node terminates the subgraph — ``think.gate`` on the normal path
+    # (``should_terminate=false``) or ``think.budget.check`` when the
+    # budget gate trips (``should_terminate=true``). Forwarding it
+    # here lets the outer edges below distinguish "the think phase
+    # answered" from "the think phase stopped because budget ran out"
+    # without leaking inner node ids into the outer plan.
+    declared_outputs: [decision, routing]
+
+  - id: act.main
+    region: phase:act
+    sub_spec_ref:
+      plan_ref: bundles/act/act_subgraph.yaml
+      entry_node: act.validate
+      binding_edge: act.main
+    # Inner act.subgraph's entry ``act.validate`` reads ``decision``
+    # (per ActValidateExecutor.declared_inputs). The kernel-wide
+    # port registry exposes ``decision`` (the typed-port D4 boundary
+    # carried from think.subgraph via the registry) so act subgraph
+    # receives it.
+    declared_inputs: [decision]
+    # Inner act.subgraph emits ``should_terminate`` (via act.observe)
+    # and the ``decision`` carried through validate/authorize/envelope.
+    # ``approval_routing`` is the typed ``RoutingDecision`` written by
+    # ``act.approve.gate`` (now nested inside act_subgraph per
+    # ADR-0237 / PR-1b, spec §3.2 原位). ``PortRegistry.exit_subgraph``
+    # (ADR-0217 §3.3.3 iron rule 1) forwards the named port to the
+    # outer caller so the 3 mutually-exclusive routing edges below
+    # can read it. Renamed from ``routing`` to avoid collision with
+    # ``act.fanout``'s ``routing`` (last-write-wins would overwrite).
+    declared_outputs: [decision, should_terminate, approval_routing]
+
+  - id: reflect.main
+    region: phase:reflect
+    sub_spec_ref:
+      plan_ref: bundles/reflect/reflect_subgraph.yaml
+      entry_node: phase.reflect.score
+      binding_edge: reflect.main
+    # No ``declared_inputs``: the reflect subgraph reads
+    # ``observation`` from the kernel-wide port registry (perceive
+    # produced it earlier; the registry persists across phases).
+    # Forwarding an explicit name here would fail the typed-port
+    # contract check when the upstream phase doesn't produce it
+    # under the same name.
+    # Inner reflect.subgraph emits ``reflection`` (via score) and
+    # ``routing`` (via admit_recovery); ``reflect_outcome`` was a
+    # legacy alias. Downstream remember.main reads ``reflection``
+    # directly from the port registry.
+    declared_outputs: [reflection, routing]
+
+  - id: remember.main
+    region: phase:remember
+    sub_spec_ref:
+      plan_ref: bundles/remember/remember_subgraph.yaml
+      entry_node: phase.remember.admit
+      binding_edge: remember.main
+    # Inner ``phase.remember.write`` declared_inputs are
+    # ``[decision, observation, reflection]`` per the executor's
+    # contract; ``reflect_outcome`` was a legacy alias. The reflect
+    # subgraph emits ``reflection`` upstream which we forward under
+    # the same name so SubgraphStrategy's name-based fallback
+    # delivers it.
+    declared_inputs: [decision, observation, reflection]
+    # ``memory_record`` is a legacy alias; the inner emits
+    # ``memory_receipt``. ``routing`` is not produced by the
+    # remember subgraph; routing decisions propagate via the
+    # kernel-wide port registry.
+    declared_outputs: [memory_receipt]
+
+  - id: terminal.commit
+    region: phase:terminal
+    binding: terminate
+    terminal: true
+    # The typed-port D4 boundary emits ``decision`` (the stamped
+    # Decision from think.subgraph). ``reflection`` flows through
+    # from the reflect subgraph's outer port declaration.
+    declared_inputs: [decision, reflection]
+    declared_outputs: [terminal_outcome]
+    config:
+      emit_on_exit: [terminal.commit]
+
+  # PR-3.8.6: intervene.interrupt outer-level wiring stub — the
+  # interrupt subgraph node is reached from act.main via the
+  # approve_interrupt next_hint. The subgraph itself stays the source
+  # of truth (intervene.interrupt emits the typed Command +
+  # RoutingDecision(should_terminate=True)).
+  - id: intervene.interrupt
+    region: phase:intervene
+    sub_spec_ref:
+      plan_ref: bundles/intervene/interrupt_subgraph.yaml
+      entry_node: intervene.interrupt
+      binding_edge: intervene.interrupt
+    declared_inputs: [decision]
+    declared_outputs: [command, routing]
+
+edges:
+  # perceive → think (model-driven continuation).
+  - from: perceive.main
+    to: think.main
+
+  # think → act when decision.action_type in [use_tool, delegate].
+  - from: think.main
+    to: act.main
+    when:
+      kind: in
+      port: { name: decision, field: action_type }
+      value: [use_tool, delegate]
+
+  # think → reflect.main when decision.action_type == respond
+  # AND decision.response_text is non-empty (ADR-0244 closed cognitive loop).
+  - from: think.main
+    to: reflect.main
+    when:
+      kind: and
+      children:
+        - { kind: eq, port: { name: decision, field: action_type }, value: respond }
+        - { kind: ne, port: { name: decision, field: response_text }, value: "" }
+
+  # PR-3.8.1: think → terminal.commit when think.budget.check trips
+  # (``routing.should_terminate=true``). Precedes the
+  # ``decision.action_type == respond`` edge above so a budget-stopped
+  # run never loops back through act on a stale use_tool decision.
+  - from: think.main
+    to: terminal.commit
+    when:
+      kind: eq
+      port: { name: routing, field: should_terminate }
+      value: true
+
+  # act → think on USE_TOOL (the re-ask-model loop).
+  # ADR-0237 / PR-1b: gate consumes needs_approval upstream; when the
+  # gate routed forward (approve_skipped / approve_approved) the
+  # act subgraph completes the dispatch + observe chain and the
+  # re-ask-model loop fires. When the gate routed to interrupt
+  # (approve_interrupt) or abort (approve_rejected) the
+  # ``approval_routing.next_hint in [approve_skipped, approve_approved]``
+  # guard fails and the think.main edge does NOT match — those
+  # outcomes fall through to the 3 mutually-exclusive routing edges
+  # below. This satisfies the brief design point 3 mutual-exclusivity
+  # requirement (no silent split between "进 interrupt" and "回 think").
+  #
+  # Edge-order invariant: ``should_terminate`` must precede the use_tool
+  # re-ask edge so budget exhaustion routes to ``reflect.main``
+  # instead of re-entering ``think.main``. ``select_edge`` returns the
+  # first matching edge; reversing the order lets the use_tool edge
+  # win on every iteration and the run loops indefinitely without
+  # producing ``manifest.json`` / ``kernel.log``.
+  # act → reflect.main on should_terminate (ADR-0244 closed cognitive loop).
+  - from: act.main
+    to: reflect.main
+    when:
+      kind: eq
+      port: { name: should_terminate }
+      value: true
+
+  - from: act.main
+    to: think.main
+    when:
+      kind: and
+      children:
+        - { kind: in, port: { name: decision, field: action_type }, value: [use_tool, delegate] }
+        - { kind: in, port: { name: approval_routing, field: next_hint }, value: [approve_skipped, approve_approved] }
+    loop:
+      # Hard cap on the tool re-ask (LangGraph recursion_limit /
+      # OpenAI max_turns analogue). Without this, a stale ``decision``
+      # port turns act→think into an unbounded empty loop (~880
+      # visits observed 2026-09-16). ``budget: run.steps`` is meant as
+      # the second bound, but ``Budget.max_steps`` is unset in the
+      # shipped profiles, so this cap is the only one — small enough to
+      # fail loud on a spin, large enough for a real multi-tool task.
+      # 24 rounds covers a document task that activates skills, reads
+      # and analyses an attachment, and generates a deliverable
+      # (run_82cf618a97f1: 11 distinct productive calls, no duplicates,
+      # killed mid-generation by the previous cap of 8). The kernel
+      # fail-louds via LoopObligationExceededError when the bound is
+      # hit and no fallback edge matches.
+      maxIterations: 24
+      budget: run.steps
+
+  # act → reflect.main (reflect reads observation/reflection from the
+  # kernel-wide port registry; the wiring edge just routes control).
+  # ADR-0237 / PR-1b: gate moved into act.subgraph (spec §3.2 原位,
+  # before any side effect). The 3 mutually-exclusive routing edges
+  # below consume ``act.main.approval_routing`` (bubbled out via
+  # ``PortRegistry.exit_subgraph``); the unconditional ``act.main →
+  # reflect.main`` pass-through is dropped — every act completion
+  # routes through one of the typed predicates below.
+  #
+  # The ``decision.action_type != use_tool`` clause makes this edge
+  # mutually exclusive with the act → think re-ask edge above (the
+  # use_tool case wins on edge-order and routes to think.main; the
+  # non-use_tool case falls through to reflect.main). Without this
+  # clause the silent-split class from `2026-09-16-act-subgraph-tightening`
+  # #F-1 would re-emerge.
+  - from: act.main
+    to: reflect.main
+    when:
+      kind: and
+      children:
+        - { kind: in, port: { name: approval_routing, field: next_hint }, value: [approve_skipped, approve_approved] }
+        - { kind: ne, port: { name: decision, field: action_type }, value: use_tool }
+
+  - from: act.main
+    to: intervene.interrupt
+    when:
+      kind: eq
+      port: { name: approval_routing, field: next_hint }
+      value: approve_interrupt
+
+  - from: act.main
+    to: terminal.commit
+    when:
+      kind: eq
+      port: { name: approval_routing, field: next_hint }
+      value: approve_rejected
+
+  # reflect → think recovery (M1): bounded admit_recovery re-entry.
+  # MUST precede the unconditional reflect→remember edge so select_edge
+  # can take recovery when routing.next_hint == admit_recovery (first
+  # matching edge wins). LoopGuard=1 semantics via edge loop obligation.
+  - from: reflect.main
+    to: think.main
+    when:
+      kind: eq
+      port: { name: routing, field: next_hint }
+      value: admit_recovery
+    loop:
+      maxIterations: 1
+      budget: run.steps
+      terminalPredicate:
+        kind: ne
+        port: { name: routing, field: next_hint }
+        value: admit_recovery
+
+  # reflect → remember (default path when recovery is not admitted).
+  - from: reflect.main
+    to: remember.main
+
+  # remember → terminal.commit (always; commit closes the loop).
+  - from: remember.main
+    to: terminal.commit

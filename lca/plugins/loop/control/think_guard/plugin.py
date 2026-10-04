@@ -1,0 +1,203 @@
+"""control.think.guard — NodeExecutor control node for the think.guard slot.
+
+Provides two nodes: ``control.think.guard.enforce`` (transform) and
+``control.think.guard`` (govern / verdict emission). Each implements
+``NodeExecutor`` directly — no PhaseContribution, no PhaseExecutor.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from lca.contracts.atoms.control.slot import ControlSlot
+from lca.contracts.atoms.enums.enums import ActionType
+from lca.contracts.atoms.functional.group import FunctionalGroup
+from lca.contracts.atoms.scope.scope import Scope
+from lca.contracts.harness.composition.plugin_contract import (
+    ArchitectureContract,
+    AuthorityContract,
+    EvidenceContract,
+    LifecycleContract,
+    PluginContract,
+    PluginIdentity,
+)
+from lca.contracts.models.core.execution.decision import Decision
+from lca.contracts.models.core.state.state import AgentState
+from lca.contracts.protocols.declarative.declarative_1.node_executor import (
+    NodeContext,
+    NodeInput,
+    NodeOutput,
+)
+from lca.contracts.protocols.declarative.declarative_1.ports import PortName
+from lca.contracts.protocols.declarative.declarative_2.declarative_plugin import (
+    OwnershipDeclaration,
+)
+from lca.contracts.protocols.gate.control_verdict import ControlVerdict, ControlVerdictKind
+from lca.contracts.protocols.graph.routing import RoutingDecision
+from lca.harness.plugin_api import PluginContext, PluginKind, plugin
+
+
+def _is_known_action(decision: Decision) -> bool:
+    try:
+        ActionType(decision.action_type)
+        return True
+    except (ValueError, AttributeError):
+        return False
+
+
+def _verdict_from_decision(decision: Decision) -> tuple[ControlVerdictKind, str]:
+    gate_verdict = decision.extra.get("gate_verdict")
+    if isinstance(gate_verdict, str) and gate_verdict == "deny":
+        return ControlVerdictKind.STOP, decision.rationale or gate_verdict
+    if decision.degraded_from is not None:
+        return (
+            ControlVerdictKind.REWRITE,
+            decision.rationale or f"rewritten from {decision.degraded_from}",
+        )
+    if isinstance(gate_verdict, str) and gate_verdict == "rewrite":
+        return ControlVerdictKind.REWRITE, decision.rationale or gate_verdict
+    return ControlVerdictKind.ALLOW, "decision gate contribution accepted"
+
+
+@dataclass(frozen=True, slots=True)
+class ThinkGuardEnforceExecutor:
+    """Transform node: run profile-selected decision gates."""
+
+    semantic_name: str = "control.think.guard.enforce"
+    region: str = "phase:think"
+    declared_inputs: tuple[PortName, ...] = (PortName("decision"),)
+    declared_outputs: tuple[PortName, ...] = (PortName("decision"),)
+
+    async def node_execute(
+        self,
+        context: NodeContext,
+        input: NodeInput,
+    ) -> NodeOutput:
+        runtime = context.runtime or {}
+        decision = input.port_values.get(PortName("decision"))
+        routing = RoutingDecision(action_type=ActionType.RESPOND)
+        if not isinstance(decision, Decision):
+            return NodeOutput(port_values={PortName("decision"): None, PortName("routing"): routing})
+        gate_service = runtime.get("gates")
+        if gate_service is None:
+            return NodeOutput(port_values={PortName("decision"): decision, PortName("routing"): routing})
+        from lca.cognition.brain.gate.service import GateService
+
+        if not isinstance(gate_service, GateService):
+            raise TypeError(
+                "phase capability 'gates' must be GateService, "
+                f"got {type(gate_service).__name__}"
+            )
+        agent_state = runtime.get("agent_state")
+        if not isinstance(agent_state, AgentState):
+            raise TypeError(
+                "phase capability 'agent_state' must be AgentState, "
+                f"got {type(agent_state).__name__}"
+            )
+        enforced = await gate_service.assemble().enforce(agent_state, decision)
+        return NodeOutput(port_values={PortName("decision"): enforced, PortName("routing"): routing})
+
+
+@dataclass(frozen=True, slots=True)
+class ThinkGuardExecutor:
+    """Govern node: enforce action-type + gate verdict; emit ``verdict``."""
+
+    semantic_name: str = "control.think.guard"
+    region: str = "phase:think"
+    declared_inputs: tuple[PortName, ...] = (PortName("decision"),)
+    declared_outputs: tuple[PortName, ...] = (PortName("verdict"),)
+
+    async def node_execute(
+        self,
+        context: NodeContext,
+        input: NodeInput,
+    ) -> NodeOutput:
+        del context
+        decision = input.port_values.get(PortName("decision"))
+        if not isinstance(decision, Decision):
+            verdict = ControlVerdict(
+                kind=ControlVerdictKind.ALLOW,
+                detail="candidate decision not materialized",
+                plugin_id="control.executor.think-guard",
+            )
+            return NodeOutput(
+                port_values={
+                    PortName("verdict"): verdict,
+                    PortName("routing"): RoutingDecision(action_type=ActionType.RESPOND),
+                },
+            )
+        if not _is_known_action(decision):
+            verdict = ControlVerdict(
+                kind=ControlVerdictKind.STOP,
+                detail="candidate action type is unknown",
+                plugin_id="control.executor.think-guard",
+            )
+            return NodeOutput(
+                port_values={
+                    PortName("verdict"): verdict,
+                    PortName("routing"): RoutingDecision(
+                        action_type=ActionType.RESPOND,
+                        should_terminate=True,
+                        next_hint="stop",
+                    ),
+                },
+            )
+        kind, detail = _verdict_from_decision(decision)
+        verdict = ControlVerdict(
+            kind=kind,
+            detail=detail,
+            plugin_id="control.executor.think-guard",
+        )
+        should_terminate = kind == ControlVerdictKind.STOP
+        return NodeOutput(
+            port_values={
+                PortName("verdict"): verdict,
+                PortName("routing"): RoutingDecision(
+                    action_type=ActionType.RESPOND,
+                    should_terminate=should_terminate,
+                    next_hint="stop" if should_terminate else None,
+                ),
+            },
+        )
+
+
+@plugin(
+    id="control.think.guard",
+    provides=(
+        "phase:think::control.think.guard.enforce",
+        "phase:think::control.think.guard",
+    ),
+    layer="L2",
+    kind=PluginKind.PRIMITIVE,
+    effects="none",
+    test_suite="tests/harness/test_think_guard_consumer.py::TestDeclarativeControlProjection::test_think_guard_projection_is_bound_to_the_think_phase",
+    contract=PluginContract(
+        identity=PluginIdentity(version="v1"),
+        architecture=ArchitectureContract(
+            group=FunctionalGroup.G6_DECISION,
+            control_slots=(ControlSlot.THINK_GUARD,),
+        ),
+        lifecycle=LifecycleContract(allowed_scopes=(Scope.TURN,)),
+        authority=AuthorityContract(grants=("decision.read", "gates.assemble")),
+        observability=EvidenceContract(
+            descriptors=("control_think_guard.checked", "control_think_guard.served")
+        ),
+    ),
+    relations=(),
+    ownership=OwnershipDeclaration(
+        reads=("plugin.serve",),
+        emits=("plugin.served",),
+        state_mutation="forbidden",
+    ),
+)
+async def setup(ctx: PluginContext, config: object) -> None:
+    del config
+    ctx.provide("phase:think::control.think.guard.enforce", ThinkGuardEnforceExecutor())
+    ctx.provide("phase:think::control.think.guard", ThinkGuardExecutor())
+
+
+__all__ = [
+    "ThinkGuardEnforceExecutor",
+    "ThinkGuardExecutor",
+    "setup",
+]

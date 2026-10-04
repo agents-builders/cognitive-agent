@@ -1,0 +1,53 @@
+﻿# bundles/think_reason.yaml — think.reason inner_graph (v2 ports)
+# ADR-0217 Bundle Graph Schema v2 + eng/retire-v1-reasoner-sandbox.
+# fork_tools first (materialize Sandbox computer tools), then
+# plan → render. The LLM call moved to think.llm.dispatch (spec §E)
+# in Task 3; think.reason.complete is deleted in the same change.
+#
+# PR-3.8.borrow-tools-wire: think.reason subgraph surface now exposes
+# ``forked_tools`` (was: hidden inside the inner plan). The downstream
+# think.history.assemble reads it as a typed-boundary input so the LLM
+# sees per-run tool schemas — closes spec §E.
+
+id: think.reason.subgraph
+region: think
+purpose: think.reason 内部执行 — fork tools then plan → render (LLM call moved to think.llm.dispatch)
+entry: think.reason.fork_tools
+
+nodes:
+  - id: think.reason.fork_tools
+    factory: think.reason.fork_tools.ref
+    inputs: []
+    outputs: [forked_tools]
+    config:
+      emit_on_enter: []
+      emit_on_exit:  []
+      sub_spec_ref:
+        plan_ref: bundles/concept/tool_fork.yaml
+        entry_node: tool.fork.dispatch
+        binding_edge: think.reason.fork_tools
+
+  - id: think.reason.plan
+    factory: think.reason.plan
+    inputs: []
+    outputs: [turn_plan]
+    config:
+      emit_on_enter: []
+      emit_on_exit:  []
+
+  - id: think.reason.render
+    factory: think.reason.render
+    inputs: [turn_plan]
+    outputs: [turn_render]
+    config:
+      emit_on_enter: []
+      emit_on_exit:  [prompt_assembler_end, reasoner_meta]
+    terminal: true
+
+edges:
+  - from: think.reason.fork_tools
+    to: think.reason.plan
+    when: true
+  - from: think.reason.plan
+    to: think.reason.render
+    when: true

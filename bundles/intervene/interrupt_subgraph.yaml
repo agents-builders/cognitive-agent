@@ -1,0 +1,25 @@
+# bundles/intervene/interrupt_subgraph.yaml — intervene 暂停端子图纯图描述。
+#
+# ADR-0228 §Decision 4: intervene is a cross-phase subgraph.
+# The kernel reads the upstream ``decision`` + ``spine_seq`` ports,
+# ``intervene.interrupt`` emits a typed ``Command`` plus
+# ``RoutingDecision(should_terminate=True, next_hint="intervene.resume")``.
+# The kernel pauses. The driver (driver.py) detects the pause signal
+# and restarts the graph from ``perceive.main`` with the human answer
+# folded into state via ``HumanAnswerResumeInputAdapter``.
+
+id: interrupt.subgraph
+region: intervene
+purpose: intervene 暂停端 — Decision + spine_seq → typed Command + terminate routing
+
+nodes:
+  - id: intervene.interrupt
+    factory: intervene.interrupt
+    inputs: [decision, spine_seq]
+    outputs: [command, routing]
+    terminal: true
+    config:
+
+# terminal: intervene.interrupt 是 subgraph 的 terminal node。
+#           kernel 看到 RoutingDecision.should_terminate=True 后 pause。
+#           driver.py 将 cursor 指向 perceive.main 实现全图重启。

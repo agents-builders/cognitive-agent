@@ -1,0 +1,226 @@
+"""PR-4: /health handler exposes ``event_bus`` field + PersistenceObserver observability.
+
+The health payload bundles EventBus delivery counters and, when loaded,
+PersistenceObserver fsync policy. ``queue_depth`` is 0 (sync observer).
+``dropped_total > 0`` flips ``status`` to ``degraded`` without breaking
+readiness. The field is omitted when EventBus is unavailable (graceful
+degradation).
+"""
+
+from __future__ import annotations
+
+from collections.abc import Iterator
+from typing import Any
+
+import pytest
+from starlette.applications import Starlette
+from starlette.requests import Request  # noqa: TC002  (runtime annotation)
+from starlette.responses import JSONResponse
+from starlette.routing import Route
+from starlette.testclient import TestClient
+
+from lca.plugins.transport.webserver.handlers.runs.api.query_endpoints import (
+    _read_event_bus_health,
+    health_payload,
+)
+
+
+class _StubRunPort:
+    """Minimal RunPort: health_payload only touches status_counts + live_totals."""
+
+    def status_counts(self) -> dict[str, int]:
+        return {"running": 0, "pending": 0}
+
+    def live_totals(self) -> dict[str, int]:
+        return {"journal_subscribers": 0}
+
+
+async def _health_route(request: Request) -> JSONResponse:
+    payload = health_payload(
+        _StubRunPort(),
+        ctx=getattr(request.app.state, "ctx", None),
+    )
+    return JSONResponse(payload)
+
+
+def _make_app() -> Starlette:
+    return Starlette(routes=[Route("/health", _health_route, methods=["GET"])])
+
+
+# ── helper fixtures ───────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def client() -> TestClient:
+    return TestClient(_make_app())
+
+
+@pytest.fixture(autouse=True)
+def _reset_event_bus_singleton() -> Iterator[None]:
+    """Avoid cross-test bleed: each test gets a fresh EventBus instance."""
+    from lca_kernel.events import EventBus
+
+    EventBus.reset_singleton()
+    yield
+    EventBus.reset_singleton()
+
+
+# ── /health handler ──────────────────────────────────────────────────────
+
+
+def test_health_payload_includes_event_bus(client: TestClient) -> None:
+    """GET /health returns 200 + JSON containing the event_bus subfield."""
+    response = client.get("/health")
+    assert response.status_code == 200
+    body = response.json()
+    assert "event_bus" in body
+    eb = body["event_bus"]
+    assert set(eb) >= {
+        "published_total",
+        "persisted_total",
+        "delivered_total",
+        "dropped_total",
+        "fsync_policy",
+    }
+
+
+def test_health_payload_event_bus_dropped_total_zero_initially(
+    client: TestClient,
+) -> None:
+    """On a fresh process the counters are all zero + status stays ``ok``."""
+    body = client.get("/health").json()
+    assert body["status"] == "ok"
+    assert body["event_bus"]["published_total"] == 0
+    assert body["event_bus"]["persisted_total"] == 0
+    assert body["event_bus"]["delivered_total"] == 0
+    assert body["event_bus"]["dropped_total"] == 0
+
+
+def test_health_payload_event_bus_dropped_sets_degraded(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """dropped_total > 0 → status flips to ``degraded`` (not blocking readiness)."""
+    fake_snapshot = {
+        "team.delegation.cache_hit": {
+            "published": 5,
+            "persisted": 0,
+            "delivered": 0,
+            "dropped": 5,
+        }
+    }
+
+    def _fake_snapshot(self: Any) -> dict[str, dict[str, int]]:
+        return fake_snapshot
+
+    # ADR-0268: bus renamed to EnvelopeBus; production calls
+    # ``lca_kernel.events.EnvelopeBus.default().delivery_snapshot()``
+    # directly, so the patch target must be EnvelopeBus (patching the
+    # EventBus compat shim subclass would not affect the base class).
+    monkeypatch.setattr("lca_kernel.events.EnvelopeBus.delivery_snapshot", _fake_snapshot)
+
+    body = client.get("/health").json()
+    assert body["status"] == "degraded"
+
+
+def test_health_payload_plugin_block_reports_fiber_count_separate_from_event_registry() -> None:
+    """Regression: ``/health`` distinguishes event-registry count from cordis fiber count.
+
+    Bug fix (poteto-mode investigation 2026-09-14): the ``plugin`` block
+    on ``/health`` exposed only ``registered``/``expected`` (the event-registry
+    catalog — 4 publisher slots on web-standard). Operators asked "how many
+    plugins loaded?" and the answer was a misleading ``4``. The fix adds a
+    separate ``fiber_count`` field whose value matches the resolved profile's
+    enabled plugin list (the same predicate ``_boot_context`` uses for the
+    K3 topo_order — 244 on web-standard). The event-registry counters stay
+    unchanged so the spawner's ``plugin_ready`` predicate still works.
+    """
+    from pathlib import Path
+
+    from lca.harness.profile.boot.products import (
+        ProfileBootProducts,
+        attach_profile_boot_products,
+    )
+    from lca.harness.profile.resolve.resolve import resolve_profile
+
+    resolved = resolve_profile(Path("profiles/web-standard.yaml"))
+    ctx_holder: dict[str, Any] = {}
+
+    async def _wire() -> None:
+        from cordis import Context
+
+        ctx = Context()
+        attach_profile_boot_products(
+            ctx, ProfileBootProducts(resolved_profile=resolved)
+        )
+        ctx_holder["ctx"] = ctx
+
+    import asyncio
+
+    asyncio.run(_wire())
+
+    payload = health_payload(_StubRunPort(), ctx=ctx_holder["ctx"])
+    plugin_block = payload["plugin"]
+    expected_enabled = sum(1 for p in resolved.plugins if not p.disabled)
+
+    # Event-registry counters remain (legacy contract — spawner depends on them).
+    assert "registered" in plugin_block
+    assert "expected" in plugin_block
+    # New field surfaces the cordis-side count.
+    assert "fiber_count" in plugin_block, plugin_block
+    assert plugin_block["fiber_count"] == expected_enabled
+    assert plugin_block["fiber_count"] > plugin_block["registered"]
+
+
+def test_health_payload_event_bus_missing_graceful(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """If EnvelopeBus.delivery_snapshot raises, health still returns the core shape."""
+
+    def _boom(self: Any) -> dict[str, dict[str, int]]:
+        raise RuntimeError("event bus unavailable")
+
+    monkeypatch.setattr("lca_kernel.events.EnvelopeBus.delivery_snapshot", _boom)
+
+    body = client.get("/health").json()
+    assert body["status"] == "ok"
+    assert "runs" in body
+    assert "live" in body
+    assert "event_bus" not in body
+
+
+# ── _read_event_bus_health direct ─────────────────────────────────────────
+
+
+def test_read_event_bus_health_returns_dict_on_fresh_process() -> None:
+    """Direct call returns a dict with the five required keys + zero totals."""
+    result = _read_event_bus_health()
+    assert result is not None
+    assert result["published_total"] == 0
+    assert result["persisted_total"] == 0
+    assert result["delivered_total"] == 0
+    assert result["dropped_total"] == 0
+    # fsync_policy reads from PersistenceObserver; default FsyncProtocol.BATCH.
+    assert result["fsync_policy"] in {"batch", "n/a"}
+    if result["fsync_policy"] != "n/a":
+        assert result.get("queue_depth") == 0
+
+
+def test_read_event_bus_health_swallows_persistence_observer_import_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PersistenceObserver module absence must not poison the snapshot."""
+    import builtins
+
+    real_import = builtins.__import__
+
+    def _guarded(name: str, *args: Any, **kwargs: Any):
+        if name == "lca_kernel.events.persistence.persistence" or name.endswith(".events.persistence"):
+            raise ImportError("simulated persistence unavailable")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _guarded)
+
+    result = _read_event_bus_health()
+    assert result is not None
+    assert result["fsync_policy"] == "n/a"
+    assert "queue_depth" not in result

@@ -1,0 +1,43 @@
+# Candidate-only self-improving profile.
+#
+# This profile is intentionally separate from web-standard. It can resolve and
+# compile the learning plugins, but no plugin in this bundle may auto-apply a
+# profile, change capability grants, or write an installed skill package.
+name: self-improving-minimal
+description: |
+  Minimal, non-default learning-plane profile for evidence-gated skill and
+  profile candidates. Promotion remains external and explicitly approved.
+
+# ADR-0174 PR-7.2/7.2: profile migrated to ``loop_cursor.spine_*`` bundle
+# naming(§D1 第二批);observability 五缝装配段 schema 与 web-standard 对齐,
+# 使用 loop_cursor.spine_default(完整 spine),但 projection_host.initial
+# 收敛到 step_tree + cost(非默认,evidence-gated 意图下最小 deriver 表面)。
+observability:
+  loop_cursor:
+    implementation: std                              # 默认实现(PR-14 LoopCursorFactory)
+    spine_default: loop_cursor.spine_default         # 复用 bundles/loop_cursor.spine_default.yaml 的 bundle
+  projection_host:
+    initial: [step_tree, cost]
+  persistence:
+    coalescer: default
+    sink: routing_file
+  model_visible:
+    enabled: true
+  close_barrier:
+    enabled: true
+  plan_ref: self-improving-minimal
+
+bundles:
+  # The resolver still performs a provides→requires topological sort. Listing
+  # this scenario first guarantees its passive terminal-review contribution is
+  # registered before base freezes the lifecycle publisher snapshot.
+  - scenario-self-improving
+  - base
+  - web-app
+  - bundles/outer/phase_main.yaml
+  - bundles/think/think_subgraph.yaml
+  - bundles/act/act_subgraph.yaml
+  - bundles/perceive/perceive_subgraph.yaml
+  - bundles/reflect/reflect_subgraph.yaml
+  - bundles/remember/remember_subgraph.yaml
+  - bundles/loop_cursor.spine_default.yaml

@@ -1,0 +1,87 @@
+# 观测性默认 bundle(缝族 plugin 装配)。
+#
+# 在 base.yaml 已装的 EventDescriptor registry 之外,新增四缝
+# (LoopCursor / ProjectionHost / CloseBarrier / Persistence)seam + provider
+# 装配。profile.yaml 不再持有 ``observability:`` 段;一切四缝选择经
+# capability lookup 走本 bundle 的 NamedRegistry。
+#
+# 默认 provider 选择:
+# - loop_cursor / projection_host / close_barrier = standard
+# - persistence = null(ADR-0169 D8 调用方注入面永不空;生产路径由 transport
+#   注入 FilePersistenceCoordinator,barrier flush 时仍走 File sink 路径)
+#
+# ADR-0185 PR-4:capture 缝已退场,改由 ``events.model_visible.publisher``
+# plugin 在 LLM adapter 边界走 spine event bus 统一注入,本 bundle 不再
+# 装配 ModelVisibleCapture seam + provider。
+#
+# 其它 bundle(web-app / scenario-*)通过 requires 间接依赖本 bundle。
+name: observability-default
+description: |
+  四缝 LoopCursor / ProjectionHost / CloseBarrier / Persistence seam +
+  provider 装配。EventDescriptor registry 见 base.yaml。
+requires:
+  - base
+
+entries:
+  # ── 四缝 seam(声明 capability,提供 NamedRegistry)──────────────
+  - id: observability.loop_cursor.factory
+    name: observability_loop_cursor_factory
+    $module: lca.plugins.observability.seams.loop_cursor_factory
+    config: {}
+
+  - id: observability.projection_host
+    name: observability_projection_host
+    $module: lca.plugins.observability.seams.projection_host
+    config: {}
+
+  - id: observability.close_barrier
+    name: observability_close_barrier
+    $module: lca.plugins.observability.seams.close_barrier
+    config: {}
+
+  - id: observability.persistence
+    name: observability_persistence
+    $module: lca.plugins.observability.seams.persistence_coordinator
+    config: {}
+
+  # ── 四缝默认 provider(把 Std* / Null factory 注册到 NamedRegistry)──
+  - id: observability.loop_cursor.standard
+    name: observability_loop_cursor_standard
+    $module: lca.plugins.observability.providers.loop_cursor.standard
+    config: {}
+
+  - id: observability.projection_host.standard
+    name: observability_projection_host_standard
+    $module: lca.plugins.observability.providers.projection_host.standard
+    config: {}
+
+  - id: observability.close_barrier.standard
+    name: observability_close_barrier_standard
+    $module: lca.plugins.observability.providers.close_barrier.standard
+    config: {}
+
+  - id: observability.persistence.null
+    name: observability_persistence_null
+    $module: lca.plugins.observability.providers.persistence_coordinator.null
+    config: {}
+
+  # ── Run-health fold (PR-1 / Task 1.4) ─────────────────────────────
+  # Fold function is the SSOT for run-health; consumers (CLI post-create,
+  # debug, manifest, new ``lca-ops runs health``) read from it.
+  # Seams/providers here are thin shims — the real registry is the
+  # ``lca.health_derivers`` entry-point group in pyproject.toml.
+  # Marked ``disabled: true`` so the bundle declares the surface without
+  # forcing the seam/provider skeletons to ship a full Cordis ``setup()``
+  # (the actual fold is invoked directly by consumers via import, not via
+  # Cordis lookup). Full Cordis wiring is a follow-up PR.
+  - id: observability.health.fold.seam
+    name: observability_health_fold_seam
+    $module: lca.plugins.observability.health.seam_provider
+    config: {}
+    disabled: true
+
+  - id: observability.health.fold.standard
+    name: observability_health_fold_standard
+    $module: lca.plugins.observability.health.fold_provider
+    config: {}
+    disabled: true

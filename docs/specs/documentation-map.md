@@ -1,0 +1,34 @@
+# Documentation Map
+
+本页是 LCA 文档的导航入口。目录归属和维护规则由 [Documentation Standard](../AGENTS.md) 定义。
+
+| 需求 | 权威位置 | 说明 |
+|---|---|---|
+| 了解开发约束、仓库地图和验证命令 | [根 AGENTS.md](../../AGENTS.md) | 每次开发会话的高频入口 |
+| 读顶位架构速查（以 graph 为主轴） | [architecture.md](architecture.md) | 五层单向依赖 + 图三层 + BundleGraphSpec v2 + 四段事实链 + 当前在飞 |
+| 查询术语、数据所有权和结构化认知模型 | [LCA structured cognition guide](lca-structured-cognition-guide.md) | Fact、State、Decision、Verdict、Effect、Journal 等词汇 |
+| 读外环图 + act→工具调用栈（新人） | [phase-graph-and-act-tool-path.md](../guides/phase-graph-and-act-tool-path.md) | `factory`/`semantic_name` 查类；act.validate→…→SafeExecutor→`tool.execute` |
+| 查询现行协议与操作说明 | `docs/specs/` | Harness、阶段图、运行时投影、工具恢复、命名与包组织规范、集成规范 |
+| 查询包目录规模、命名与拆分规则 | [package-organization-discipline.md](package-organization-discipline.md) | 5/6/8 规则、概念群映射、代码体量硬约束 |
+| 查询图书馆式目录认知可靠性 | [cognitive-directory-discipline.md](cognitive-directory-discipline.md) | ≤5 文件/目录、路径即语义、agent 新建清单 |
+| 查询全项目目录架构与 seam 树 | [platform-directory-architecture.md](platform-directory-architecture.md) | 每包职责、legacy 迁移、插件物理布局 |
+| 查询 ADR-0194/0195 完整 PR 实施计划 | [0194-0195-implementation-plan.md](0194-0195-implementation-plan.md) | 113 PR、8 并行 Lane、ADR 逐条追溯 |
+| 查询命名宪法（目录/文件/类/函数/变量/枚举全维度） | [naming-constitution.md](../design/naming-constitution.md) | v3 九群归属、四维分解、角色后缀强制词表 |
+| 查询不可变的架构决策及其状态 | [ADR index](../adr/README.md) | Accepted、Proposed、Superseded、Deprecated 决策 |
+| 查询宪法级设计与长期模型 | `docs/design/` | 认知原语、声明式插件、时空和运行计划设计 |
+| 查询 Journal、Trace 和运行诊断 | `docs/observability/` | 可观测性子系统规格和调试手册 |
+| 查询角色库、技能包和部署组件说明 | `roles/`、`skills/`、`deploy/` | 与所属组件共同维护的就近文档 |
+| 查询已结束实施、研究和审计的原始记录 | [history](../../history/README.md) | 非现行、仅供追溯的过程材料 |
+| 查询 Kernel / Transport 边界与启动链路 | [ADR-0115](../adr/0115-kernel-transport-boundary.md) · [ADR-0116](../adr/0116-boot-event-observability-convergence.md) · [ADR-0117](../adr/0117-process-lifecycle-env-whitelist.md) · [lca_kernel/README.md](../../lca_kernel/README.md) |
+| 查询全栈平台架构收敛（Loop + Obs + Transport + Plugins） | [ADR-0195](../adr/0195-platform-architecture-convergence.md) · [ADR-0194](../adr/0194-cognitive-loop-architecture-convergence.md) · [observability/platform-readme.md](../observability/platform-readme.md) | K1–K8 公共面、Boot journal 词表、process lifecycle + env 白名单 |
+| 查询 Hermes 启发的入口/插件治理收敛 | [ADR-0199](../adr/0199-hermes-inspired-cognitive-plugin-convergence.md) · [0199-implementation-plan.md](0199-implementation-plan.md) | RuntimeFacade、RunIntent、Plugin Doctor；**52 PR 实施表** |
+| 查询 Hermes 产品能力（学习/策展/调度） | [ADR-0200](../adr/0200-hermes-product-capabilities-absorption.md) | review-fork、Curator、ContextEngine、MemoryProvider、0093 no_agent |
+| 查询 Gateway routes plugin 化 | [ADR-0112](../adr/0112-gateway-routes-as-plugins.md) | Gateway router + 4 routes plugin |
+
+## 维护边界
+
+将新内容放入已有的权威家。当前系统如何工作，写入 `docs/specs/` 或 `docs/observability/`；为什么选择某种结构，写入 ADR；仅在长期设计仍有独立价值时更新 `docs/design/`。实施计划、调查笔记、进度、验收日志和优化报告在结束后归档到 `history/YYYY-MM/<topic>/`，不再进入仓库根目录或 `docs/`。
+
+## Phase-graph node orchestration (planning)
+
+- [phase-graph-node-orchestration](../architecture/phase-graph-node-orchestration/) — inventory, industry matrix, proposed graph, 0206 six-column review table

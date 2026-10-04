@@ -1,0 +1,95 @@
+"""Composio Provider plugin — binds Profile config to ComposioIntegration."""
+
+from __future__ import annotations
+
+from pydantic import BaseModel, SecretStr
+
+from lca.contracts.atoms.control.slot import ControlSlot
+from lca.contracts.atoms.functional.group import FunctionalGroup
+from lca.contracts.atoms.scope.scope import Scope
+from lca.contracts.harness.composition.plugin_contract import (
+    ArchitectureContract,
+    AuthorityContract,
+    EvidenceContract,
+    LifecycleContract,
+    PluginContract,
+    PluginIdentity,
+)
+from lca.contracts.protocols.declarative.declarative_2.declarative_plugin import (
+    OwnershipDeclaration,
+)
+from lca.harness.plugin_api import PluginContext, PluginKind, plugin
+
+
+class Config(BaseModel):
+    model_config = {"extra": "forbid"}
+    api_key: SecretStr | str | None = None
+    base_url: str | None = None
+    callback_url: str | None = None
+    default_user_id: str | None = None
+    auth_config_ids: str | dict[str, str] | None = None
+    connections_path: str | None = None
+
+
+def _secret_value(value: SecretStr | str) -> str:
+    if isinstance(value, SecretStr):
+        return value.get_secret_value()
+    return value
+
+
+@plugin(
+    id="lca-composio-provider",
+    provides=["composio"],
+    layer="L0",
+    effects="tools",
+    description="Configure ComposioIntegration from Profile-injected credentials.",
+    test_suite="tests/scenario/composio/test_composio_integration.py",
+    kind=PluginKind.PROVIDER,
+    contract=PluginContract(
+        identity=PluginIdentity(version="v1"),
+        architecture=ArchitectureContract(
+            group=FunctionalGroup.G10_COMPOSITION, control_slots=(ControlSlot.OBSERVE_WILDCARD,)
+        ),
+        lifecycle=LifecycleContract(allowed_scopes=(Scope.RUN,)),
+        authority=AuthorityContract(grants=("plugin.serve",)),
+        observability=EvidenceContract(
+            descriptors=("lca-composio-provider.checked", "lca-composio-provider.served")
+        ),
+    ),
+    relations=(),
+    ownership=OwnershipDeclaration(
+        reads=("plugin.serve",),
+        emits=("plugin.served",),
+        state_mutation="forbidden",
+    ),
+)
+async def setup(ctx: PluginContext, config: Config) -> None:
+    from lca.infrastructure.integrations.composio.service.service import ComposioIntegration
+    from lca.infrastructure.integrations.composio.settings.settings import ComposioSettings
+
+    if not config.api_key:
+        return
+    api_key = _secret_value(config.api_key).strip()
+    if not api_key:
+        return
+
+    settings = ComposioSettings.from_plugin_config(
+        api_key=api_key,
+        base_url=config.base_url,
+        callback_url=config.callback_url,
+        default_user_id=config.default_user_id,
+        auth_config_ids=config.auth_config_ids,
+        connections_path=config.connections_path,
+    )
+    registry = ctx.soft_get("event_descriptor_registry")
+    if registry is not None:
+        from contextlib import suppress
+
+        from lca.contracts.observability.closure.composio_ep_closure import (
+            all_composio_event_descriptors,
+        )
+
+        for descriptor in all_composio_event_descriptors():
+            with suppress(ValueError):
+                registry.register(descriptor, replace=False)
+    ctx.provide("composio", ComposioIntegration(settings))

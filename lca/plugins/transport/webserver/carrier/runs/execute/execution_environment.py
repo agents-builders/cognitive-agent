@@ -1,0 +1,395 @@
+"""Coordinate the legacy Gateway run environment in one explicit scope order.
+
+Binding selection, attachment staging, and cognitive run-context projection live
+in focused modules.  This coordinator owns only the order in which those pieces
+enter carrier-side scopes before a loop driver executes.
+"""
+
+from __future__ import annotations
+
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager, nullcontext, suppress
+from dataclasses import dataclass
+from typing import Any, cast
+
+import structlog
+
+from lca.contracts.atoms.ids.ids import RunId, TraceId
+from lca.contracts.mechanisms.capability.capability import (
+    require_capability,
+)
+from lca.contracts.models.core.state.plane import PlaneBindings
+from lca.contracts.models.observability.journal.journal import RunScope
+from lca.contracts.models.team.run.context import RunContext
+from lca.contracts.protocols.runtime.infra.infra import MachineResolver
+from lca.infrastructure.observability import BoundObservability, bind_backends, run_scope
+from lca.infrastructure.observability.events.event.descriptor_env import bind_descriptors
+from lca.infrastructure.observability.facade.run.ambit import (
+    RunAmbit,
+    bind_run_ambit,
+)
+from lca.infrastructure.runtime_plane.bindings.bindings import plane_bindings_scope
+from lca.infrastructure.runtime_plane.capability_bindings import (
+    BindingsViewBuilder,
+    reset_capability_bindings,
+    reset_current_tools_service,
+    set_capability_bindings,
+    set_current_tools_service,
+)
+from lca.infrastructure.sandbox.runtime.scope import bind_sandbox_runtime
+from lca.infrastructure.skills.assistant.resolver import resolve_skill_store
+from lca.infrastructure.tool_defer.policy import DeferPolicy
+from lca.infrastructure.tool_defer.session import (
+    ToolDeferSession,
+    reset_current_defer_session,
+    set_current_defer_session,
+)
+from lca.infrastructure.workspace import run_workspace_scope
+from lca.plugins.transport.webserver.carrier.runs.execute.environment_bindings import (
+    resolve_bindings as _resolve_bindings,
+)
+from lca.plugins.transport.webserver.carrier.runs.execute.environment_bindings import (
+    resolve_descriptor_registry as _resolve_descriptor_registry,
+)
+from lca.plugins.transport.webserver.carrier.runs.execute.environment_bindings import (
+    resolve_driver as _resolve_driver,
+)
+from lca.plugins.transport.webserver.carrier.runs.execute.environment_bindings import (
+    resolve_run_providers as _resolve_run_providers,
+)
+from lca.plugins.transport.webserver.carrier.runs.execute.loop_drivers import RunLoopDriver
+from lca.plugins.transport.webserver.carrier.runs.lifecycle.run_context_factory import (
+    run_context_for_session as _run_context_for_session,
+)
+from lca.plugins.transport.webserver.carrier.runs.lifecycle.runnable_assembly import (
+    _assistant_spec_for_run,
+)
+from lca.plugins.transport.webserver.carrier.runs.run_scopes import run_identity_scopes
+from lca.plugins.transport.webserver.handlers.runs.api.attachment_staging import (
+    stage_machine_attachments as _stage_machine_attachments,
+)
+from lca.plugins.transport.webserver.handlers.runs.session.session.session import RunSession
+
+
+@dataclass(frozen=True)
+class PreparedRun:
+    """Fully resolved inputs that a legacy loop driver may consume."""
+
+    driver: RunLoopDriver
+    bindings: PlaneBindings
+    run_context: RunContext
+    workspace: Any
+
+
+class RunExecutionEnvironment:
+    """Enter the carrier scopes that make one resolved legacy run executable."""
+
+    def __init__(
+        self,
+        session: RunSession,
+        *,
+        ctx: Any,
+        hub: BoundObservability,
+        machine_resolver: MachineResolver | None = None,
+    ) -> None:
+        self._session = session
+        self._ctx = ctx
+        self._hub = hub
+        self._machine_resolver = machine_resolver
+
+    @asynccontextmanager
+    async def prepare(self) -> AsyncIterator[PreparedRun]:
+        """Yield a driver-ready environment after ordered carrier preflight.
+
+        ADR-0122: every ambient resource is bound through the single
+        :func:`bind_run_ambit` frame at the outermost level. Component
+        accessors (e.g. ``current_file_store()``) read from RunAmbit; the
+        legacy ``run_*_scope`` helpers, when invoked inside the frame, also
+        delegate to RunAmbit. New ambient resources MUST be added to
+        :class:`RunAmbit` rather than as new ``with``-blocks here.
+        """
+        session = self._session
+        # Resolve providers BEFORE entering ambient scopes so we can bind
+        # the FileStore via RunAmbit (ADR-0122 / run_f03bd17f77f1):
+        # reasoner code reaches the FileStore via current_file_store()
+        # (no ctx handle); without this binding every think.main raises
+        # ``RuntimeError("no FileStore in ambient scope")`` before LLM is called.
+        bindings = _resolve_bindings(session, self._ctx, self._machine_resolver)
+        session.bindings = bindings
+        driver = _resolve_driver(session, self._ctx)
+        providers = _resolve_run_providers(bindings, self._ctx)
+
+        chat_id = (
+            getattr(session, "chat_id", "") or getattr(session, "topic_id", "") or ""
+        ).strip()
+        topic_id = (
+            getattr(session, "topic_id", "") or getattr(session, "chat_id", "") or ""
+        ).strip()
+        ambit = RunAmbit(
+            scope=RunScope(
+                trace_id=cast("TraceId", session.trace_id),
+                run_id=cast("RunId", session.run_id),
+            ),
+            run_id=cast("RunId", session.run_id),
+            trace_id=cast("TraceId", session.trace_id),
+            attachment_ids=tuple(session.attachment_ids or ()),
+            file_store=providers.file_store,
+            assistant_id=(getattr(session, "assistant_id", "") or "").strip(),
+            chat_id=chat_id,
+            topic_id=topic_id,
+        )
+        # Capture the ambient snapshot on the session so a HIL resume can
+        # re-bind it (FileStore etc.) without re-resolving providers.
+        session.ambit = ambit
+        # ADR-0167 D11: bind StepCoordinator + facade RunContext。
+        # StepCoordinator 是 Agent 唯一可见写入口 (D2); 通过 ContextVar 注入,
+        # adapter / facade 在 prepare 期间可直接拿当前 coordinator。
+        from lca.infrastructure.observability.facade import RunContext as FacadeRunContext
+        from lca.infrastructure.observability.facade import bind as bind_facade_run
+        from lca.infrastructure.observability.writable_matrix.coordinator import (
+            bind_current_coordinator,
+            reset_current_coordinator,
+        )
+
+        coordinator_token: object | None = None
+        coordinator = getattr(session, "coordinator", None)
+        if coordinator is None:
+            coordinator = getattr(session, "thread_tree_writer", None)
+        if coordinator is not None:
+            coordinator_token = bind_current_coordinator(coordinator)
+
+        agent = session.agent
+        assistant_id = ambit.assistant_id
+        if assistant_id:
+            # I-A2：带 assistant_id 的 run，agent 级载体值 = 该 id；
+            # Spine EP 的 source / actor_role 以此为身份。
+            agent_role = assistant_id
+        else:
+            agent_role = (
+                agent.name
+                if agent is not None and agent.name
+                else (agent.agent_id if agent is not None and agent.agent_id else "")
+            )
+        facade_ctx = FacadeRunContext(
+            run_id=cast("RunId", session.run_id),
+            trace_id=cast("TraceId", session.trace_id),
+            agent_role=agent_role,
+        )
+
+        with (
+            bind_facade_run(facade_ctx),
+            bind_run_ambit(ambit),
+            run_identity_scopes(
+                session.run_id,
+                session.attachment_ids,
+                assistant_id,
+            ),
+        ):
+            log_context: dict[str, str] = {
+                "run_id": session.run_id,
+                "trace_id": session.trace_id,
+            }
+            if assistant_id:
+                log_context["assistant_id"] = assistant_id
+            structlog.contextvars.bind_contextvars(**log_context)
+            # ADR-0220 §7.3: publish the per-turn BindingsViewBuilder next to
+            # the plane scope so concept.tool.fork reads typed bindings.
+            # Refs mirror runnable_assembly.tools_from_scope, but with the
+            # plane-filtered providers so unforked planes stay unforked.
+            capability_token = None
+            tools_token = None
+            defer_token = None
+            if assistant_id:
+                from lca.infrastructure.observability.meta_event_emit import (
+                    emit_assistant_run_bound,
+                )
+
+                emit_assistant_run_bound(
+                    assistant_id=assistant_id,
+                    run_id=str(session.run_id),
+                    profile=str(getattr(session, "profile", "") or ""),
+                )
+            try:
+                spec = _assistant_spec_for_run(self._ctx, assistant_id)
+                home_path = spec.home_path if spec is not None else None
+                tools_service = require_capability(self._ctx, "tools")
+                # ADR-0248: 在组合前解析 assistant 声带/审查配置并创建共享 gate，
+                # 注册 send_message 工具工厂，使该工具在 materialize 阶段就进入
+                # body 的可执行工具注册表（此前只在 fork 节点追加到模型可见列表，
+                # 导致「模型看得到但执行时未注册工具」）。
+                from lca.contracts.models.auto_review.models import (
+                    AutoReviewMode as AutoReviewModeEnum,
+                )
+                from lca.contracts.models.vocal.models import VocalMode
+                from lca.infrastructure.auto_review.gate import AutoReviewGate
+                from lca.infrastructure.vocal.gate import GatedVocalGate
+                from lca.infrastructure.vocal.tool_adapter import SendMessageVocalTool
+
+                profile_runtime = spec.profile_runtime if spec is not None else {}
+                vocal_mode = str(profile_runtime.get("vocal_mode", "direct"))
+                auto_review_mode = str(profile_runtime.get("auto_review_mode", "off"))
+                vocal_gate = None
+                auto_review_gate = None
+                factory_disposers: list[Any] = []
+                from lca.infrastructure.computer.box_accessor import BoxAccessor
+
+                box_accessor = BoxAccessor()
+                if vocal_mode == VocalMode.GATED.value:
+                    from lca.infrastructure.tools.box import (
+                        BoxListFilesTool,
+                        BoxReadFileTool,
+                        BoxRunCommandTool,
+                        BoxWriteFileTool,
+                        RequestBoxHelpTool,
+                    )
+
+                    vocal_gate = GatedVocalGate(operation_id=str(session.run_id))
+                    if auto_review_mode != "off":
+                        auto_review_gate = AutoReviewGate(mode=AutoReviewModeEnum(auto_review_mode))
+
+                    def _send_message_factory(b: object) -> object | None:
+                        if getattr(b, "vocal_mode", "direct") != VocalMode.GATED.value:
+                            return None
+                        return SendMessageVocalTool(vocal_gate)  # type: ignore[arg-type]
+
+                    factory_disposers.append(
+                        tools_service.register_factory("send_message", _send_message_factory)
+                    )
+                    factory_disposers.append(
+                        tools_service.register_factory(
+                            "box_read_file",
+                            lambda b, box=box_accessor: BoxReadFileTool(box),
+                        )
+                    )
+                    factory_disposers.append(
+                        tools_service.register_factory(
+                            "box_write_file",
+                            lambda b, box=box_accessor: BoxWriteFileTool(box),
+                        )
+                    )
+                    factory_disposers.append(
+                        tools_service.register_factory(
+                            "box_list_files",
+                            lambda b, box=box_accessor: BoxListFilesTool(box),
+                        )
+                    )
+                    if auto_review_mode != "off":
+                        factory_disposers.append(
+                            tools_service.register_factory(
+                                "box_run_command",
+                                lambda b, box=box_accessor: BoxRunCommandTool(box),
+                            )
+                        )
+                    factory_disposers.append(
+                        tools_service.register_factory(
+                            "request_box_help",
+                            lambda b: RequestBoxHelpTool(),
+                        )
+                    )
+                # 共享给 runnable_assembly（组合 body 工具注册表）与 runtime loop。
+                session.vocal_mode = vocal_mode  # type: ignore[attr-defined]
+                session.vocal_gate = vocal_gate  # type: ignore[attr-defined]
+                session.auto_review_mode = auto_review_mode  # type: ignore[attr-defined]
+                session.auto_review_gate = auto_review_gate  # type: ignore[attr-defined]
+                bindings_view = BindingsViewBuilder(
+                    file_store=providers.file_store,
+                    bindings=bindings,
+                    sandbox=providers.sandbox,
+                    search=require_capability(self._ctx, "search"),
+                    # ADR-0242 D4: assistant runs read the merged store so
+                    # skill tools see the same view as prompt discovery.
+                    skill_store=resolve_skill_store(self._ctx, assistant_id),
+                    machine_resolver=self._machine_resolver,
+                    mode=(getattr(session, "mode", "") or "solo").strip() or "solo",
+                    assistant_id=assistant_id,
+                    home_path=home_path,
+                    vocal_mode=vocal_mode,
+                    vocal_gate=vocal_gate,
+                    auto_review_mode=auto_review_mode,
+                    auto_review_gate=auto_review_gate,
+                    origin="user",
+                    box_accessor=box_accessor,
+                )
+                # Hot-resume cache (same class as session.ambit): the HIL
+                # resume task has no execution environment, so it
+                # re-publishes these handles instead of re-resolving.
+                session.capability_bindings = bindings_view
+                session.tools_service = tools_service
+                capability_token = set_capability_bindings(bindings_view)
+                # ADR-0241 §Consequences R-1 follow-up: publish the
+                # per-turn ToolsService to the typed RuntimePlane so the
+                # v2 driver (PlanInterpreter) can seed the typed ``tools``
+                # port at the outer plan entry.  Mirror of the bindings
+                # ContextVar pattern — both are per-turn typed values
+                # that the kernel reads once at outer-plan entry.
+                tools_token = set_current_tools_service(tools_service)
+                # Defer-tool seam (Muse L1 alignment): one session per run;
+                # think.reason's per-turn fork only refreshes the turn view.
+                # Gated vocal mode keeps the ``agent`` namespace eager so
+                # ``send_message`` is visible from turn one (ADR-0248);
+                # otherwise the vocal contract makes the model call a tool
+                # whose schema was never loaded.
+                defer_token = set_current_defer_session(
+                    ToolDeferSession(DeferPolicy.for_vocal_mode(vocal_mode))
+                )
+                with (
+                    run_workspace_scope(session.run_id) as workspace,
+                    run_scope(ambit.scope) if ambit.scope is not None else nullcontext(),
+                    plane_bindings_scope(bindings),
+                ):
+                    await _bind_sandbox_runtime(session, providers.sandbox, providers.file_store)
+                    descriptor_registry = _resolve_descriptor_registry(self._ctx)
+                    with bind_backends(self._hub), bind_descriptors(descriptor_registry):
+                        await _stage_machine_attachments(
+                            session,
+                            providers.file_store,
+                            self._machine_resolver,
+                        )
+                        yield PreparedRun(
+                            driver=driver,
+                            bindings=bindings,
+                            # ADR-0248: profile.json.runtime 的 vocal_mode /
+                            # auto_review_mode / wake_source 经 RunContext.extra
+                            # 透传，runtime loop 据此启用 gated 模式与 AutoReview。
+                            run_context=_run_context_for_session(
+                                session,
+                                profile_runtime=spec.profile_runtime if spec is not None else None,
+                            ),
+                            workspace=workspace,
+                        )
+            finally:
+                for disposer in factory_disposers:
+                    with suppress(Exception):
+                        disposer()
+                if capability_token is not None:
+                    reset_capability_bindings(capability_token)
+                if tools_token is not None:
+                    reset_current_tools_service(tools_token)
+                if defer_token is not None:
+                    reset_current_defer_session(defer_token)
+                structlog.contextvars.clear_contextvars()
+                if coordinator_token is not None:
+                    reset_current_coordinator(coordinator_token)
+
+
+async def _bind_sandbox_runtime(session: RunSession, sandbox: Any, file_store: Any) -> None:
+    """Bind a selected sandbox only when both required provider planes exist."""
+    if sandbox is None or file_store is None:
+        return
+    try:
+        await bind_sandbox_runtime(
+            session.run_id,
+            sandbox,
+            file_store,
+            session.attachment_ids,
+        )
+    except Exception as exc:
+        structlog.get_logger(__name__).warning(
+            "sandbox_runtime_bind_failed",
+            hop="H2",
+            run_id=session.run_id,
+            error=str(exc),
+        )
+
+
+__all__ = ["PreparedRun", "RunExecutionEnvironment"]

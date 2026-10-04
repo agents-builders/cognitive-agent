@@ -1,0 +1,628 @@
+"""StampedEvent → AgentStreamEvent.data fold.
+
+Pure function table. Each fold row mirrors the translation table in
+spec §5.3. `tool_end.data` deliberately omits `projected_state` — the
+server-side coordinator writes the full `projected_state` into the
+tool message's `pluginState` DB column BEFORE publishing the event;
+the front-end `gatewayEventHandler.tool_end` then `fetchAndReplaceMessages`
+reads the populated row. See spec §5.3.1.
+"""
+
+from __future__ import annotations
+
+import json
+from typing import Any
+
+
+def _text_delta(e: dict[str, Any]) -> str:
+    for key in ("text_delta", "delta", "content"):
+        raw = e.get(key)
+        if isinstance(raw, str) and raw:
+            return raw
+    return ""
+
+
+def _inner_payload(e: dict[str, Any]) -> dict[str, Any]:
+    nested = e.get("payload")
+    if isinstance(nested, dict):
+        return nested
+    return e
+
+
+_FAILURE_OUTCOMES: frozenset[str] = frozenset({"failure", "failed", "error"})
+
+
+def _user_visible_llm_failure_message(e: dict[str, Any]) -> str:
+    """Build a short, human-readable failure message from ``llm.call.end``.
+
+    The user turn failed before any assistant text was produced. The message
+    must be actionable in Chinese without leaking internals.
+    """
+    payload = _inner_payload(e)
+    model = str(payload.get("model") or "")
+    latency_ms = payload.get("latency_ms")
+    parts: list[str] = ["本次回复失败"]
+    if model:
+        parts.append(f"(模型 {model})")
+    if isinstance(latency_ms, (int, float)) and latency_ms > 0:
+        parts.append(f"，等待约 {int(latency_ms) // 1000}s 后失败")
+    parts.append("，请稍后重试。")
+    return "".join(parts)
+
+
+def wire_tool_call(
+    tool_name: str,
+    invocation_id: str,
+    arguments: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    from lca.infrastructure.tools.contract.project.project import project_args
+    from lca.plugins.transport.webserver.wire.wire import resolve
+
+    coords = resolve(tool_name)
+    if coords is None:
+        identifier, api_name = "lobe-cloud-sandbox", tool_name
+    else:
+        identifier, api_name = coords
+    # Wire protocol: ``arguments`` is a JSON-encoded string to match the
+    # LobeHub ChatToolPayloadSchema contract (``z.string()``). Sending a dict
+    # makes the trpc updateMessage call fail schema validation and silently
+    # clears the assistant bubble on completion (because the persist fallback
+    # refetch runs before the failed write resolves). Mirrors the OpenAI
+    # compat / Anthropic adapter convention (see
+    # ``lca/infrastructure/llm_adapter/openai_compat/anthropic/_anthropic_stream.py``).
+    #
+    # RenderContract remaps python keys onto LobeHub inspector keys.
+    # Tools whose python keys already match the inspector are a no-op.
+    raw_args: dict[str, Any] = dict(arguments or {})
+    projected = project_args(tool_name, raw_args)
+    args_dict: dict[str, Any] = dict(projected) if projected else raw_args
+    # Collapsed chips read ``args.description`` (falling back to command/code).
+    # An empty description leaves the chip blank; default to the apiName.
+    if not args_dict.get("description"):
+        args_dict["description"] = api_name or tool_name or "tool call"
+    return {
+        "id": invocation_id or tool_name,
+        "identifier": identifier,
+        "apiName": api_name,
+        "arguments": json.dumps(args_dict, ensure_ascii=False),
+        "type": "builtin",
+    }
+
+
+class EventTranslator:
+    """Pure fold from a StampedEvent to AgentStreamEvent payloads.
+
+    Always returns a list of envelope dicts; an empty list means the
+    event is ignored. Multi-event translations (e.g. HITL pause) yield
+    more than one envelope.
+    """
+
+    def __init__(self) -> None:
+        self._streamed_text: bool = False
+        self._turn_requested_tools: bool = False
+
+    def translate(self, stamped: dict) -> list[dict]:
+        """Return the AgentStreamEvent envelopes for one stamped event.
+
+        Single-shape contract: always a list; empty list means ignore.
+        """
+        folded = self._fold(stamped)
+        if folded is None:
+            return []
+        return folded if isinstance(folded, list) else [folded]
+
+    def _fold(self, stamped: dict) -> list[dict] | dict | None:
+        """Internal fold; tri-state (list | dict | None), normalized by translate()."""
+        event = stamped.get("event") or {}
+        kind = event.get("kind")
+        if kind == "ignore":
+            return None
+
+        execution_point = event.get("execution_point")
+        if isinstance(execution_point, str):
+            if execution_point == "llm.call.start":
+                self._streamed_text = False
+                self._turn_requested_tools = False
+            elif execution_point == "llm.stream.token":
+                self._streamed_text = True
+            elif execution_point == "llm.tool_call.streaming":
+                self._turn_requested_tools = True
+            elif execution_point == "llm.request.header.assistant" and self._streamed_text:
+                # Tokens were already streamed incrementally; drop full header to prevent duplication
+                return None
+            spine_handler = _SPINE_HANDLERS.get(execution_point)
+            if spine_handler is not None:
+                folded = spine_handler(event)
+                if (
+                    execution_point == "llm.call.end"
+                    and self._streamed_text
+                    and not self._turn_requested_tools
+                    and isinstance(folded, dict)
+                    and folded.get("type") == "stream_end"
+                ):
+                    # The send button stays loading until visible_output_end.
+                    # A tool-less streamed turn is the last text the user sees.
+                    # memory_extract still runs after this and must not hold the button.
+                    return [
+                        folded,
+                        {
+                            "type": "visible_output_end",
+                            "data": {"reason": "completed"},
+                        },
+                    ]
+                return folded
+
+        etype = event.get("type")
+        if not isinstance(etype, str):
+            return None
+        handler = _HANDLERS.get(etype)
+        if handler is None:
+            return None
+        return handler(event)
+
+    # ── Translation rules (one per spec §5.3 row) ────────────────────
+
+    @staticmethod
+    def _llm_call_started(e: dict) -> dict:
+        return {
+            "type": "stream_start",
+            "data": {"assistantMessage": e.get("assistantMessage", {})},
+        }
+
+    @staticmethod
+    def _text_delta_event(e: dict) -> dict | None:
+        delta = _text_delta(e)
+        if not delta:
+            return None
+        return {
+            "type": "stream_chunk",
+            "data": {
+                "chunkType": "text",
+                "content": delta,
+                "snapshotMode": "append",
+            },
+        }
+
+    @staticmethod
+    def _step_text_delta(e: dict) -> dict | None:
+        channel = e.get("channel", "decision")
+        if channel not in ("answer", "all"):
+            return None
+        return EventTranslator._text_delta_event(e)
+
+    @staticmethod
+    def _reasoning_delta(e: dict) -> dict | None:
+        delta = _text_delta(e)
+        if not delta:
+            return None
+        return {
+            "type": "stream_chunk",
+            "data": {
+                "chunkType": "reasoning",
+                "reasoning": delta,
+                "snapshotMode": "append",
+            },
+        }
+
+    @staticmethod
+    def _assistant_responded(e: dict) -> dict | None:
+        content = str(e.get("content") or "")
+        if not content:
+            return None
+        return {
+            "type": "stream_chunk",
+            "data": {
+                "chunkType": "text",
+                "content": content,
+                "snapshotMode": "append",
+            },
+        }
+
+    @staticmethod
+    def _decision_made(e: dict) -> dict:
+        return {
+            "type": "stream_chunk",
+            "data": {
+                "chunkType": "tools_calling",
+                "toolsCalling": e.get("tool_calls", []),
+            },
+        }
+
+    @staticmethod
+    def _tool_started(e: dict) -> dict:
+        payload = e.get("payload") or e.get("toolCalling") or {}
+        if not payload and e.get("tool_name"):
+            payload = wire_tool_call(
+                str(e.get("tool_name") or ""),
+                str(e.get("invocation_id") or ""),
+                e.get("arguments") if isinstance(e.get("arguments"), dict) else {},
+            )
+        tool_start_msg = {
+            "type": "tool_start",
+            "data": {
+                "parentMessageId": e.get("parentMessageId"),
+                "toolCalling": payload,
+            },
+        }
+        return tool_start_msg
+
+    @staticmethod
+    def _tool_invoked(e: dict) -> dict:
+        """spec §5.3.1: NO top-level projected_state — use ``result.state`` (native shape).
+
+        Also surface ``output_text`` (the inline stdout / content for non-evidence
+        tools, set by ``prepare_tool_invoked``) into ``result.content`` so the
+        LobeHub gateway handler can write it onto the tool message in memory.
+        Without this, the assistant bubble shows the tool invocation but never
+        its return text, and the post-run ``persistAssistantRow`` writes an
+        empty ``content`` for the assistant message.
+        """
+        result_raw = e.get("result")
+        result: dict[str, Any] = dict(result_raw) if isinstance(result_raw, dict) else {}
+        projected = e.get("projected_state")
+        if isinstance(projected, dict) and projected:
+            result["state"] = projected
+        output_text = e.get("output_text")
+        if isinstance(output_text, str) and output_text:
+            result.setdefault("content", output_text)
+        tool_end_msg = {
+            "type": "tool_end",
+            "data": {
+                "isSuccess": e.get("isSuccess", True),
+                "result": result or None,
+                "payload": e.get("payload"),
+                "executionTime": e.get("executionTime"),
+            },
+        }
+        return tool_end_msg
+
+    @staticmethod
+    def _tool_denied(e: dict) -> dict:
+        tool_end_msg = {
+            "type": "tool_end",
+            "data": {
+                "isSuccess": False,
+                "result": {"error": e.get("reason", "denied")},
+            },
+        }
+        return tool_end_msg
+
+    @staticmethod
+    def _reaction_added(e: dict) -> dict:
+        return {
+            "type": "reaction_added",
+            "data": {
+                "message_id": e.get("message_id"),
+                "emoji": e.get("emoji"),
+                "actor": e.get("actor"),
+            },
+        }
+
+    @staticmethod
+    def _step_start(e: dict) -> dict:
+        return {
+            "type": "step_start",
+            "data": {
+                "phase": e.get("phase"),
+                "requiresApproval": e.get("requiresApproval"),
+                "pendingToolsCalling": e.get("pendingToolsCalling"),
+            },
+        }
+
+    @staticmethod
+    def _step_finished(e: dict) -> dict:
+        return {
+            "type": "stream_end",
+            "data": {
+                "finalContent": e.get("finalContent"),
+            },
+        }
+
+    @staticmethod
+    def _spine_close(e: dict) -> list[dict] | dict:
+        final_state = e.get("final_state") or {}
+        status = final_state.get("status", "done")
+        reason = e.get("reason", status)
+
+        runtime_end = {
+            "type": "agent_runtime_end",
+            "data": {
+                "finalState": final_state,
+                "reason": reason,
+                "reasonDetail": e.get("reasonDetail", ""),
+                "phase": "execution_complete",
+            },
+        }
+
+        if reason in ("waiting_for_human", "waiting_input"):
+            step_start = {
+                "type": "step_start",
+                "data": {
+                    "phase": "human_approval",
+                    "requiresApproval": True,
+                    "pendingToolsCalling": e.get("pending_tools_calling", []),
+                },
+            }
+            return [step_start, runtime_end]
+
+        return runtime_end
+
+    @staticmethod
+    def _llm_error(e: dict) -> dict:
+        return {
+            "type": "error",
+            "data": {
+                "type": e.get("errorType"),
+                "message": e.get("message"),
+                "body": e.get("body"),
+                "provider": e.get("provider"),
+            },
+        }
+
+    @staticmethod
+    def _llm_retry(e: dict) -> dict:
+        return {
+            "type": "stream_retry",
+            "data": {
+                "attempt": e.get("attempt", 1),
+                "max": e.get("max", 3),
+                "provider": e.get("provider"),
+                "delayMs": e.get("delayMs"),
+            },
+        }
+
+    # NOTE: ``agent_intervention_request`` is NOT produced by the LCA
+    # runtime. The HIL round-trip is HTTP-based
+    # (``POST /lca-api/runs/{runId}/answer`` bridged via
+    # ``deploy/lobehub/patches/runtime/lca_runtime_agent_gateway.py``),
+    # and the WS pause signal travels through the durable journal
+    # (``approval.persisted.v1`` + ``waiting_input`` checkpoint →
+    # ``SpineClose`` → ``agent_runtime_end``). The native hetero
+    # executor emits ``agent_intervention_request`` to drive its local
+    # CLI/MCP card; LCA's server-side runtime does not. The Pydantic
+    # class remains in ``agent_stream_event.AgentStreamEvent`` for wire
+    # parity, but no translator row exists here. If a future producer
+    # ever wires one, pair it with a front-end case in
+    # ``gatewayEventHandler.ts`` and update this note — see
+    # ``docs/notes/plans/2026-09-16-resume-askuser-flow-audit.md``
+    # Gap B.
+
+    # ── Session spine EP → gateway (ADR-0194 SSOT) ─────────────────
+
+    @staticmethod
+    def _spine_llm_call_start(e: dict) -> dict | None:
+        # Internal non-streaming calls (memory_extract, summarisation) are
+        # not user-visible LLM steps. Translating them as ``stream_start``
+        # would open an empty assistant row in the chat UI and confuse
+        # the multi-step layout. Only user-turn streaming calls open a row.
+        stream = e.get("stream")
+        if stream is None:
+            stream = _inner_payload(e).get("stream")
+        if stream is False:
+            return None
+        parent = e.get("parentMessageId")
+        assistant: dict[str, Any] = {}
+        if isinstance(parent, str) and parent:
+            assistant["id"] = parent
+        return {
+            "type": "stream_start",
+            "data": {"assistantMessage": assistant},
+        }
+
+    @staticmethod
+    def _spine_llm_call_end(e: dict) -> dict | None:
+        # Match the start filter: non-streaming calls never opened a UI
+        # step, so they must not close one either.
+        stream = e.get("stream")
+        if stream is None:
+            stream = _inner_payload(e).get("stream")
+        if stream is False:
+            return None
+
+        # A failed user-turn streaming LLM call leaves the placeholder
+        # stuck on ``...`` because ``stream_end`` alone does not replace
+        # it. Translate the failure into a gateway ``error`` event so the
+        # ChatItem error badge renders the errno instead.
+        outcome = e.get("outcome")
+        if outcome is None:
+            outcome = _inner_payload(e).get("outcome")
+        if stream is True and isinstance(outcome, str) and outcome in _FAILURE_OUTCOMES:
+            return {
+                "type": "error",
+                "data": {
+                    "type": "AgentRuntimeError",
+                    "message": _user_visible_llm_failure_message(e),
+                },
+            }
+
+        return {"type": "stream_end", "data": {}}
+
+    @staticmethod
+    def _spine_llm_stream_token(e: dict) -> dict | None:
+        payload = _inner_payload(e)
+        delta = str(payload.get("text_delta") or "")
+        if not delta:
+            return None
+        kind = payload.get("channel_kind") or "output"
+        if kind == "reasoning":
+            return {
+                "type": "stream_chunk",
+                "data": {
+                    "chunkType": "reasoning",
+                    "reasoning": delta,
+                    "snapshotMode": "append",
+                },
+            }
+        return {
+            "type": "stream_chunk",
+            "data": {
+                "chunkType": "text",
+                "content": delta,
+                "snapshotMode": "append",
+            },
+        }
+
+    @staticmethod
+    def _spine_llm_tool_call_streaming(e: dict) -> dict | None:
+        """``llm.tool_call.streaming`` → 提前的 ``tools_calling`` 占位。
+
+        在 LLM 生成工具参数期间触发一次，复用 LobeHub 原生 ``stream_chunk``
+        ``tools_calling`` 契约渲染工具卡片；参数留空（仍在生成），完整参数由
+        随后的 ``step.tool_call.record`` 覆盖（前端 ``preserveToolResultMessageIds``
+        按工具 id 合并）。
+        """
+        payload = _inner_payload(e)
+        tool_name = str(payload.get("tool_name") or "")
+        invocation_id = str(payload.get("invocation_id") or "")
+        if not tool_name or not invocation_id:
+            return None
+        return {
+            "type": "stream_chunk",
+            "data": {
+                "chunkType": "tools_calling",
+                "toolsCalling": [wire_tool_call(tool_name, invocation_id, {})],
+            },
+        }
+
+    @staticmethod
+    def _spine_llm_header_assistant(e: dict) -> dict | None:
+        payload = _inner_payload(e)
+        content = str(payload.get("assistant_content") or "")
+        if not content:
+            return None
+        return {
+            "type": "stream_chunk",
+            "data": {
+                "chunkType": "text",
+                "content": content,
+                "snapshotMode": "append",
+            },
+        }
+
+    @staticmethod
+    def _spine_tool_call_record(e: dict) -> dict | None:
+        payload = _inner_payload(e)
+        tool_name = str(payload.get("tool_name") or "")
+        invocation_id = str(payload.get("invocation_id") or payload.get("tool_call_id") or "")
+        if not tool_name or not invocation_id:
+            return None
+        arguments = payload.get("arguments") if isinstance(payload.get("arguments"), dict) else {}
+        tool_calling = wire_tool_call(tool_name, invocation_id, arguments)
+        # Calls observed but not yet authorized (HITL pause) carry the native
+        # intervention marker so LobeHub renders its pending-approval panel
+        # (getPendingInterventions scans tool.intervention.status === 'pending').
+        if payload.get("status") == "pending_approval":
+            tool_calling["intervention"] = {"status": "pending"}
+        stream_chunk_msg = {
+            "type": "stream_chunk",
+            "data": {
+                "chunkType": "tools_calling",
+                "toolsCalling": [tool_calling],
+            },
+        }
+        # `step.tool_call.record` is the gateway-path tool START signal that
+        # survives `SUPPRESSED_SPINE_EPS` (phase.tool.call.start is suppressed
+        # in favour of catalog ToolStarted).
+        return stream_chunk_msg
+
+    @staticmethod
+    def _spine_phase_tool_start(e: dict) -> dict | None:
+        payload = _inner_payload(e)
+        tool_name = str(payload.get("tool_name") or "")
+        invocation_id = str(payload.get("invocation_id") or "")
+        # Without tool identity there is nothing to publish; the legacy
+        # ``emit_*_for_state`` shape carries only ``state_id`` and is
+        # silently dropped. ``SUPPRESSED_SPINE_EPS`` filters these at the
+        # pump today, but the translator must remain defensible on its
+        # own so a future relaxation does not emit a malformed wire.
+        if not tool_name:
+            return None
+        tool_calling = wire_tool_call(tool_name, invocation_id, {})
+        tool_start_msg = {
+            "type": "tool_start",
+            "data": {
+                "parentMessageId": e.get("parentMessageId"),
+                "toolCalling": tool_calling,
+            },
+        }
+        return tool_start_msg
+
+    @staticmethod
+    def _spine_body_tool_end(e: dict) -> dict | None:
+        payload = _inner_payload(e)
+        invocation_id = str(payload.get("invocation_id") or "")
+        tool_name = str(payload.get("tool_name") or "")
+        # Mirror ``_spine_phase_tool_start``: the legacy ``emit_*_for_state``
+        # shape carries only ``state_id`` and has no tool identity to
+        # publish. Returning ``None`` is safe and prevents a fall-through
+        # to ``wire_tool_call("", ...)`` which would emit ``id=""`` /
+        # ``apiName=""`` if ``SUPPRESSED_SPINE_EPS`` is ever relaxed.
+        if not tool_name:
+            return None
+        outcome = str(payload.get("outcome") or "")
+        ok = payload.get("ok")
+        is_success = ok if isinstance(ok, bool) else outcome not in _FAILURE_OUTCOMES
+        tool_calling = wire_tool_call(tool_name, invocation_id, {})
+        # Tool result lands in ``payload["message"]`` as an OpenAI-shaped
+        # ``{role, tool_call_id, content}`` envelope produced by
+        # ``build_tool_surface_data``. The LobeHub gateway handler reads
+        # ``data.result`` to feed the in-memory message row (and the
+        # post-run ``persistAssistantRow`` writes it back to DB); without
+        # ``result.content`` the assistant bubble stays empty after the
+        # tool completes and the LLM never sees its own tool return text,
+        # so it cannot produce a final answer.
+        message = payload.get("message")
+        result_content = ""
+        if isinstance(message, dict):
+            content = message.get("content")
+            if isinstance(content, str):
+                result_content = content
+        result: dict[str, Any] | None = None
+        if result_content:
+            result = {"content": result_content}
+        tool_end_msg = {
+            "type": "tool_end",
+            "data": {
+                "isSuccess": is_success,
+                "executionTime": payload.get("latency_ms"),
+                "result": result,
+                "payload": {
+                    "parentMessageId": e.get("parentMessageId"),
+                    "toolCalling": tool_calling,
+                },
+            },
+        }
+        return tool_end_msg
+
+
+_HANDLERS = {
+    "LlmCallStarted": EventTranslator._llm_call_started,
+    "LlmCallTextDelta": EventTranslator._text_delta_event,
+    "StepTextDelta": EventTranslator._step_text_delta,
+    "ReasoningDelta": EventTranslator._reasoning_delta,
+    "assistant.responded.v1": EventTranslator._assistant_responded,
+    "DecisionMade": EventTranslator._decision_made,
+    "ToolStarted": EventTranslator._tool_started,
+    "ToolInvoked": EventTranslator._tool_invoked,
+    "ToolDenied": EventTranslator._tool_denied,
+    "ReactionAdded": EventTranslator._reaction_added,
+    "StepStart": EventTranslator._step_start,
+    "StepFinished": EventTranslator._step_finished,
+    "SpineClose": EventTranslator._spine_close,
+    "LlmError": EventTranslator._llm_error,
+    "LlmRetry": EventTranslator._llm_retry,
+}
+
+_SPINE_HANDLERS = {
+    "llm.call.start": EventTranslator._spine_llm_call_start,
+    "llm.call.end": EventTranslator._spine_llm_call_end,
+    "llm.stream.token": EventTranslator._spine_llm_stream_token,
+    "llm.tool_call.streaming": EventTranslator._spine_llm_tool_call_streaming,
+    "llm.request.header.assistant": EventTranslator._spine_llm_header_assistant,
+    "step.tool_call.record": EventTranslator._spine_tool_call_record,
+    "phase.tool.call.start": EventTranslator._spine_phase_tool_start,
+    "body.tool.execute.end": EventTranslator._spine_body_tool_end,
+}
+
+
+__all__ = ("EventTranslator", "wire_tool_call")

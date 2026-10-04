@@ -1,0 +1,76 @@
+"""Gateway-owned registration adapter for the legacy cognitive run driver.
+
+The driver binds Gateway run-session and carrier result types, so its registry
+entry belongs to the outer composition root.  It still consumes the LCA
+``run_mode_registry`` seam and exposes the same plugin identity to profiles.
+"""
+
+from __future__ import annotations
+
+from typing import cast
+
+import structlog
+from pydantic import BaseModel, ConfigDict
+
+from lca.contracts.capabilities import RUN_MODE_REGISTRY
+from lca.contracts.mechanisms.capability.capability import require_capability
+from lca.contracts.protocols.session.run.mode import RunModeRegistryProtocol
+from lca.harness.plugin_api import PluginContext, PluginKind, plugin
+from lca.plugins.transport.webserver.carrier.runs.execute.loop_drivers import CognitiveRunDriver
+from lca.plugins.transport.webserver.carrier.runs.lifecycle.runnable_assembly import (
+    CognitiveRunnableAssembler,
+)
+
+_log = structlog.get_logger(__name__)
+
+
+class Config(BaseModel):
+    """Pydantic config for ``lca-loop-cognitive``."""
+
+    model_config = ConfigDict(extra="forbid")
+    target: str = "cognitive"
+
+
+def _cognitive_driver_factory(ctx: object) -> CognitiveRunDriver:
+    """Build the Gateway driver with the Profile's declared mode registry.
+
+    ``lca-loop-cognitive`` declares ``run_mode_registry`` and
+    ``llm_resolver`` as required capabilities. Resolving both here keeps
+    the executable driver aligned with the manifest: a profile that
+    boots cannot silently select compatibility mode adapters through
+    an absent registry, nor invent a resolver from Cordis state.
+    """
+
+    registry = cast("RunModeRegistryProtocol", require_capability(ctx, RUN_MODE_REGISTRY.key))
+    llm_resolver = require_capability(ctx, "llm_resolver")
+    return CognitiveRunDriver(
+        CognitiveRunnableAssembler(mode_registry=registry),
+        llm_resolver=llm_resolver,
+    )
+
+
+@plugin(
+    id="lca-loop-cognitive",
+    Config=Config,
+    requires=[
+        "run_loop_driver_registry",
+        RUN_MODE_REGISTRY.key,
+        "llm_resolver",
+    ],
+    provides=["run_loop_driver_registry[cognitive]"],
+    implements=[],
+    layer="L4",
+    effects="none",
+    description="Register the Gateway-owned cognitive RunLoopDriver adapter.",
+    test_suite="tests/scenario/plugin/test_plugin_tree_single_owner.py",
+    kind=PluginKind.PRIMITIVE,
+)
+async def setup(ctx: PluginContext, config: Config) -> None:
+    """Mount the profile-aware cognitive run driver."""
+
+    registry = ctx.require("run_loop_driver_registry")
+    registry.register(config.target, lambda: _cognitive_driver_factory(ctx))
+    _log.debug("cognitive_run_driver_registered", target=config.target)
+
+
+__all__ = ["Config", "setup"]

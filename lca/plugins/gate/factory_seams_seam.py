@@ -1,0 +1,84 @@
+"""Empty factory / strategy registry seams (ADR-0062 §3 / PR-3)."""
+
+from __future__ import annotations
+
+from typing import Any
+
+from pydantic import BaseModel
+
+from lca.contracts.atoms.control.slot import ControlSlot
+from lca.contracts.atoms.functional.group import FunctionalGroup
+from lca.contracts.atoms.scope.scope import Scope
+from lca.contracts.capabilities import (
+    BODIES,
+    BRAINS,
+    HOOKS,
+    RESUME_INPUT_ADAPTERS,
+    STRATEGIES,
+)
+from lca.contracts.harness.composition.plugin_contract import (
+    ArchitectureContract,
+    AuthorityContract,
+    EvidenceContract,
+    LifecycleContract,
+    PluginContract,
+    PluginIdentity,
+)
+from lca.contracts.mechanisms.factory.registry import FactoryRegistry
+from lca.contracts.protocols.declarative.declarative_2.declarative_plugin import (
+    OwnershipDeclaration,
+)
+from lca.harness.plugin_api import PluginContext, PluginKind, plugin
+
+
+class Config(BaseModel):
+    model_config = {"extra": "forbid"}
+
+
+@plugin(
+    id="lca-factory-seams-default",
+    provides=[
+        BODIES.key,
+        BRAINS.key,
+        HOOKS.key,
+        RESUME_INPUT_ADAPTERS.key,
+        STRATEGIES.key,
+    ],
+    requires=[],
+    layer="L1",
+    kind=PluginKind.PRIMITIVE,
+    effects="none",
+    description=("Empty BODIES/BRAINS/HOOKS/RESUME_INPUT_ADAPTERS/STRATEGIES registry seams."),
+    test_suite="tests/scenario/plugin/test_plugin_alignment.py::test_factory_registry_seams",
+    contract=PluginContract(
+        identity=PluginIdentity(version="v1"),
+        architecture=ArchitectureContract(
+            group=FunctionalGroup.G10_COMPOSITION, control_slots=(ControlSlot.OBSERVE_WILDCARD,)
+        ),
+        lifecycle=LifecycleContract(allowed_scopes=(Scope.RUN,)),
+        authority=AuthorityContract(grants=("plugin.serve",)),
+        observability=EvidenceContract(
+            descriptors=("lca-factory-seams-default.checked", "lca-factory-seams-default.served")
+        ),
+    ),
+    relations=(),
+    ownership=OwnershipDeclaration(
+        reads=("plugin.serve",),
+        emits=("plugin.served",),
+        state_mutation="forbidden",
+    ),
+)
+async def setup(ctx: PluginContext, config: Config) -> None:
+    del config
+    from lca.runtime.support.null_hook_registry import NullHookRegistry
+
+    hooks_registry: FactoryRegistry[Any] = FactoryRegistry("hooks")
+    hooks_registry.register("simple", NullHookRegistry)
+    ctx.provide(BODIES.key, FactoryRegistry("bodies"))
+    ctx.provide(BRAINS.key, FactoryRegistry("brains"))
+    ctx.provide(HOOKS.key, hooks_registry)
+    ctx.provide(
+        RESUME_INPUT_ADAPTERS.key,
+        FactoryRegistry("resume_input_adapters"),
+    )
+    ctx.provide(STRATEGIES.key, FactoryRegistry("team_strategies"))

@@ -1,0 +1,115 @@
+"""DecisionClassifier Provider plugin — Tier-2."""
+
+from __future__ import annotations
+
+from pydantic import BaseModel
+
+from lca.cognition.brain.llm_turn.response_projection import project_llm_response
+from lca.contracts.atoms.control.slot import ControlSlot
+from lca.contracts.atoms.enums.enums import ActionType
+from lca.contracts.atoms.functional.group import FunctionalGroup
+from lca.contracts.atoms.ids.ids import new_id
+from lca.contracts.atoms.scope.scope import Scope
+from lca.contracts.harness.composition.plugin_contract import (
+    ArchitectureContract,
+    AuthorityContract,
+    EvidenceContract,
+    LifecycleContract,
+    PluginContract,
+    PluginIdentity,
+)
+from lca.contracts.models.core.conversation.llm import LLMResponse
+from lca.contracts.models.core.execution.decision import Decision
+from lca.contracts.protocols.declarative.declarative_2.declarative_plugin import (
+    OwnershipDeclaration,
+)
+from lca.contracts.protocols.gate.decision_classifier import DecisionClassifier
+from lca.harness.plugin_api import PluginContext, PluginKind, plugin
+from lca.infrastructure.runtime_plane.access.classify import decision_needs_approval
+
+_PARSE_FAILURE_USER_MESSAGE = "抱歉，模型未返回有效决策，请重试。"
+
+
+class Config(BaseModel):
+    model_config = {"extra": "forbid"}
+
+
+class DefaultDecisionClassifier(DecisionClassifier):
+    """Default DecisionClassifier implementation.
+
+    Migrated from lca/cognition/brain/llm_result.py:build_decision_from_response().
+    Maps native function-calling output to LCA Decision (LobeHub tool wire parity).
+    """
+
+    def classify(self, response: LLMResponse) -> Decision:
+        """Map native function-calling output to LCA Decision (LobeHub tool wire parity)."""
+        projected = project_llm_response(response)
+        if projected.delegations:
+            return Decision(
+                decision_id=new_id("dec"),
+                action_type=ActionType.DELEGATE.value,
+                rationale="",
+                confidence=1.0,
+                delegations=list(projected.delegations),
+            )
+        if projected.tool_calls:
+            return Decision(
+                decision_id=new_id("dec"),
+                action_type=ActionType.USE_TOOL.value,
+                rationale="",
+                confidence=1.0,
+                tool_calls=list(projected.tool_calls),
+                needs_approval=decision_needs_approval(projected.tool_calls),
+            )
+        if projected.intent:
+            return Decision(
+                decision_id=new_id("dec"),
+                action_type=ActionType.RESPOND.value,
+                rationale="",
+                confidence=1.0,
+                response_text=projected.intent,
+            )
+        return Decision(
+            decision_id=new_id("dec"),
+            action_type=ActionType.RESPOND.value,
+            rationale="模型返回空响应",
+            confidence=0.0,
+            response_text=_PARSE_FAILURE_USER_MESSAGE,
+        )
+
+
+@plugin(
+    id="lca-decision-classifier-provider",
+    provides=["decision_classifier"],
+    implements=[DecisionClassifier],
+    layer="L1",
+    effects="none",
+    description="Provide the default DecisionClassifier implementation.",
+    test_suite="tests/scenario/plugin/test_plugin_alignment.py",
+    kind=PluginKind.PROVIDER,
+    contract=PluginContract(
+        identity=PluginIdentity(version="v1"),
+        architecture=ArchitectureContract(
+            group=FunctionalGroup.G10_COMPOSITION, control_slots=(ControlSlot.OBSERVE_WILDCARD,)
+        ),
+        lifecycle=LifecycleContract(allowed_scopes=(Scope.RUN,)),
+        authority=AuthorityContract(grants=("plugin.serve",)),
+        observability=EvidenceContract(
+            descriptors=(
+                "lca-decision-classifier-provider.checked",
+                "lca-decision-classifier-provider.served",
+            )
+        ),
+    ),
+    relations=(),
+    ownership=OwnershipDeclaration(
+        reads=("decision_classifier",),
+        emits=("decision_classifier.checked",),
+        state_mutation="forbidden",
+    ),
+)
+async def setup(ctx: PluginContext, config: Config) -> None:
+    ctx.provide("decision_classifier", DefaultDecisionClassifier())
+
+
+__all__ = ["DefaultDecisionClassifier", "setup"]

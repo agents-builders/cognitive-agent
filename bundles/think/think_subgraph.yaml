@@ -1,0 +1,258 @@
+# bundles/think.yaml — think 子图纯图描述(精简)
+# ADR-0217 Bundle Graph Schema v2。
+#
+# D4 typed-port cutover: edge predicates use typed :class:`Predicate`
+# dicts. The legacy string-DSL edge conditions are gone.
+#
+# PR-B (typed-port cutover): ``think.llm.dispatch`` is split into
+# ``llm.invoke`` (adapter call) + ``llm.persist`` (writer
+# append), and ``think.context.compact`` is split into
+# ``think.budget.gate`` (typed budget gate) + ``think.context.summarize``
+# (sediment-before-compact + structured summary, ADR-0283). Each new node
+# owns exactly one responsibility; routing decisions live in gate, journal
+# writes live in persist, sediment+summary lives in summarize.
+# ``think.context.truncate`` is retired from this plan (its plugin module
+# remains registered; summarize fail-closes to ``truncate_oldest``
+# internally and owns the ``-> think.route`` continuation edge).
+
+id: think.subgraph
+region: think
+purpose: think 11 节点执行 — shortcut → route.decide → budget.gate → context.summarize → route → reason → history.assemble → llm.invoke → llm.persist → decision.parse → gate
+
+nodes:
+  - id: think.shortcut
+    factory: think.shortcut
+    inputs: [in_assembled_manifest]
+    outputs: [decision]
+    entry: true
+    config:
+
+  - id: think.route.decide
+    factory: think.route.decide
+    inputs: [decision]
+    outputs: [routing]
+    config:
+
+  # PR-B typed-port rewrite: budget gate sits between
+  # ``think.route.decide`` and the miss-path reasoning chain. Reads
+  # the typed ``budget`` port (no more ``context.runtime.state`` theft)
+  # and either stops the run (subgraph terminates here,
+  # ``routing.should_terminate=true`` bubbles up to
+  # ``phase.main.outer`` which routes ``think.main`` →
+  # ``terminal.commit``) or continues to ``think.context.summarize``.
+  #
+  # Not marked ``terminal: true``: this node has one conditional
+  # outgoing edge (→ think.context.summarize on should_terminate=false)
+  # and the lift-time validator forbids outgoing edges on terminal
+  # nodes. Termination is edge-driven per ADR-0217 D4 — when the
+  # executor emits ``should_terminate=true`` the only edge's predicate
+  # does not match, ``select_edge`` returns ``None``, and
+  # ``traversal.advance(edge=None)`` terminates the plan. The
+  # think.subgraph terminates cleanly via ``think.gate`` on the
+  # normal path (also edge-driven via no outgoing edges).
+  #
+  # Honors ADR-0225 (no per-node max_visits).
+  - id: think.budget.gate
+    factory: think.budget.gate
+    outputs: [routing, decision]
+    config:
+
+  # PR-B typed-port rewrite: truncation node now takes the typed
+  # ADR-0283: sediment-before-compact + structured summary. Fail-closed:
+  # when the sediment pass cannot run or persist, the node degrades to
+  # ``truncate_oldest`` internally (receipt honestly labeled). Like the
+  # retired ``think.context.truncate``, this node emits no routing port
+  # and always advances to ``think.route`` (edge below).
+  - id: think.context.summarize
+    factory: think.context.summarize
+    outputs: [compact_receipt]
+    config:
+
+  - id: think.route
+    factory: think.route
+    config:
+
+  - id: think.reason
+    factory: think.reason
+    inputs: [in_assembled_manifest]
+    # PR-3.8.borrow-tools-wire: ``forked_tools`` now exposed on the
+    # subgraph surface so think.history.assemble can read it as a typed
+    # boundary input (spec §E). Previously hidden inside the inner plan.
+    # ``turn_render`` is the inner plan's own port name (think.reason.render
+    # → plan_sdk port catalog); the surface used to declare ``response``,
+    # which no node produces, so the render never reached history.assemble.
+    outputs: [turn_render, forked_tools]
+    config:
+      sub_spec_ref:
+        plan_ref: bundles/think_reason.yaml
+        entry_node: think.reason.fork_tools
+        binding_edge: think.reason
+      emit_on_enter: []
+      emit_on_exit:  []
+
+  - id: think.history.assemble
+    factory: think.history.assemble.ref
+    inputs: [turn_render, state, forked_tools]
+    outputs: [model_visible_request]
+    config:
+      emit_on_enter: []
+      emit_on_exit:  []
+      # Spec §D: think.history.assemble runs immediately before llm.dispatch;
+      # it projects ModelVisibleRequest from RunSessionWriter with orphan-drop
+      # applied. T3 wires llm.invoke + think.decision.parse after it.
+      sub_spec_ref:
+        plan_ref: bundles/concept/history_assemble.yaml
+        entry_node: history.derive
+        binding_edge: think.history.assemble
+
+  - id: llm.invoke
+    factory: llm.invoke
+    inputs: [model_visible_request]
+    outputs: [llm_response, usage]
+    config:
+      # PR-B: typed-port typed-only node. Drives the LLM adapter once
+      # per think turn and forwards (LLMResponse, TokenUsage). Does
+      # NOT write the journal — that lives in the sibling persist
+      # node (spec §C persist-before-execute split).
+      emit_on_enter: []
+      emit_on_exit:  []
+
+  - id: llm.persist
+    factory: llm.persist
+    inputs: [llm_response]
+    outputs: [journaled]
+    config:
+      # PR-B: typed-port journal side-effect node. Persists the
+      # assistant row + tool_calls to RunSessionWriter and emits a
+      # ``journaled`` boolean. Does NOT call the adapter — that
+      # path lives in the sibling invoke node.
+      emit_on_enter: []
+      emit_on_exit:  []
+
+  - id: think.decision.parse
+    factory: think.decision.parse.ref
+    inputs: [state, llm_response]
+    outputs: [decision]
+    config:
+      emit_on_enter: []
+      emit_on_exit:  []
+      # Spec §E: think.decision.parse is the third single-responsibility
+      # node; it projects LLMResponse into a typed Decision. Its
+      # terminal_predicate routes action_type ∈ {respond, ask_user}
+      # to the outer graph.
+      sub_spec_ref:
+        plan_ref: bundles/concept/decision_parse.yaml
+        entry_node: decision.parse
+        binding_edge: think.decision.parse
+
+  # PR-3.8.3: typed-boundary repair node between decision.parse
+  # and think.gate. Reads the parsed Decision + the per-run tools
+  # registry (via context.runtime) and emits either the original
+  # Decision (well-formed / irreparable) or the repaired Decision
+  # (truncated JSON successfully repaired). The accompanying
+  # RoutingDecision's reason gates downstream routing: decision_ok
+  # and decision_repaired forward to think.gate;
+  # decision_rejected_{schema,truncated} re-route to
+  # think.route.decide for a full re-reason.
+  - id: think.decision.repair
+    factory: think.decision.repair
+    inputs: [decision]
+    outputs: [decision, routing]
+    config:
+
+  - id: think.gate
+    factory: think.gate.ref
+    inputs: [decision]
+    outputs: [decision, routing]
+    terminal: true
+    config:
+      emit_on_enter: []
+      emit_on_exit:  [think.gate.end]
+      # ADR-0220 P6: think.gate 改为 sub_spec_ref delegate 到
+      # concept.decision.enforce (P5 落地的 2 节点 gate chain + reject
+      # stamp)。typed decision port 由上游 think.decision.parse 经 close-out
+      # 投影转发,inner 图第一节点 gate.chain.run 直接消费。state port
+      # 缺失时 gate chain run 走 no-op(decision 不被 enforce),保证 think
+      # 路径不依赖 AgentState 透传。
+      sub_spec_ref:
+        plan_ref: bundles/concept/decision_enforce.yaml
+        entry_node: gate.chain.run
+        binding_edge: think.gate
+
+edges:
+  # shortcut → route.decide → {budget.gate → context.truncate, gate}: think.route.decide
+  # 读 decision 端口并 emit RoutingDecision typed port,next_node 决定下游图
+  # 节点。miss-path (routing.next_node == "think.route") 改道先经
+  # budget.gate, 由 budget.gate 决定继续到 think.context.truncate
+  # 还是 terminal.commit (should_terminate)。
+  # short-circuit path 不变。
+  - from: think.shortcut
+    to: think.route.decide
+  - from: think.route.decide
+    to: think.budget.gate
+    when:
+      kind: eq
+      port: { name: routing, field: next_node }
+      value: think.route
+  - from: think.budget.gate
+    to: think.context.summarize
+    when:
+      kind: eq
+      port: { name: routing, field: should_terminate }
+      value: false
+  # When ``routing.should_terminate=true`` no outgoing edge from
+  # ``think.budget.gate`` matches; the subgraph terminates naturally
+  # via ``traversal.advance(edge=None)``. The outer ``phase.main.outer``
+  # reads the bubbled ``routing`` port from ``think.main`` and routes
+  # to ``terminal.commit``. We deliberately do NOT wire to
+  # ``terminal.commit`` here — that node is declared in
+  # ``bundles/outer/phase_main.yaml``, not in this subgraph, and a
+  # cross-subgraph edge fails the ``Plan._one_entry`` validator
+  # (``terminal.commit`` is unknown in the inner node set).
+  # ADR-0283: context.summarize emits no routing port; it always
+  # advances to think.route after emitting its receipt (the budget
+  # gate already routed the should-terminate case). This replaces the
+  # PR-B ``think.context.truncate -> think.route`` edge; truncate is
+  # retired from this plan.
+  - from: think.context.summarize
+    to: think.route
+  - from: think.route.decide
+    to: think.gate
+    when:
+      kind: eq
+      port: { name: routing, field: next_node }
+      value: think.gate
+
+  # route → reason → history.assemble → llm.invoke → llm.persist → decision.parse → gate
+  - from: think.route
+    to: think.reason
+  - from: think.reason
+    to: think.history.assemble
+  - from: think.history.assemble
+    to: llm.invoke
+  - from: llm.invoke
+    to: llm.persist
+  - from: llm.persist
+    to: think.decision.parse
+  - from: think.decision.parse
+    to: think.decision.repair
+  # PR-3.8.3: decision.repair routes to think.gate when the
+  # Decision is well-formed or successfully repaired; rejects
+  # re-route to think.route.decide so Gate never sees a malformed
+  # payload (ADR-0047 wire-block split: schema repair here,
+  # wire-level blocking in Body).
+  - from: think.decision.repair
+    to: think.gate
+    when:
+      kind: in
+      port: { name: routing, field: next_hint }
+      value: [decision_ok, decision_repaired]
+  - from: think.decision.repair
+    to: think.route.decide
+    when:
+      kind: in
+      port: { name: routing, field: next_hint }
+      value: [decision_rejected_schema, decision_rejected_truncated]
+
+# terminal: think.gate 直接回 outer graph(binding_edge=think.main),
+#           无需显式返回边。

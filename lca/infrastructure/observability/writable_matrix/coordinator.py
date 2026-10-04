@@ -1,0 +1,157 @@
+"""StepCoordinator —— Agent 唯一可见的写 API（ADR-0167 D2 / D11）。
+
+Agent / Brain / Body / Perceive 只与 ``StepCoordinator`` 交互。
+``StepCoordinator`` 持有 ``WritableFaceRegistry``，把每次「意图」
+转换为五面矩阵上的链式调用：Emitter → Driver → Coalescer → Serializer
+→ Storage。
+
+链上每节都可独立替换（I-PLUG3）；Coordinator 自身永不 import 任何具体
+实现，永远通过 Protocol + registry 解引用（I-PLUG1）。
+
+禁止（ADR-0167 D13 设计尊严）：
+- 缓存默认值 / 未配置就抛错的伪防御
+- 重复 emit 同一事实（D9 I-PLUG3）；上游 deriver 仅订阅一次
+- 「过渡期两边同时写」层——全部在 PR-3 一次性切
+
+ADR-0194 P2-09: ``record_*`` / ``emit_phase`` / ``emit`` stub 已删除;
+spine EP 唯一走 ``LoopCursor`` WritePort (``cursor.advance`` / ``record_*``)。
+"""
+
+from __future__ import annotations
+
+from contextvars import ContextVar
+from dataclasses import dataclass
+from typing import Any, cast
+
+from lca.infrastructure.observability.writable_matrix.registry import (
+    MissingWritableFaceError,
+    WritableFaceRegistry,
+)
+
+_current: ContextVar[StepCoordinator | None] = ContextVar("lca_writable_coordinator", default=None)
+
+
+def get_current_coordinator() -> StepCoordinator | None:
+    """运行时取当前协程/任务绑定的 Coordinator。
+
+    未注入返回 ``None`` —— 调用方应让 Agent 显式持有一个 coordinator，
+    而不是依赖 ContextVar 隐藏的全局状态（ADR-0167 D13 / B10 反对
+    「隐式全局副作用」）。
+    """
+    return _current.get()
+
+
+def bind_current_coordinator(coord: StepCoordinator) -> Any:
+    """绑定 coordinator；返回 reset token，由调用方在 finally 释放。"""
+    return _current.set(coord)
+
+
+def reset_current_coordinator(token: Any) -> None:
+    _current.reset(token)
+
+
+@dataclass
+class StepCoordinator:
+    """唯一写入口。Agent 调 driver/segment 状态; spine EP 由 cursor 派生。
+
+    ADR-0167 D11: ``bind_run`` 设置 run 身份 + 元数据; 业务侧只在
+    bind 之后才能 begin_step / begin_segment。
+    """
+
+    registry: WritableFaceRegistry
+    run_id: str = "default-run"
+    trace_id: str = ""
+    metadata: Any = None  # JournalMetadata
+    started_at: float | None = None
+    _current_step: str | None = None
+    _current_segment: str | None = None
+
+    def bind_run(
+        self,
+        *,
+        run_id: str,
+        trace_id: str,
+        metadata: Any,
+        started_at: float | None = None,
+    ) -> None:
+        """绑定 run 身份。bind 不发 EP(state 已就位; 与旧 StepLifecycleStore 一致)。"""
+        self.run_id = run_id
+        self.trace_id = trace_id
+        self.metadata = metadata
+        self.started_at = started_at
+
+    # ── 切步 / 切段 ────────────────────────────────────────────────
+
+    def begin_step(self, phase: str, **ctx: Any) -> str:
+        """SSOT 收口后,begin_step 仅保留 driver 派生 step_id 的内部状态。
+
+        不再写任何 step 边界 EP —— 该显式边界由 hook
+        ``ModelVisibleHook.capture_pre_llm`` 通过
+        ``spine.llm.request.header`` 唯一发射(单生产者)。
+        业务路径必须走 hook,不要直接调用本方法。
+        """
+        if self._current_step is not None:
+            raise RuntimeError(f"begin_step while step {self._current_step!r} still open")
+        driver = self.registry.require("driver")
+        step_id = driver.begin_step(phase, **ctx)
+        self._current_step = step_id
+        return cast("str", step_id)
+
+    def end_step(
+        self,
+        outcome: str = "success",
+        *,
+        error: str | None = None,
+    ) -> None:
+        """仅做 driver.end_step 状态收尾,不再写任何 step 边界 EP。
+
+        该显式边界由 cursor 发射:``advance('stop')`` 与 ``close``
+        (ADR-0184 D6)。
+        """
+        if self._current_step is None:
+            raise RuntimeError("end_step while no step open")
+        driver = self.registry.require("driver")
+        step_id = self._current_step
+        driver.end_step(step_id, outcome)
+        self._current_step = None
+
+    def begin_segment(self, kind: str) -> str:
+        """仅做 driver.begin_segment 状态派生,不再写 ``writable.segment.start`` EP。
+
+        EP 由 cursor 派生(ADR-0169)。
+        """
+        if self._current_step is None:
+            raise RuntimeError("begin_segment while no step open")
+        driver = self.registry.require("driver")
+        segment_id = driver.begin_segment(self._current_step, kind)
+        self._current_segment = segment_id
+        return cast("str", segment_id)
+
+    def end_segment(self, outcome: str = "success") -> None:
+        """仅做 driver.end_segment 状态收尾,不再写 EP。"""
+        if self._current_segment is None:
+            raise RuntimeError("end_segment while no segment open")
+        driver = self.registry.require("driver")
+        seg_id = self._current_segment
+        driver.end_segment(seg_id, outcome)
+        self._current_segment = None
+
+    # ── context manager 便利 ─────────────────────────────────────
+
+    def __enter__(self) -> StepCoordinator:
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        if self._current_segment is not None:
+            self.end_segment("cancelled")
+        if self._current_step is not None:
+            self.end_step("cancelled")
+
+
+__all__ = [
+    "MissingWritableFaceError",
+    "StepCoordinator",
+    "bind_current_coordinator",
+    "get_current_coordinator",
+    "reset_current_coordinator",
+]

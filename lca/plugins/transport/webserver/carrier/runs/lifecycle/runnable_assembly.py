@@ -1,0 +1,310 @@
+"""Materialize generic run inputs and delegate to one adapter resolver.
+
+The carrier resolves the profile-selected LLM and tools, then passes one
+:class:`RunnableBuildRequest` to the profile-selected mode adapter.  This
+generic module contains no mode fallback policy or mode implementation
+knowledge.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Protocol, cast
+
+from lca.application.api.api import Agent, Team
+from lca.contracts.capabilities import ASSISTANT_CATALOG, ASSISTANT_PROFILE_BACKFILL
+from lca.contracts.mechanisms.capability.capability import (
+    MissingCapabilityError,
+    provider_current,
+    require_capability,
+)
+from lca.contracts.models.assistant.spec import AssistantSpec
+from lca.contracts.models.core.state.plane import PlaneBindings
+from lca.contracts.models.team.role.team import RoleProfile, ToolPermissionManifest
+from lca.contracts.protocols import LLMAdapter
+from lca.contracts.protocols.runtime.infra.infra import MachineResolver, Tool
+from lca.contracts.protocols.session.run.mode import RunModeRegistryProtocol
+from lca.infrastructure.llm_adapter.model_override import ModelOverridingLLMAdapter
+from lca.infrastructure.observability import BoundObservability
+from lca.plugins.transport.webserver.handlers.runs.session.session.session import RunSession
+
+if TYPE_CHECKING:
+    from cordis import Context
+
+
+class LlmResolver(Protocol):
+    """Resolve the concrete LLM implementation selected by the booted profile."""
+
+    def resolve(self) -> LLMAdapter: ...
+
+
+@dataclass(frozen=True, slots=True)
+class RunnableAssemblyRequest:
+    """All run-scoped inputs needed to select and prepare a mode adapter."""
+
+    session: RunSession
+    question: str
+    mode: str
+    observability: BoundObservability
+    bindings: PlaneBindings | None
+    scope: Context | None
+    llm_resolver: LlmResolver
+    machine_resolver: MachineResolver | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RunnableBuildRequest:
+    """Adapter input after profile-backed dependencies are materialized."""
+
+    assembly: RunnableAssemblyRequest
+    llm: LLMAdapter
+    tools: tuple[Tool, ...]
+    role_profile: RoleProfile | None = None
+    """Assistant Home persona (ADR-0242 D3); None when no assistant_id."""
+    assistant_home_path: str | None = None
+    """Assistant Home 绝对路径 (ADR-0242 D4/D5); None when no assistant_id."""
+    assistant_runtime: dict[str, object] = field(default_factory=dict)
+    """``profile.json.runtime`` 运行参数覆盖 (ADR-0242 D9); 空 dict = 默认值。"""
+    profile_backfill: object | None = None
+    """ADR-0246 PR-5: ``(assistant_id, records) -> None`` 异步回调，身份/偏好
+    落盘后触发 USER.md 回填；None = 未装配（fail-soft，USER.md 保持模板）。"""
+
+
+class CognitiveRunnableAssembler:
+    """Materialize shared run inputs and delegate through ``run_mode_registry``.
+
+    The existing registry protocol is the real mode-selection seam: profiles
+    can replace any ``ModeAdapter`` without changing this generic assembler.
+    Keeping a second resolver protocol and a registry-to-adapter wrapper here
+    only duplicated that contract and obscured the selected adapter's interface.
+    """
+
+    def __init__(self, *, mode_registry: RunModeRegistryProtocol) -> None:
+        self._mode_registry = mode_registry
+
+    async def assemble(self, request: RunnableAssemblyRequest) -> Agent | Team:
+        """Materialize common dependencies and delegate to the selected adapter."""
+        assistant_id = str(getattr(request.session, "assistant_id", "") or "").strip()
+        # Resolve the Home spec once; the persona, the tool set, and the
+        # per-assistant model all read the same Home (ADR-0242 D3/D4/D9).
+        spec = _assistant_spec_for_run(request.scope, assistant_id)
+        home_path = spec.home_path if spec is not None else None
+
+        llm = request.llm_resolver.resolve()
+        if spec is not None and spec.profile_model:
+            # I-B9: 模型选择是 Home 数据;boot resolver 只提供默认值。
+            llm = ModelOverridingLLMAdapter(inner=llm, model=spec.profile_model)
+
+        prepared = RunnableBuildRequest(
+            assembly=request,
+            llm=llm,
+            tools=tools_from_scope(
+                request.scope,
+                request.bindings,
+                machine_resolver=request.machine_resolver,
+                assistant_id=assistant_id,
+                home_path=home_path,
+                # ADR-0248：共享 execution_environment 创建的 gate/审查配置，
+                # 让 send_message 在组合期进入 body 可执行注册表。
+                vocal_mode=str(getattr(request.session, "vocal_mode", "direct") or "direct"),
+                vocal_gate=getattr(request.session, "vocal_gate", None),
+                auto_review_mode=str(getattr(request.session, "auto_review_mode", "off") or "off"),
+                auto_review_gate=getattr(request.session, "auto_review_gate", None),
+            ),
+            role_profile=_role_profile_for_assistant(
+                request.scope, assistant_id, home_path=home_path
+            ),
+            assistant_home_path=home_path,
+            assistant_runtime=dict(spec.profile_runtime) if spec is not None else {},
+            profile_backfill=_profile_backfill_for_run(request.scope),
+        )
+        adapter = self._mode_registry.resolve(request.mode)
+        return cast("Agent | Team", await adapter.build(prepared))
+
+
+def _assistant_spec_for_run(scope: Context | None, assistant_id: str) -> AssistantSpec | None:
+    """Resolve an assistant's Home spec through the catalog (ADR-0242 D4/D9).
+
+    A non-empty ``assistant_id`` must resolve through the assistant catalog;
+    a missing catalog is a run-assembly error rather than a silent policy
+    drop. ``POST /runs`` already validates the binding, so this is defensive.
+    Returns ``None`` when ``assistant_id`` is empty (I-B8 no-assistant path).
+    """
+    if not assistant_id:
+        return None
+    try:
+        catalog = require_capability(scope, ASSISTANT_CATALOG.key)
+    except MissingCapabilityError as exc:
+        raise RuntimeError(
+            "assistant_id is set but the assistant.catalog capability is missing; "
+            "cannot resolve the assistant Home"
+        ) from exc
+    return catalog.get(assistant_id)
+
+
+def _role_profile_for_assistant(
+    scope: Context | None,
+    assistant_id: str,
+    *,
+    home_path: str | None = None,
+) -> RoleProfile | None:
+    """Resolve an assistant's Home persona into a ``RoleProfile`` (ADR-0242 D3).
+
+    A non-empty ``assistant_id`` must resolve through the assistant catalog;
+    a missing catalog is a run-assembly error rather than a silent persona
+    drop. ``POST /runs`` already validates the binding, so this is defensive.
+    """
+    if not assistant_id:
+        return None
+    if home_path is None:
+        spec = _assistant_spec_for_run(scope, assistant_id)
+        if spec is None:
+            raise RuntimeError(
+                "assistant_id is set but no assistant catalog entry found; "
+                "cannot resolve the assistant Home"
+            )
+        home_path = spec.home_path
+    from lca.plugins.assistant.persona.persona import persona_from_home
+
+    persona = persona_from_home(home_path)
+    return RoleProfile(
+        role=persona.role,
+        goal=persona.goal,
+        backstory=persona.backstory,
+        tool_permission_manifest=ToolPermissionManifest(allowed_tools=[]),
+        extra={
+            "assistant_id": assistant_id,
+            "assistant_home_path": home_path or "",
+        },
+    )
+
+
+def _profile_backfill_for_run(scope: Context | None) -> object | None:
+    """Resolve the USER.md backfill callback from the booted scope.
+
+    Returns an async ``(assistant_id, records) -> None`` callback backed by
+    the ``assistant.profile.backfill`` capability. Returns ``None`` when the
+    scope is absent or the capability is missing, so non-assistant profiles
+    keep the historical no-backfill behavior (fail-soft).
+    """
+    if scope is None:
+        return None
+    try:
+        service = require_capability(scope, ASSISTANT_PROFILE_BACKFILL.key)
+    except (MissingCapabilityError, TypeError, ValueError):
+        return None
+    backfill = getattr(service, "backfill_from_records", None)
+    if not callable(backfill):
+        return None
+
+    async def _backfill(assistant_id: str, records: object) -> None:
+        backfill(assistant_id, records)
+
+    return _backfill
+
+
+def tools_from_scope(
+    scope: Context | None,
+    bindings: PlaneBindings | None,
+    *,
+    machine_resolver: MachineResolver | None = None,
+    assistant_id: str = "",
+    home_path: str | None = None,
+    vocal_mode: str = "direct",
+    vocal_gate: object | None = None,
+    auto_review_mode: str = "off",
+    auto_review_gate: object | None = None,
+) -> tuple[Tool, ...]:
+    """Materialize tools from the booted tools seam; missing seams fail loudly.
+
+    With a non-empty ``assistant_id`` the materialized set is narrowed by the
+    assistant Home's ``tools.yaml`` / ``grants.yaml`` (ADR-0242 D4 / I-B3);
+    the legacy no-assistant path returns the full set unchanged (I-B8).
+
+    ADR-0248: gated 模式经 ``send_message`` 工具工厂物化出声带工具（进入 body
+    可执行注册表）；``auto_review_mode != "off"`` 时所有工具包 AutoReview 硬闸。
+    """
+
+    if scope is None:
+        return ()
+    from lca.infrastructure.runtime_plane.capability_bindings import (
+        BindingsViewBuilder,
+    )
+    from lca.infrastructure.skills.assistant.resolver import resolve_skill_store
+
+    # ``materialize`` consumes a typed ``BindingsView``; the dict form it
+    # used to receive was silently downgraded to ``BindingsView()`` inside
+    # the g2a factory, so the onlyboxes sandbox (and any other plane-bound
+    # capability) never reached the LLM. Wrap the live seam refs first.
+    view = BindingsViewBuilder(
+        file_store=provider_current(require_capability(scope, "file_store")),
+        bindings=bindings,
+        sandbox=provider_current(require_capability(scope, "sandbox")),
+        search=require_capability(scope, "search"),
+        skill_store=resolve_skill_store(scope, assistant_id),
+        machine_resolver=machine_resolver,
+        assistant_id=assistant_id.strip(),
+        home_path=home_path,
+        vocal_mode=vocal_mode,
+        vocal_gate=vocal_gate,
+        auto_review_mode=auto_review_mode,
+        auto_review_gate=auto_review_gate,
+    ).build()
+    tools = tuple(require_capability(scope, "tools").materialize(view))
+    # ADR-0248：AutoReview 硬闸在组合期包装，确保 body 执行时真的过闸。
+    if auto_review_mode != "off" and auto_review_gate is not None:
+        from typing import cast
+
+        from lca.infrastructure.auto_review.gate import AutoReviewGate
+        from lca.infrastructure.auto_review.wrapped_tool import AutoReviewWrappedTool
+
+        tools = tuple(
+            AutoReviewWrappedTool(tool, cast("AutoReviewGate", auto_review_gate)) for tool in tools
+        )
+    assistant_id = assistant_id.strip()
+    if not assistant_id:
+        return tools
+    if home_path is None:
+        spec = _assistant_spec_for_run(scope, assistant_id)
+        if spec is None:
+            raise RuntimeError(
+                "assistant_id is set but no assistant catalog entry found; "
+                "cannot resolve the assistant Home"
+            )
+        home_path = spec.home_path
+    from lca.infrastructure.tools.assistant.filter import filter_tools_by_assistant
+
+    filtered = filter_tools_by_assistant(tools, home_path)
+    if home_path:
+        from pathlib import Path
+
+        from lca.infrastructure.preset.discovery import AssistantPresetDiscovery
+        from lca.infrastructure.tools.assistant.filter import (
+            _load_tools_policy,
+            _tool_matching_names,
+        )
+
+        policy = _load_tools_policy(Path(home_path))
+        deny = policy[1] if policy is not None else frozenset()
+
+        discovery = AssistantPresetDiscovery(home_path)
+        discovered_tools = discovery.discover_tools()
+        if discovered_tools:
+            existing_names = {t.name for t in filtered}
+            kept_discovered = [
+                t
+                for t in discovered_tools
+                if t.name not in existing_names and not bool(_tool_matching_names(t) & deny)
+            ]
+            filtered = (*filtered, *kept_discovered)
+
+    return filtered
+
+
+__all__ = [
+    "CognitiveRunnableAssembler",
+    "LlmResolver",
+    "RunnableAssemblyRequest",
+    "RunnableBuildRequest",
+    "tools_from_scope",
+]

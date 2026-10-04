@@ -1,0 +1,98 @@
+# Run Layout — ADR-0065 §七 + ADR-0167
+
+## 目录布局（目标态）
+
+```text
+traces/
+└── runs/<unguessable_run_id>/          # run_id 即目录名 (ULID)
+    ├── events.jsonl                    # EventSpine SSOT（执行点账本）
+    ├── journal.json                    # 物化视图 lca.journal/3.1（step 故事）
+    ├── journal.narrative.md            # 人读轨迹（deriver）
+    ├── manifest.json                   # RunManifest（封印 / 高水位 / 完整性）
+    ├── profile_snapshot.json           # boot 组合快照
+    ├── <digest>.json                   # I10 spine offload sidecar：>4 KB 的 event 全文;**traceback 多数在此不在 events.jsonl**
+    ├── model_visible/                  # 模型所见正文（按 step）
+    │   └── step_001/
+    │       ├── request-header.json
+    │       ├── system-prompt.md
+    │       ├── tool-schemas.json
+    │       ├── context-manifest.json   # 含 skill_catalog 等
+    │       └── messages.json           # 实际送入 LLM 的 messages
+    ├── evidence/                       # 内容寻址大对象
+    │   ├── sha256-<digest>.txt
+    │   └── sha256-<digest>.json
+    └── materializations/<generator-id>/<generator-version>/
+        ├── summary.md
+        ├── cost.json
+        └── decision-tree.md
+```
+
+可选遗留（非新 run 主路径）：`journal.raw.jsonl`（旧 stream 兼容）。
+
+## 文件分工（读轨迹时按这个找）
+
+| 你想知道 | 打开 |
+|---|---|
+| 发生了哪些执行点、耗时、错误链 | `events.jsonl`(**完整 traceback 不一定在里面;见 `<digest>.json`**) |
+| 第几步想了什么、调了哪些工具（故事） | `journal.json` / `journal.narrative.md` |
+| **完整 traceback / 完整 source_location / 完整 call_frames** | **首选** `<digest>.json`(I10 sidecar;多数情况 1 个文件 = 完整失败诊断);`journal logs -v` 会自动展开它 |
+| **当时模型完整看见了什么**（prompt / tools / skills） | `model_visible/step_NN/` |
+| 大段工具输出 / 附件正文 | `evidence/`(content-addressed namespace, **和上面 `<digest>.json` 是不同的**) |
+| Profile 装了谁 | `profile_snapshot.json` |
+
+原则（ADR-0167）：**Model-visible ≡ logged**；journal 持 digest + 相对路径，不把整段 prompt 塞进 `objective`。
+
+## 谁写什么 (ADR-0167.1 D1–D3)
+
+| 文件 | 写者 | 触发 |
+|---|---|---|
+| `events.jsonl` | `RoutingFileSink` (registry 的 storage face) | 每个 spine EP |
+| `journal.json` | `StepTreeFoldDeriver.flush()` (ADR-0212 §9) | transport 在 terminalize 时调 (run 末尾) |
+| `journal.narrative.md` | `StepNarrativeWriter` 由 `_StepTreeBundle.flush()` 触发 | run 末尾 |
+| `manifest.json` | `record_terminal_materialization()` | terminalize |
+| `model_visible/` | fold deriver 产物 → `model_visible/*.json` | 每次 step close |
+| `evidence/` | body / tool / facade 任意 evidence 写入者 | 同步 content addressing |
+
+**单一写入原则**(ADR-0212 §2.5 P5 / ADR-0195 O7):每个文件只有一个真实
+写入者(deriver 或 sink),不允许两个模块竞争同一文件。**`journal.json`
+唯一真值写者是 :class:`StepTreeFoldDeriver`**(fold 纯函数 + 写盘),写盘失败
+抛 :class:`JournalWriteError`(不再 ``log.warning + swallow`` —— 修复
+run_f78f66322f1d 的 doctor H3 重复 step_id 根因面)。旧的
+`StepGroupedBackend.flush` 与 `StepTreeAccumulatorDeriver.flush` 均已物理
+删除(ADR-0212 D1 delete-when = 0)。
+
+**StepTreeFoldDeriver 装配位置**:`RunSessionBuilder.build` 阶段(**不是**
+boot 阶段)。deriver 需要 `run_id / run_dir / agent_role / strategy_key /
+plan_ref`,这些字段是 per-run 的;boot 阶段(`spine.core.setup`)不再订阅
+任何 per-run deriver。
+
+```text
+RunSessionBuilder.build(run_id=X)
+    ├── StepCoordinator          ← Agent 唯一可见写入口 (ADR-0167 D2)
+    ├── StepTreeFoldDeriver(run_id=X, run_dir=...)
+    │      └── fold_session_snapshot() / fold_spine_ledger() → journal.json
+    └── assemble_run_hub(...)
+```
+
+## 最新 run 判定
+
+"最新 run" = `traces/runs/<run_id>` 中目录 mtime 最新的一个
+（`find_latest_run_id()`，CLI 各 journal 子命令共用）。不存在也不读
+任何指针文件：终态写入时刻与目录真实活跃度不一致，指针判定会错。
+
+## 目录命名
+
+`<unguessable_run_id>` 由 `lca/contracts/atoms/ids.py:new_run_id()` 生成。
+
+**禁止**: 本地时间戳目录名、部分 hash、人类随意命名。
+
+## check 脚本
+
+`scripts/check_run_naming.py` 扫描 `traces/runs/` 下目录名必须是 `<run_id>`。
+
+## 参考
+
+- [ADR-0167](../adr/0167-spine-ssot-and-step-materialization.md) D3/D4
+- [ADR-0167.1](../adr/0167.1-step-tree-deriver-wiring-and-run-layout-cleanup.md) D1–D7
+- [ADR-0166](../adr/0166-step-segment-phase-and-spine-hardening.md)
+- [ADR-0065](../adr/0065-recoverable-evidence-ledger.md)

@@ -1,0 +1,235 @@
+"""A2ATransport —— Google A2A 协议传输实现。
+
+通过 HTTP 调用远程 A2A Agent 端点，实现跨框架 Agent 互操作。
+依赖 httpx（已加入项目依赖）。
+
+A2A 协议核心流程：
+1. 解析 AgentCard 获取端点 URL
+2. send_task: POST 到 /tasks/send 创建异步任务
+3. poll_status: GET /tasks/{task_id} 查询状态
+4. receive_result: 从任务结果中提取 Observation
+"""
+
+from __future__ import annotations
+
+import asyncio
+from typing import Any
+
+import httpx
+
+from lca.contracts.atoms.ids.ids import new_id
+from lca.contracts.models.core.execution.decision import AgentCard, Observation
+from lca.contracts.models.core.policy.budget import DEFAULT_A2A_TIMEOUT_S
+from lca.contracts.models.core.state.lifecycle import TaskStatus
+from lca.contracts.protocols import AgentTransport
+
+_DEFAULT_POLL_INTERVAL_S = 0.1
+
+
+def _map_a2a_file_part(part: dict[str, Any]) -> dict[str, Any] | None:
+    """Map A2A artifact file/data part → GeneratedFile-shaped dict.
+
+    Supports common A2A shapes::
+
+        {"kind": "file", "file": {"name": "...", "mimeType": "...", "uri": "..."}}
+        {"kind": "file", "name": "...", "mimeType": "...", "uri": "..."}
+        {"kind": "data", "data": "...", "mimeType": "...", "name": "..."}
+    """
+    nested = part.get("file")
+    source: dict[str, Any] = nested if isinstance(nested, dict) else part
+
+    name = str(source.get("name") or source.get("filename") or "artifact").strip() or "artifact"
+    mime = str(
+        source.get("mimeType")
+        or source.get("mime_type")
+        or source.get("mediaType")
+        or "application/octet-stream"
+    )
+    url = source.get("uri") or source.get("url") or source.get("bytesUrl")
+    size_raw = source.get("sizeBytes") or source.get("size_bytes") or source.get("size")
+    size_bytes: int | None
+    try:
+        size_bytes = int(size_raw) if size_raw is not None else None
+    except (TypeError, ValueError):
+        size_bytes = None
+
+    # Inline base64 / raw data without URI — keep a data-URL only for small text
+    if not url and isinstance(source.get("bytes"), str) and source["bytes"]:
+        # Opaque reference only; callers download out-of-band if needed
+        url = None
+    if not url and isinstance(part.get("data"), str) and part.get("kind") == "data":
+        # Non-downloadable inline data: still expose name/mime for the card
+        url = None
+
+    result: dict[str, Any] = {
+        "name": name,
+        "mimeType": mime,
+        "previewable": mime.lower().startswith("text/html"),
+    }
+    if url:
+        result["url"] = str(url)
+    if size_bytes is not None:
+        result["sizeBytes"] = size_bytes
+    return result
+
+
+class A2ATransport(AgentTransport):
+    """Google A2A 协议传输实现。
+
+    通过 HTTP 与远程 A2A Agent 通信。AgentCard 可以是：
+    - 字符串：直接作为 endpoint URL
+    - 包含 url/endpoint 属性的对象：提取 URL
+    """
+
+    protocol_name: str = "a2a"
+
+    def __init__(
+        self,
+        timeout_s: float = DEFAULT_A2A_TIMEOUT_S,
+        default_endpoint: str | None = None,
+    ) -> None:
+        self._timeout = timeout_s
+        self._default_endpoint = default_endpoint
+        self._task_endpoints: dict[str, str] = {}
+        self._client: httpx.AsyncClient | None = None
+
+    async def _get_client(self) -> httpx.AsyncClient:
+        if self._client is None:
+            self._client = httpx.AsyncClient(timeout=self._timeout)
+        return self._client
+
+    def _resolve_endpoint(self, agent_card: AgentCard | str) -> str:
+        if isinstance(agent_card, str):
+            return agent_card
+        endpoint = getattr(agent_card, "url", None) or agent_card.endpoint
+        if endpoint:
+            return str(endpoint)
+        if self._default_endpoint:
+            return self._default_endpoint
+        raise ValueError(f"无法从 AgentCard 解析 A2A 端点 URL: {agent_card!r}")
+
+    async def send_task(
+        self, agent_card: AgentCard | str, subtask: str, context_refs: list[str]
+    ) -> str:
+        endpoint = self._resolve_endpoint(agent_card)
+        task_id = new_id("a2a_task")
+        self._task_endpoints[task_id] = endpoint
+
+        client = await self._get_client()
+        payload: dict[str, Any] = {
+            "task_id": task_id,
+            "message": {
+                "role": "user",
+                "parts": [{"kind": "text", "text": subtask}],
+            },
+        }
+        if context_refs:
+            parts = payload["message"]["parts"]
+            parts.extend({"kind": "reference", "ref": ref} for ref in context_refs)
+
+        try:
+            response = await client.post(f"{endpoint}/tasks/send", json=payload)
+            response.raise_for_status()
+        except httpx.HTTPError as exc:
+            self._task_endpoints[task_id] = f"error:{exc}"
+
+        return task_id
+
+    async def wait_result(self, task_id: str, timeout_s: float | None = None) -> Observation:
+        """HTTP 轮询等待任务完成（单调时钟，精确控制超时）。"""
+        loop = asyncio.get_event_loop()
+        deadline = (loop.time() + timeout_s) if timeout_s is not None else None
+        while True:
+            status = await self.poll_status(task_id)
+            if status != TaskStatus.WORKING:
+                return await self.receive_result(task_id)
+            if deadline is not None and loop.time() >= deadline:
+                raise TimeoutError(f"a2a wait_result 超时: {task_id}")
+            await asyncio.sleep(_DEFAULT_POLL_INTERVAL_S)
+
+    async def poll_status(self, task_id: str) -> str:
+        endpoint_info = self._task_endpoints.get(task_id, "")
+        if endpoint_info.startswith("error:"):
+            return TaskStatus.FAILED
+
+        client = await self._get_client()
+        try:
+            response = await client.get(f"{endpoint_info}/tasks/{task_id}")
+            response.raise_for_status()
+            data = response.json()
+            status = data.get("status", {}).get("state", TaskStatus.WORKING)
+            return str(status)
+        except httpx.HTTPError:
+            return TaskStatus.WORKING
+
+    async def receive_result(self, task_id: str) -> Observation:
+        endpoint_info = self._task_endpoints.get(task_id, "")
+        if endpoint_info.startswith("error:"):
+            return Observation(
+                observation_id=new_id("obs"),
+                success=False,
+                payload=None,
+                error=endpoint_info[6:],
+            )
+
+        client = await self._get_client()
+        try:
+            response = await client.get(f"{endpoint_info}/tasks/{task_id}")
+            response.raise_for_status()
+            data = response.json()
+
+            status = data.get("status", {})
+            if status.get("state") != TaskStatus.COMPLETED:
+                return Observation(
+                    observation_id=new_id("obs"),
+                    success=False,
+                    payload=None,
+                    error=f"Task not completed: state={status.get('state')}",
+                )
+
+            artifacts = data.get("artifacts", [])
+            output_parts: list[str] = []
+            file_parts: list[dict[str, Any]] = []
+            for artifact in artifacts:
+                for part in artifact.get("parts", []):
+                    kind = str(part.get("kind") or part.get("type") or "").lower()
+                    if kind == "text":
+                        output_parts.append(str(part.get("text", "")))
+                    elif kind in {"file", "data"}:
+                        mapped = _map_a2a_file_part(part)
+                        if mapped is not None:
+                            file_parts.append(mapped)
+
+            extra: dict[str, Any] = {
+                "a2a_task_id": task_id,
+                "raw_response": data,
+            }
+            if file_parts:
+                extra["files"] = file_parts
+
+            text_payload = "\n".join(output_parts) if output_parts else None
+            # Prefer text for legacy payload; surface files only in extra when both exist.
+            payload: Any = text_payload
+            if payload is None and len(file_parts) == 1:
+                payload = file_parts[0]
+            elif payload is None and file_parts:
+                payload = {"files": file_parts}
+
+            return Observation(
+                observation_id=new_id("obs"),
+                success=True,
+                payload=payload,
+                extra=extra,
+            )
+        except httpx.HTTPError as exc:
+            return Observation(
+                observation_id=new_id("obs"),
+                success=False,
+                payload=None,
+                error=f"A2A receive_result failed: {exc}",
+            )
+
+    async def close(self) -> None:
+        if self._client is not None:
+            await self._client.aclose()
+            self._client = None

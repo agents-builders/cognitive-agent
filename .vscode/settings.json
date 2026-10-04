@@ -1,0 +1,157 @@
+{
+  // VS Code: Pylance for Go to Definition; diagnostics stay off.
+  // Typecheck/lint only via `lca-ops typecheck` / ruff CLI.
+  // After changing: Developer: Reload Window.
+  // Keep basedpyright installed but language services off (conflicts with Pylance).
+  "python.defaultInterpreterPath": "${workspaceFolder}/.venv/Scripts/python.exe",
+  "python.languageServer": "Pylance",
+  "python.terminal.activateEnvironment": true,
+  "python.analysis.extraPaths": [
+    "${workspaceFolder}",
+    "${workspaceFolder}/vendor/cordis/src",
+    "${workspaceFolder}/vendor/cosmokit/src",
+    "${workspaceFolder}/vendor/schemastery/src"
+  ],
+  "python.analysis.typeCheckingMode": "off",
+  "python.analysis.diagnosticMode": "openFilesOnly",
+  "python.analysis.indexing": true,
+  "python.analysis.autoImportCompletions": false,
+  "python.analysis.diagnosticSeverityOverrides": {
+    "reportGeneralTypeIssues": "none",
+    "reportMissingImports": "none",
+    "reportMissingModuleSource": "none",
+    "reportMissingTypeStubs": "none",
+    "reportUndefinedVariable": "none",
+    "reportUnboundVariable": "none",
+    "reportPossiblyUnboundVariable": "none",
+    "reportArgumentType": "none",
+    "reportAssignmentType": "none",
+    "reportAttributeAccessIssue": "none",
+    "reportCallIssue": "none",
+    "reportIndexIssue": "none",
+    "reportOperatorIssue": "none",
+    "reportOptionalMemberAccess": "none",
+    "reportOptionalSubscript": "none",
+    "reportOptionalIterable": "none",
+    "reportOptionalContextManager": "none",
+    "reportOptionalOperand": "none",
+    "reportReturnType": "none",
+    "reportIncompatibleMethodOverride": "none",
+    "reportIncompatibleVariableOverride": "none",
+    "reportPrivateImportUsage": "none",
+    "reportUnusedImport": "none",
+    "reportUnusedVariable": "none",
+    "reportUnusedClass": "none",
+    "reportUnusedFunction": "none",
+    "reportUnusedCoroutine": "none",
+    "reportUnusedExpression": "none",
+    "reportUnusedCallResult": "none",
+    "reportUnnecessaryCast": "none",
+    "reportUnnecessaryComparison": "none",
+    "reportUnnecessaryContains": "none",
+    "reportUnnecessaryIsInstance": "none",
+    "reportUnknownArgumentType": "none",
+    "reportUnknownMemberType": "none",
+    "reportUnknownVariableType": "none",
+    "reportUnknownParameterType": "none",
+    "reportMissingParameterType": "none",
+    "reportUntypedFunctionDecorator": "none",
+    "reportUntypedClassDecorator": "none",
+    "reportUntypedBaseClass": "none",
+    "reportUntypedNamedTuple": "none",
+    "reportImportCycles": "none",
+    "reportDuplicateImport": "none",
+    "reportWildcardImportFromLibrary": "none",
+    "reportAbstractUsage": "none",
+    "reportInvalidTypeForm": "none",
+    "reportInvalidTypeArguments": "none",
+    "reportInvalidTypeVarUse": "none",
+    "reportCallInDefaultInitializer": "none",
+    "reportUnhashable": "none",
+    "reportUnusedParameter": "none",
+    "reportSyntaxError": "none"
+  },
+
+  "basedpyright.disableLanguageServices": true,
+  "basedpyright.disableOrganizeImports": true,
+  "basedpyright.disableTaggedHints": true,
+  "basedpyright.analysis.typeCheckingMode": "off",
+  "basedpyright.analysis.diagnosticMode": "openFilesOnly",
+  "basedpyright.analysis.diagnosticSeverityOverrides": {
+    "reportGeneralTypeIssues": "none",
+    "reportMissingImports": "none",
+    "reportMissingModuleSource": "none",
+    "reportSyntaxError": "none"
+  },
+
+  "pyright.disableLanguageServices": true,
+  "pyright.disableOrganizeImports": true,
+
+  "mypy-type-checker.ignorePatterns": ["**"],
+  "mypy-type-checker.preferDaemon": false,
+  "mypy-type-checker.showNotifications": "off",
+  "mypy-type-checker.severity": {
+    "error": "Hint",
+    "note": "Hint"
+  },
+  "mypy.enabled": false,
+  "mypy.targets": [],
+  "mypy.runUsingActiveInterpreter": false,
+
+  "python.linting.enabled": false,
+  "python.linting.mypyEnabled": false,
+  "python.linting.pylintEnabled": false,
+  "python.linting.flake8Enabled": false,
+  "python.linting.banditEnabled": false,
+  "python.linting.pydocstyleEnabled": false,
+  "python.linting.pycodestyleEnabled": false,
+  "python.linting.prospectorEnabled": false,
+  "pylint.enabled": false,
+  "flake8.enabled": false,
+  "flake8.args": ["--exit-zero"],
+
+  "ruff.enable": true,
+  "ruff.lint.enable": false,
+  "ruff.format.enable": true,
+  "ruff.organizeImports": false,
+  "ruff.configuration": null,
+  "ruff.nativeServer": "on",
+
+  "eslint.enable": false,
+  "javascript.validate.enable": false,
+  "typescript.validate.enable": false,
+  "css.validate": false,
+  "html.validate.scripts": false,
+  "html.validate.styles": false,
+  "json.validate.enable": false,
+  "yaml.validate": false,
+  "evenBetterToml.schema.enabled": false,
+  "redhat.telemetry.enabled": false,
+
+  "errorLens.enabled": false,
+  "sonarlint.rules": {},
+  "sonarlint.disableTelemetry": true,
+
+  "problems.decorations.enabled": false,
+  "problems.showCurrentInStatus": false,
+  "editor.showUnused": false,
+  "editor.showDeprecated": false,
+  "editor.semanticValidation": false,
+  "editor.parameterHints.enabled": false,
+
+  "editor.formatOnSave": true,
+  "editor.codeActionsOnSave": {
+    "source.fixAll.ruff": "never",
+    "source.organizeImports.ruff": "never",
+    "source.fixAll": "never",
+    "source.organizeImports": "never"
+  },
+  "[python]": {
+    "editor.defaultFormatter": "charliermarsh.ruff",
+    "editor.codeActionsOnSave": {
+      "source.fixAll.ruff": "never",
+      "source.organizeImports.ruff": "never"
+    }
+  },
+  "editor.rulers": [100]
+}

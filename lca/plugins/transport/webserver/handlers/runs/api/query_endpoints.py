@@ -1,0 +1,646 @@
+"""HTTP query handlers for the run carrier.
+
+All handlers read through the composition-selected run owner or observability
+store. This keeps query shaping and compatibility SSE framing local while the
+carrier remains independent from concrete loop implementations.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any
+
+from starlette.requests import Request
+from starlette.responses import JSONResponse, StreamingResponse
+
+from lca.contracts.mechanisms.capability.capability import (
+    MissingCapabilityError,
+    require_capability,
+)
+from lca.contracts.models.core.state.plane import PlaneBindings
+from lca.contracts.models.observability.activity import parse_step_evidence
+from lca.contracts.observability.registry.run_locator import RunLocator
+from lca.infrastructure.observability.journal.sse.frames import parse_last_event_id
+from lca.plugins.transport.webserver.handlers.cors.cors import cors_headers
+from lca.plugins.transport.webserver.handlers.runs.api.command_endpoints import _run_port_of
+from lca.plugins.transport.webserver.handlers.runs.terminal.port.port import RunPort
+from lca.plugins.transport.webserver.read.runs.evidence.evidence import (
+    EvidencePayloadDecodeError,
+    InvalidEvidenceDigestError,
+    RunEvidenceNotFoundError,
+    RunEvidenceReader,
+)
+
+_PROFILE_SNAPSHOT_NAME = "profile_snapshot.json"
+_DEFAULT_PROFILE_SNAPSHOT_ROOT = Path("traces") / "runs"
+
+
+def _spine_path_of(request: Request, run_id: str) -> Path | None:
+    """Resolve one run's Journal through the owner selected by composition."""
+    return _run_port_of(request).journal_path(run_id)
+
+
+def _run_locator_of(request: Request) -> RunLocator | None:
+    """Resolve the boot-provided RunLocator without constructing a filesystem backend."""
+    ctx = getattr(request.app.state, "ctx", None)
+    if ctx is None:
+        return None
+    try:
+        locator = require_capability(ctx, "run_locator")
+    except MissingCapabilityError:
+        return None
+    return locator if isinstance(locator, RunLocator) else None
+
+
+def _profile_snapshot_path(request: Request, run_id: str) -> Path:
+    """Resolve ``traces/runs/<id>/profile_snapshot.json`` via RunLocator when bound."""
+    locator = _run_locator_of(request)
+    if locator is not None:
+        return locator.run_dir(run_id) / _PROFILE_SNAPSHOT_NAME
+    return _DEFAULT_PROFILE_SNAPSHOT_ROOT / run_id / _PROFILE_SNAPSHOT_NAME
+
+
+def _plane_payload(ref: object | None) -> dict[str, str] | None:
+    if ref is None:
+        return None
+    kind_attr = getattr(ref, "kind", None)
+    kind_value = getattr(kind_attr, "value", "") if kind_attr is not None else ""
+    return {
+        "id": getattr(ref, "id", ""),
+        "label": getattr(ref, "label", ""),
+        "kind": kind_value,
+        "root": getattr(ref, "root", ""),
+        "outputs_dir": getattr(ref, "outputs_dir", ""),
+        "platform": getattr(ref, "platform", ""),
+        "home": getattr(ref, "home", ""),
+    }
+
+
+async def get_context(request: Request) -> JSONResponse:
+    """GET /context — bound planes of latest run plus online device candidates."""
+    if request.method == "OPTIONS":
+        return JSONResponse({}, headers=cors_headers())
+    devices = request.app.state.devices
+    online = [device.as_dict() for device in devices.list_online()]
+    latest = _run_port_of(request).latest_bindings()
+    bindings = None
+    if isinstance(latest, PlaneBindings):
+        bindings = {
+            "primary": _plane_payload(latest.primary),
+            "secondary": _plane_payload(latest.secondary),
+        }
+    return JSONResponse(
+        {"bindings": bindings, "online_devices": online},
+        headers=cors_headers(),
+    )
+
+
+async def stream_journal_live(request: Request) -> StreamingResponse | JSONResponse:
+    """``GET /journal/live`` — process-wide compatibility SSE.
+
+    The route is bound at boot only when the ``process_journal`` capability
+    is present (ADR-0163 决策 3). Reaching this handler implies
+    ``RunPort.stream_process_journal_live`` must produce frames. Returning
+    ``None`` here is a real port bug, not a service-shaped 503.
+    """
+    if request.method == "OPTIONS":
+        return JSONResponse({}, headers=cors_headers())
+    after = parse_last_event_id(request.headers.get("last-event-id"))
+    frames = _run_port_of(request).stream_process_journal_live(after)
+    if frames is None:
+        return JSONResponse(
+            {"error": "run owner lacks process journal streaming"},
+            status_code=500,
+            headers=cors_headers(),
+        )
+    return StreamingResponse(
+        frames,
+        media_type="text/event-stream",
+        headers=cors_headers(
+            **{
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            }
+        ),
+    )
+
+
+_DEFAULT_JOURNAL_ROOT = Path("traces") / "runs"
+
+
+def _read_run_journal_detail(
+    run_id: str, locator: RunLocator | None = None
+) -> dict[str, Any] | None:
+    """Read full steps, thinking, tool calls, and outputs from journal.json."""
+    step_path: Path | None = None
+    if locator is not None:
+        try:
+            step_path = locator.journal_step_path(run_id)
+        except Exception:
+            step_path = None
+    if step_path is None or not step_path.is_file():
+        fallback_path = _DEFAULT_JOURNAL_ROOT / run_id / "journal.json"
+        if fallback_path.is_file():
+            step_path = fallback_path
+
+    if step_path is None or not step_path.is_file():
+        return None
+
+    try:
+        data = json.loads(step_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+    metadata = data.get("metadata") or {}
+    raw_steps = data.get("steps") or []
+
+    output = ""
+    for s in reversed(raw_steps):
+        th = s.get("thinking") or {}
+        if th.get("raw_response_preview"):
+            output = th.get("raw_response_preview")
+            break
+
+    rich_steps = []
+    for s in raw_steps:
+        th = s.get("thinking") or {}
+        raw_tcs = s.get("tool_calls") or []
+        raw_trs = s.get("tool_results") or []
+
+        if not raw_tcs:
+            tc_single = s.get("tool_call")
+            if tc_single and tc_single.get("name"):
+                raw_tcs = [tc_single]
+                tr_single = s.get("tool_result")
+                raw_trs = [tr_single] if tr_single else []
+
+        if not raw_tcs:
+            rich_steps.append(
+                {
+                    "step_id": s.get("step_id"),
+                    "step_index": s.get("step_index"),
+                    "phase": s.get("phase"),
+                    "duration_ms": s.get("duration_ms"),
+                    "thinking": {
+                        "model": th.get("model"),
+                        "latency_ms": th.get("latency_ms"),
+                        "reasoning": th.get("reasoning"),
+                        "prompt_tokens": th.get("prompt_tokens"),
+                        "completion_tokens": th.get("completion_tokens"),
+                        "decision": th.get("decision"),
+                        "raw_response_preview": th.get("raw_response_preview"),
+                    },
+                    "tool_call": None,
+                    "tool_result": None,
+                    "evidence": None,
+                }
+            )
+            continue
+
+        trs_by_id = {
+            tr.get("invocation_id"): tr
+            for tr in raw_trs
+            if isinstance(tr, dict) and tr.get("invocation_id")
+        }
+
+        for idx, tc in enumerate(raw_tcs):
+            if not isinstance(tc, dict):
+                continue
+            inv_id = str(tc.get("invocation_id") or "")
+            tr = trs_by_id.get(inv_id) if inv_id else None
+            if not tr and idx < len(raw_trs) and isinstance(raw_trs[idx], dict):
+                tr = raw_trs[idx]
+            if tr is None:
+                tr = {}
+
+            sub_step_id = (
+                f"{s.get('step_id') or 'step'}-{idx + 1}"
+                if len(raw_tcs) > 1
+                else str(s.get("step_id") or "")
+            )
+
+            evidence = None
+            if tc.get("name"):
+                try:
+                    ev = parse_step_evidence(
+                        tool_name=tc.get("name") or "",
+                        arguments=tc.get("arguments"),
+                        tool_result=tr,
+                        thinking=th,
+                        step_id=str(sub_step_id or ""),
+                    )
+                    evidence = ev.model_dump()
+                except Exception:
+                    evidence = None
+
+            rich_steps.append(
+                {
+                    "step_id": sub_step_id,
+                    "step_index": s.get("step_index"),
+                    "phase": s.get("phase"),
+                    "duration_ms": tr.get("latency_ms") or s.get("duration_ms"),
+                    "thinking": {
+                        "model": th.get("model"),
+                        "latency_ms": th.get("latency_ms"),
+                        "reasoning": th.get("reasoning"),
+                        "prompt_tokens": th.get("prompt_tokens"),
+                        "completion_tokens": th.get("completion_tokens"),
+                        "decision": th.get("decision"),
+                        "raw_response_preview": th.get("raw_response_preview"),
+                    },
+                    "tool_call": {
+                        "name": tc.get("name"),
+                        "arguments": tc.get("arguments"),
+                        "arguments_summary": tc.get("arguments_summary"),
+                    },
+                    "tool_result": {
+                        "ok": tr.get("ok", True),
+                        "latency_ms": tr.get("latency_ms"),
+                        "stdout_head": tr.get("stdout_head"),
+                        "delta_summary": tr.get("delta_summary"),
+                        "error": tr.get("error"),
+                    },
+                    "evidence": evidence,
+                }
+            )
+
+    doctor_report = None
+    manifest_path = step_path.parent / "manifest.json"
+    if manifest_path.is_file():
+        try:
+            mdata = json.loads(manifest_path.read_text(encoding="utf-8"))
+            doctor_report = mdata.get("extra", {}).get("doctor_report")
+        except Exception:
+            doctor_report = None
+
+    return {
+        "run_id": run_id,
+        "trace_id": data.get("trace_id") or run_id,
+        "status": metadata.get("outcome") or "completed",
+        "session_status": metadata.get("outcome") or "completed",
+        "question": metadata.get("objective") or "",
+        "output": output,
+        "started_at": data.get("started_at"),
+        "closed_at": data.get("closed_at"),
+        "steps": rich_steps,
+        "doctor_report": doctor_report,
+    }
+
+
+async def get_run(request: Request) -> JSONResponse:
+    """GET /runs/{run_id} — retrieve a compatibility summary through the owner."""
+    run_id = request.path_params["run_id"]
+    summary = await _run_port_of(request).summary(run_id)
+    locator = _run_locator_of(request)
+    journal_detail = _read_run_journal_detail(run_id, locator)
+
+    if summary is None and journal_detail is None:
+        return JSONResponse({"error": "run not found"}, status_code=404, headers=cors_headers())
+
+    if summary is None:
+        return JSONResponse(journal_detail, headers=cors_headers())
+
+    if journal_detail:
+        if not summary.get("steps") and journal_detail.get("steps"):
+            summary["steps"] = journal_detail["steps"]
+        if not summary.get("question") and journal_detail.get("question"):
+            summary["question"] = journal_detail["question"]
+        if not summary.get("output") and journal_detail.get("output"):
+            summary["output"] = journal_detail["output"]
+        if journal_detail.get("doctor_report"):
+            summary["doctor_report"] = journal_detail["doctor_report"]
+
+    return JSONResponse(summary, headers=cors_headers())
+
+
+async def get_run_doctor(request: Request) -> JSONResponse:
+    """GET /runs/{run_id}/doctor — expose the owner's diagnostic projection.
+
+    Optional ``?shape=contracts`` returns the contracts-layer
+    ``DoctorReport`` (ADR-0199 §5.3 / P2-11) instead of the native web
+    ``doctor.v3`` shape, so external tooling can share one schema across
+    CLI / CI / web consumers. Defaults to the native shape for backward
+    compatibility.
+    """
+    run_id = request.path_params["run_id"]
+    report = await _run_port_of(request).doctor(run_id)
+    if report is None:
+        return JSONResponse({"error": "run not found"}, status_code=404, headers=cors_headers())
+    shape = request.query_params.get("shape")
+    if shape == "contracts":
+        from lca.plugins.transport.webserver.doctor.contracts_adapter import (
+            web_to_contracts_report,
+        )
+
+        contracts_doc = web_to_contracts_report(report)
+        return JSONResponse(contracts_doc.to_jsonable(), headers=cors_headers())
+    return JSONResponse(report.as_dict(), headers=cors_headers())
+
+
+async def get_run_failure(request: Request) -> JSONResponse:
+    """GET /runs/{run_id}/failure — user + operator failure projection."""
+    run_id = request.path_params["run_id"]
+    summary = await _run_port_of(request).summary(run_id)
+    if summary is None:
+        return JSONResponse({"error": "run not found"}, status_code=404, headers=cors_headers())
+    from lca.plugins.transport.webserver.read.runs.failure.failure_reader import (
+        failure_summary_for_run,
+    )
+
+    payload = failure_summary_for_run(
+        run_id,
+        user_error=str(summary.get("error") or ""),
+    )
+    return JSONResponse(payload, headers=cors_headers())
+
+
+async def get_run_exceptions(request: Request) -> JSONResponse:
+    """GET /runs/{run_id}/exceptions — exception.caught evidence (operator/debug)."""
+    run_id = request.path_params["run_id"]
+    summary = await _run_port_of(request).summary(run_id)
+    if summary is None:
+        return JSONResponse({"error": "run not found"}, status_code=404, headers=cors_headers())
+    from lca.plugins.transport.webserver.read.runs.failure.failure_reader import (
+        load_exception_records,
+    )
+
+    records = load_exception_records(run_id)
+    return JSONResponse({"run_id": run_id, "exceptions": records}, headers=cors_headers())
+
+
+async def get_run_profile(request: Request) -> JSONResponse:
+    """GET /runs/{run_id}/profile — return the boot-time profile_snapshot.json."""
+    run_id = request.path_params["run_id"]
+    snapshot_path = _profile_snapshot_path(request, run_id)
+    if not snapshot_path.is_file():
+        return JSONResponse(
+            {"error": f"No profile snapshot for run {run_id}"},
+            status_code=404,
+            headers=cors_headers(),
+        )
+    try:
+        payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return JSONResponse(
+            {"error": "invalid profile snapshot", "run_id": run_id},
+            status_code=500,
+            headers=cors_headers(),
+        )
+    return JSONResponse(payload, headers=cors_headers())
+
+
+async def get_run_evidence(request: Request) -> JSONResponse:
+    """GET /runs/{run_id}/evidence/{ref} — fetch verified evidence by digest."""
+    from lca.contracts.observability.evidence.evidence import EvidenceIntegrityError
+
+    run_id = request.path_params["run_id"]
+    ref_str = request.path_params["ref"]
+    bound = getattr(request.app.state, "bound_observability", None)
+    evidence_binding = bound.evidence_binding() if bound is not None else None
+    if evidence_binding is None or evidence_binding.store is None:
+        return JSONResponse(
+            {"error": "evidence store not configured", "run_id": run_id, "ref": ref_str},
+            status_code=404,
+            headers=cors_headers(),
+        )
+
+    try:
+        evidence = RunEvidenceReader(evidence_binding.store).read_json(
+            run_id=run_id,
+            requested_ref=ref_str,
+            journal_path=_spine_path_of(request, run_id),
+            requester=f"gateway:{run_id}",
+        )
+    except InvalidEvidenceDigestError:
+        return JSONResponse(
+            {"error": "invalid ref format", "ref": ref_str},
+            status_code=400,
+            headers=cors_headers(),
+        )
+    except RunEvidenceNotFoundError:
+        return JSONResponse(
+            {"error": "evidence ref not found in run journal", "run_id": run_id, "ref": ref_str},
+            status_code=404,
+            headers=cors_headers(),
+        )
+    except EvidenceIntegrityError as exc:
+        return JSONResponse(
+            {"error": "evidence integrity violation", "detail": str(exc), "ref": ref_str},
+            status_code=500,
+            headers=cors_headers(),
+        )
+    except KeyError as exc:
+        return JSONResponse(
+            {"error": "evidence ref not found", "detail": str(exc), "ref": ref_str},
+            status_code=404,
+            headers=cors_headers(),
+        )
+    except PermissionError as exc:
+        return JSONResponse(
+            {"error": "audience rejected", "detail": str(exc), "ref": ref_str},
+            status_code=403,
+            headers=cors_headers(),
+        )
+    except EvidencePayloadDecodeError as exc:
+        return JSONResponse(
+            {
+                "error": "evidence payload not json-decodable",
+                "ref": ref_str,
+                "byte_length": exc.byte_length,
+            },
+            status_code=500,
+            headers=cors_headers(),
+        )
+    return JSONResponse(
+        {
+            "run_id": evidence.run_id,
+            "ref": evidence.requested_ref,
+            "byte_length": evidence.byte_length,
+            "data": evidence.data,
+        },
+        headers=cors_headers(),
+    )
+
+
+def health_payload(run_port: RunPort, *, ctx: Any) -> dict[str, Any]:
+    """Build a health projection from the composition-selected run owner.
+
+    Boot-period readiness is enforced by the routes plugin and the LLM
+    resolver plugin; this projection is now run-port-only and fits inside
+    the carrier surface.
+
+    Includes ``event_bus`` field (PR-4) aggregating EventBus delivery
+    counters and, when loaded, PersistenceObserver fsync policy.
+    ``queue_depth`` is always 0 (sync observer; no queue). ``dropped_total > 0``
+    flips ``status`` to ``degraded``; readiness is unaffected (frontend
+    surfaces the warning).
+
+    Includes ``plugin`` block (PR-0213.2 / ADR-0213 §决定 4) reporting
+    the event-registry catalog / pipeline / cognitive driver readiness.
+    ``registered`` is the current catalog size, ``expected`` is the
+    count of plugins in the resolved profile that declared a
+    ``marker_class`` (the same predicate ``_collect_marker_catalog``
+    uses). ``missing`` is the set difference. ``pipeline_registered`` /
+    ``cognitive_driver_registered`` are pulled from existing bus /
+    driver-registry state. Any error during read degrades gracefully
+    and the block is dropped — ``/health`` must never 500 on observability.
+    """
+    base: dict[str, Any] = {
+        "status": "ok",
+        "runs": run_port.status_counts(),
+        "live": run_port.live_totals(),
+    }
+    event_bus = _read_event_bus_health()
+    if event_bus is not None:
+        base["event_bus"] = event_bus
+        if event_bus.get("dropped_total", 0) > 0:
+            base["status"] = "degraded"
+    plugin = _read_plugin_health(ctx)
+    if plugin is not None:
+        base["plugin"] = plugin
+    return base
+
+
+def _read_plugin_health(ctx: Any) -> dict[str, Any] | None:
+    """Aggregate the 5 plugin-readiness signals for ``/health`` (PR-0213.2).
+
+    Graceful degradation mirrors :func:`_read_event_bus_health`: any error
+    returns ``None`` and the caller drops the block. See ADR-0213 §决定 4
+    for the wire schema; ``missing`` is computed from resolved profile
+    plugin ids whose ``marker_class`` is set but whose id is not present
+    in the live event-registry catalog.
+    """
+    try:
+        from lca_kernel.events import EventBus
+
+        bus = EventBus.default()
+        registry = bus.registry
+        registered = len(getattr(registry, "_plugins", {}))
+
+        expected = 0
+        missing: list[str] = []
+        try:
+            from lca.harness.profile.boot.products import (
+                resolved_profile_from_scope,
+            )
+
+            resolved = resolved_profile_from_scope(ctx) if ctx is not None else None
+        except Exception:
+            resolved = None
+        if resolved is not None:
+            catalog_ids = set(getattr(registry, "_plugins", {}).keys())
+            for plugin in getattr(resolved, "plugins", ()):
+                marker = getattr(getattr(plugin, "definition", None), "marker_class", None)
+                if marker is None:
+                    continue
+                expected += 1
+                if plugin.id not in catalog_ids:
+                    missing.append(plugin.id)
+
+        registry_populated = registered > 0 or expected == 0
+
+        fiber_count = sum(1 for plugin in getattr(resolved, "plugins", ()) if not plugin.disabled)
+
+        # pipeline_registered: read the module-level _REGISTERED set used
+        # by ``register_pipeline_once`` to deduplicate pipeline loads.
+        pipeline_registered = False
+        try:
+            from lca.harness.profile.resolve import pipeline_loader
+
+            seen = pipeline_loader._REGISTERED.get(bus)  # module-level SSOT (SLF001)
+            pipeline_registered = bool(seen)
+        except Exception:
+            pipeline_registered = False
+
+        # cognitive_driver_registered: the cognitive plugin registers
+        # ``run_loop_driver_registry[cognitive]`` at setup time; the
+        # presence of ``"cognitive"`` in the registry is the SSOT.
+        cognitive_driver_registered = False
+        try:
+            from lca.contracts.mechanisms.capability.capability import (
+                require_capability,
+            )
+
+            driver_registry = require_capability(ctx, "run_loop_driver_registry")
+        except Exception:
+            driver_registry = None
+        if driver_registry is not None:
+            try:
+                cognitive_driver_registered = bool(driver_registry.contains("cognitive"))
+            except Exception:
+                cognitive_driver_registered = False
+
+        return {
+            "registered": registered,
+            "expected": expected,
+            "missing": missing,
+            "registry_populated": registry_populated,
+            "pipeline_registered": pipeline_registered,
+            "cognitive_driver_registered": cognitive_driver_registered,
+            # ADR-0213 §决定 4 + poteto-mode investigation 2026-09-14:
+            # the ``registered``/``expected`` counters report the event-registry
+            # catalog only (4 publisher slots on web-standard). Operators asking
+            # "how many plugins loaded" need the cordis-side count too, which
+            # is the resolved profile's enabled plugin list (same predicate
+            # ``_boot_context`` uses for the K3 topo_order). Surfaced as a
+            # distinct key so existing consumers do not mis-read it as the
+            # event-registry count.
+            "fiber_count": fiber_count,
+        }
+    except Exception as exc:
+        import structlog
+
+        _log = structlog.get_logger(__name__)
+        _log.warning("kernel_health_plugin_block_failed", error=str(exc), exc_info=True)
+        return None
+
+
+def _read_event_bus_health() -> dict[str, Any] | None:
+    """Read EventBus delivery counters and PersistenceObserver status (if loaded).
+
+    Graceful degradation: PersistenceObserver is imported lazily. Any error —
+    import, attribute, or runtime — yields core counters with
+    ``fsync_policy="n/a"`` so readiness is never blocked by observability.
+    ``queue_depth`` is 0 when the observer is available (sync path; no queue).
+    """
+    try:
+        from lca_kernel.events import EnvelopeBus
+
+        snapshot = EnvelopeBus.default().delivery_snapshot()
+        published_total = sum(c.get("published", 0) for c in snapshot.values())
+        persisted_total = sum(c.get("persisted", 0) for c in snapshot.values())
+        delivered_total = sum(c.get("delivered", 0) for c in snapshot.values())
+        dropped_total = sum(c.get("dropped", 0) for c in snapshot.values())
+        result: dict[str, Any] = {
+            "published_total": published_total,
+            "persisted_total": persisted_total,
+            "delivered_total": delivered_total,
+            "dropped_total": dropped_total,
+            "fsync_policy": "n/a",
+        }
+        try:
+            from lca_kernel.events.persistence.persistence import PersistenceObserver
+
+            observer = PersistenceObserver.default()
+            result["queue_depth"] = 0
+            result["fsync_policy"] = observer.fsync_policy.value
+        except (ImportError, AttributeError):
+            pass
+        return result
+    except Exception:
+        return None
+
+
+__all__ = [
+    "get_context",
+    "get_run",
+    "get_run_doctor",
+    "get_run_evidence",
+    "get_run_exceptions",
+    "get_run_failure",
+    "get_run_profile",
+    "health_payload",
+    "stream_journal_live",
+]

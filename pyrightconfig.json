@@ -1,0 +1,24 @@
+{
+  "pythonVersion": "3.11",
+  "typeCheckingMode": "off",
+  "venvPath": ".",
+  "venv": ".venv",
+  "extraPaths": [
+    ".",
+    "vendor/cordis/src",
+    "vendor/cosmokit/src",
+    "vendor/schemastery/src"
+  ],
+  "exclude": [
+    "vendor/**",
+    "lobehub-ui/**",
+    "**/__pycache__",
+    ".venv/**",
+    "node_modules/**"
+  ],
+  "reportMissingImports": "none",
+  "reportMissingModuleSource": "none",
+  "reportMissingTypeStubs": "none",
+  "reportGeneralTypeIssues": "none",
+  "reportSyntaxError": "none"
+}

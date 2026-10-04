@@ -1,0 +1,417 @@
+"""Reducer contract tests (ADR-0066).
+
+Pure-function tests on the Reducer Protocol default implementation.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from lca.contracts.models.core.execution.decision import Decision, Observation, Reflection, Turn
+from lca.contracts.models.core.perceive.perception import ContextItem, ContextManifest
+from lca.contracts.models.core.policy.budget import create_budget
+from lca.contracts.models.core.policy.stop import StopDecision, StopReason
+from lca.contracts.models.core.state.lifecycle import TaskStatus
+from lca.contracts.models.core.state.state import AgentState
+from lca.contracts.models.core.workspace.activation import ActivatedSkill
+from lca.plugins.loop.reducer.plugin import DefaultReducer
+from lca_kernel.events.payloads.spine import SpineEventPayload
+
+
+def _state() -> AgentState:
+    return AgentState(
+        trace_id="trace-1",
+        task="t",
+        budget=create_budget(max_steps=10),
+    )
+
+
+def test_apply_step_advanced_updates_step_and_budget() -> None:
+    state = _state()
+    out = DefaultReducer().apply_step_advanced(state, 3)
+    assert out.step == 3
+    assert out.budget.used_steps == 3
+
+
+def test_apply_perception_writes_perceive_projection() -> None:
+    state = _state()
+    manifest = ContextManifest(
+        items=(ContextItem(kind="clock", payload="12:00", provenance="clock"),), digest="abc"
+    )
+    out = DefaultReducer().apply_perception(state, manifest)
+    assert "manifest_digest" not in out.extra
+    assert out.perceive is not None
+    assert out.perceive.manifest is manifest
+    assert out.perceive.digest == "abc"
+    assert out.perceive.step == 0
+
+
+def test_apply_turn_appends_control_turns() -> None:
+    state = _state()
+    decision = Decision(
+        decision_id="d1",
+        action_type="respond",  # type: ignore[arg-type]
+        rationale="",
+        confidence=1.0,
+    )
+    observation = Observation(observation_id="o1", success=True, payload="ok")
+    reflection = Reflection(reflection_id="r1", verdict="on_track")  # type: ignore[arg-type]
+    turn = Turn(decision=decision, observation=observation, reflection=reflection)
+    out = DefaultReducer().apply_turn(state, turn)
+    assert len(out.control_turns) == 1
+    assert out.control_turns[0] is turn
+    assert len(out.history) == 1
+
+
+def test_apply_activation_no_op_on_empty() -> None:
+    state = _state()
+    out = DefaultReducer().apply_activation(state, ())
+    assert out.activated_skills == state.activated_skills
+
+
+def test_apply_activation_extends_skills() -> None:
+    state = _state()
+    activated = (ActivatedSkill(skill_id="s1", name="S1", activated_at_step=0),)
+    out = DefaultReducer().apply_activation(state, activated)
+    assert out.activated_skills == [activated[0]]
+
+
+def test_apply_stop_writes_status_only() -> None:
+    """ADR-0158 决策 四:apply_stop 只折叠 status / last_error;final_output 由
+    StopDecision 携带并由 apply_terminal_outcome 转入 TerminalOutcome.final_output_ref。
+
+    旧 test_apply_stop_writes_status_and_output 断言 state.final_output == "done"
+    已不适用(字段已删除)。
+    """
+
+    state = _state()
+    stop = StopDecision(
+        reason=StopReason.CONTINUE,
+        status=TaskStatus.COMPLETED,
+        final_output="done",
+    )
+    out = DefaultReducer().apply_stop(state, stop)
+    assert out.status == TaskStatus.COMPLETED
+    # final_output 不在 AgentState 上;StopDecision.final_output 由
+    # apply_terminal_outcome 读走,见 test_apply_terminal_outcome_uses_stop_final_output
+
+
+def test_apply_stop_does_not_mutate_state_final_output_field() -> None:
+    """ADR-0158 决策 四:AgentState 已无 final_output 字段;apply_stop 不再尝试写入。"""
+
+    state = _state()
+    stop = StopDecision(
+        reason=StopReason.CONTINUE,
+        status=TaskStatus.COMPLETED,
+        final_output="done\n\n[artifact closure]",
+    )
+
+    out = DefaultReducer().apply_stop(state, stop)
+    # 既无 final_output 字段可断言;改断言 stop.final_output 透传(stop 不可变)
+    assert stop.final_output == "done\n\n[artifact closure]"
+    assert "final_output" not in out.__annotations__
+
+
+def test_apply_error_marks_failed() -> None:
+    state = _state()
+    err = RuntimeError("boom")
+    out = DefaultReducer().apply_error(state, err)
+    assert out.status == TaskStatus.FAILED
+    assert "boom" in (out.last_error or "")
+
+
+def test_apply_paused_marks_input_required() -> None:
+    state = _state()
+    out = DefaultReducer().apply_paused(state, "snap-ref")
+    assert out.status == TaskStatus.INPUT_REQUIRED
+
+
+def test_apply_resume_records_input_turn_and_restores_working_status() -> None:
+    state = _state()
+    state.status = TaskStatus.INPUT_REQUIRED
+    turn = Turn(
+        decision=Decision(
+            decision_id="resume-decision",
+            action_type="ask_human",  # type: ignore[arg-type]
+            rationale="answer received",
+            confidence=1.0,
+        ),
+        observation=Observation(observation_id="resume-observation", success=True, payload="yes"),
+    )
+
+    out = DefaultReducer().apply_resume(state, "yes", turn)
+
+    assert out.status == TaskStatus.WORKING
+    assert out.working_memory["resume_input"] == "yes"
+    assert out.history == [turn]
+    assert out.step == 1
+
+
+def test_apply_artifact_closure_method_is_removed() -> None:
+    """ADR-0158 决策 六:apply_artifact_closure 整段删除;Reducer 不再折叠 closure。
+
+    closure 改走 transport projection 通道(artifact_closure.py / SSE);
+    reducer 仍是 state 唯一 writer(ADR-0070 C4)。
+    """
+
+    reducer = DefaultReducer()
+    assert not hasattr(reducer, "apply_artifact_closure"), (
+        "DefaultReducer.apply_artifact_closure 必须被删除(ADR-0158 决策 六)"
+    )
+
+
+def test_apply_terminal_outcome_rejects_waiting_input_without_durable_cursor() -> None:
+    from lca.contracts.protocols.declarative.declarative_2.declarative_phase_graph import (
+        DeclarativeValidationError,
+    )
+
+    stop = StopDecision(
+        reason="approval_required",  # type: ignore[arg-type]
+        status=TaskStatus.INPUT_REQUIRED,
+    )
+
+    # SSOT 收口(SSOT-Teardown):apply_terminal_outcome 不再内部调 apply_stop;
+    # teardown 顺序由 caller 决定——caller 必须先 apply_stop 再 apply_terminal_outcome。
+    state = DefaultReducer().apply_stop(_state(), stop)
+    with pytest.raises(
+        DeclarativeValidationError,
+        match="requires a durable resume cursor",
+    ):
+        DefaultReducer().apply_terminal_outcome(state, stop, plan_ref="plan-hil", journal_seq_end=4)
+
+
+# ── ADR-0077 invariant: TerminalOutcome(FAILED) must always carry error_ref ──
+#
+# Regression gate for run_d111c5459031 / run_98ef69d5ff29 / run_697848752aa6 /
+# run_27123ee235ac / run_10503d64d622 / run_93d4a69e3c14 — six runs that all
+# died with ``TerminalOutcome(FAILED) requires error_ref`` because the
+# upstream ``StopDecision`` carries no error string and ``state.last_error``
+# was empty when the loop terminated.
+
+
+class TestFailedTerminalCarriesErrorRef:
+    """Pin the ADR-0077 invariant for ``kind=FAILED``.
+
+    The reducer is the sole constructor of ``TerminalOutcome``; if it ever
+    yields a FAILED outcome without ``error_ref`` the model layer raises
+    ``ValueError`` mid-run, the user sees an opaque status=failed response,
+    and the Journal contains no error context — exactly what run_d111c5459031
+    and its siblings demonstrated.
+    """
+
+    @staticmethod
+    def _state_with_empty_error() -> AgentState:
+        # last_error=None is the realistic case: a StopDecision lands with
+        # status=FAILED and no message (StopDecision has no error field).
+        return AgentState(
+            trace_id="trace-failed-no-msg",
+            task="t",
+            budget=create_budget(max_steps=10),
+        )
+
+    def test_failed_with_empty_state_error_still_builds_error_ref(self) -> None:
+        from lca.contracts.models.core.policy.stop import StopReason
+
+        stop = StopDecision(
+            reason=StopReason.ERROR,
+            status=TaskStatus.FAILED,
+        )
+        state = self._state_with_empty_error()
+        # Real-world precondition: last_error stays None (StopDecision has no
+        # error field; nobody wrote one before apply_terminal_outcome runs).
+        assert state.last_error is None
+
+        outcome = DefaultReducer().apply_terminal_outcome(
+            state, stop, plan_ref="plan-x", journal_seq_end=2
+        )
+
+        assert outcome.kind.value == "failed"
+        assert outcome.error_ref is not None
+        assert outcome.error_ref.message  # non-empty fallback derived from stop reason
+
+    def test_failed_with_explicit_state_error_preserves_message(self) -> None:
+        from lca.contracts.models.core.policy.stop import StopReason
+
+        stop = StopDecision(
+            reason=StopReason.ERROR,
+            status=TaskStatus.FAILED,
+        )
+        state = self._state_with_empty_error()
+        state.last_error = "explicit failure: cloud-sandbox unavailable"
+
+        outcome = DefaultReducer().apply_terminal_outcome(
+            state, stop, plan_ref="plan-x", journal_seq_end=2
+        )
+
+        assert outcome.kind.value == "failed"
+        assert outcome.error_ref is not None
+        assert outcome.error_ref.message == "explicit failure: cloud-sandbox unavailable"
+
+
+# ── _instrument_apply → Session publish(ADR-0183 PR-8 / ADR-0186 PR-3d) ──
+
+
+class _CollectingPublishSession:
+    """最小 publish Session:S1 鉴权走 EventBus,append 留底 payload。"""
+
+    def __init__(self, bus: object) -> None:
+        self._bus = bus
+        self.payloads: list[object] = []
+
+    def append(
+        self,
+        event_type_or_payload: object,
+        data: object | None = None,
+        *,
+        actor: str | None = None,
+        producer: object = None,
+    ) -> object:
+        if isinstance(event_type_or_payload, str) and data is not None:
+            from types import SimpleNamespace
+
+            from lca_kernel.events.payloads.payloads import Category, SpineEventPayload
+
+            payload_dict = dict(data)  # type: ignore[arg-type]
+            sp = SpineEventPayload(
+                category=Category(event_type_or_payload),
+                execution_point=str(payload_dict.get("execution_point", "")),
+                channel=str(payload_dict.get("channel", "fact")),
+                payload=dict(payload_dict.get("payload", {})),
+            )
+            self.payloads.append(sp)
+            return SimpleNamespace(
+                type=event_type_or_payload,
+                seq=len(self.payloads),
+                session_id="collecting-session",
+                time=float(len(self.payloads)),
+            )
+        self.payloads.append(event_type_or_payload)
+        ref = self._bus.publish(event_type_or_payload, producer=producer)  # type: ignore[attr-defined]
+        # bridge/facade 语义:合成 session.id:seq 格式 ref;生产
+        # _receipt_from_bus_ref 只接受冒号格式,原生 bus 的 evt_<hex>
+        # 在此不适用(0377)。
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            event_id=f"collecting-session:{len(self.payloads)}",
+            ts=ref.ts,
+        )
+
+
+def _bind_collecting_session() -> tuple[_CollectingPublishSession, object, object]:
+    """绑定 test catalog EventBus + collecting Session;返回 (session, token, bus)。"""
+    from lca.plugins.events.publishers._session_publish import (
+        set_publish_session,
+    )
+    from lca_kernel.events.bus.bus import EventBus
+    from lca_kernel.events.test.catalog import build_test_bus
+
+    bus = build_test_bus()
+    session = _CollectingPublishSession(bus)
+    EventBus.set_default(bus)
+    token = set_publish_session(session)
+    return session, token, bus
+
+
+def _reset_active_run_id() -> None:
+    """marker payload 的 run_id 取 thread active run;测试钉为空串(C8)。"""
+    from lca.infrastructure.session.emit.runtime_emit import set_active_run_id
+
+    set_active_run_id(None)
+
+
+class TestInstrumentApply:
+    """``_instrument_apply`` 经 ``publish_via_session`` 发 ``runtime.reducer.apply``。"""
+
+    def test_instrument_apply_success_emits_paired_markers(self) -> None:
+        """One fold emits start + end markers to the bound publish Session."""
+        from lca.plugins.events.publishers._session_publish import reset_publish_session
+        from lca_kernel.events.bus.bus import EventBus
+
+        _reset_active_run_id()
+        session, token, _bus = _bind_collecting_session()
+        try:
+            DefaultReducer().apply_step_advanced(_state(), 2)
+        finally:
+            reset_publish_session(token)
+            EventBus.set_default(None)
+
+        markers = [p for p in session.payloads if isinstance(p, SpineEventPayload)]
+        assert [m.payload for m in markers] == [
+            {"method": "apply_step_advanced", "phase": "start", "run_id": ""},
+            {
+                "method": "apply_step_advanced",
+                "phase": "end",
+                "outcome": "success",
+                "run_id": "",
+            },
+        ]
+        assert all(m.category.value == "spine.runtime.reducer.apply" for m in markers)
+        assert all(m.channel == "fact" for m in markers)
+
+    def test_instrument_apply_failure_outcome_and_exception_propagate(self) -> None:
+        """A raising fold emits ``outcome="failure"`` and re-raises the error."""
+        from lca.contracts.protocols.declarative.declarative_2.declarative_phase_graph import (
+            DeclarativeValidationError,
+        )
+        from lca.plugins.events.publishers._session_publish import reset_publish_session
+        from lca_kernel.events.bus.bus import EventBus
+
+        _reset_active_run_id()
+        session, token, _bus = _bind_collecting_session()
+        try:
+            stop = StopDecision(
+                reason="approval_required",  # type: ignore[arg-type]
+                status=TaskStatus.INPUT_REQUIRED,
+            )
+            state = DefaultReducer().apply_stop(_state(), stop)
+            with pytest.raises(DeclarativeValidationError):
+                DefaultReducer().apply_terminal_outcome(
+                    state, stop, plan_ref="plan-x", journal_seq_end=1
+                )
+        finally:
+            reset_publish_session(token)
+            EventBus.set_default(None)
+
+        markers = [
+            p.payload
+            for p in session.payloads
+            if isinstance(p, SpineEventPayload) and p.payload["method"] == "apply_terminal_outcome"
+        ]
+        assert [m["phase"] for m in markers] == ["start", "end"]
+        assert markers[1]["outcome"] == "failure"
+
+    def test_instrument_apply_routes_to_bound_session_only(self) -> None:
+        """marker 只落当前上下文绑定的 Session;未绑定的收集实例收不到。"""
+        from lca.plugins.events.publishers._session_publish import reset_publish_session
+        from lca_kernel.events.bus.bus import EventBus
+
+        _reset_active_run_id()
+        bound, token, _bus = _bind_collecting_session()
+        isolated = _CollectingPublishSession(_bus)
+        try:
+            DefaultReducer().apply_paused(_state(), "snap-ref")
+        finally:
+            reset_publish_session(token)
+            EventBus.set_default(None)
+
+        assert len(bound.payloads) == 2
+        # 隔离实例未被 set_publish_session,reducer 不可能路由到它
+        assert isolated.payloads == []
+
+    def test_instrument_apply_without_bound_session_is_noop(self) -> None:
+        """run context 之外(boot/测试未 bind Session)→ marker no-op,不挡 fold。"""
+        from lca.plugins.events.publishers._session_publish import (
+            get_active_session,
+            reset_publish_session,
+            set_publish_session,
+        )
+
+        token = set_publish_session(None)  # type: ignore[arg-type]
+        try:
+            assert get_active_session() is None
+            state = DefaultReducer().apply_paused(_state(), "snap-ref")
+        finally:
+            reset_publish_session(token)
+
+        assert state.status == TaskStatus.INPUT_REQUIRED

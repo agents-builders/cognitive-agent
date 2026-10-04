@@ -1,0 +1,912 @@
+"""LobeHub service — Next.js frontend.
+
+Full lifecycle: sync source, apply patches, configure env, install deps,
+start dev server, stop, restart.
+
+Design: each phase is a separate method, all idempotent. The service
+tracks what's been done via stamps so restart doesn't redo setup.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import time
+from contextlib import suppress
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
+
+from lca.infrastructure.cli.config.config import KernelServeConfig, LobeHubConfig
+from lca.infrastructure.cli.service.service import (
+    HealthCheck,
+    ServiceState,
+    ServiceStatus,
+    free_port,
+    http_code,
+    http_ready,
+    kill_tree,
+    pid_alive,
+    pid_on_listening_port,
+    pid_on_port,
+)
+from lca.infrastructure.cli.state.state import StateStore
+
+# Redirect statuses on the /signin probe mean the dev route table collapsed:
+# every URL falls into not-found.tsx, which redirects to '/', and '/signin' is
+# rewritten to /spa-auth/... only to bounce back. A healthy /signin must answer
+# 200 with the auth SPA HTML; any 3xx here is the collapse signature.
+SIGNIN_REDIRECT_CODES = frozenset({301, 302, 307, 308})
+
+
+@dataclass(frozen=True, slots=True)
+class _VerifySummary:
+    """Structured result from ``patch_lobehub.py verify``.
+
+    ``total`` is the number of patches the engine actually checked.
+    ``ok`` patches have their verify marker present in the target file.
+    ``broken`` patches are missing or carry a stale marker.
+    ``names`` lists broken patch names so the status can name them.
+    ``error`` is non-empty when the verify subprocess itself failed
+    (script missing, timeout, etc.) — in that case the other fields
+    are zero/empty and the caller should report "unknown".
+    """
+
+    ok: int
+    broken: int
+    names: tuple[str, ...]
+    error: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class _VerifyCache:
+    ts: float
+    summary: _VerifySummary
+
+
+def _parse_verify_output(stdout: str) -> _VerifySummary:
+    """Parse the ``[verify] N ok, M broken/missing`` summary line.
+
+    Falls back to scanning per-patch OK/BROKEN/MISS lines when the
+    summary line is missing (older engine versions). Names listed as
+    SKIP are not counted as broken — they simply have no verify marker.
+    """
+    broken_names: list[str] = []
+    ok_count = 0
+    broken_count = 0
+
+    for line in stdout.splitlines():
+        # Per-patch lines look like: "[patch] OK     dev_auth_files"
+        if line.startswith("[patch]"):
+            parts = line.split()
+            if len(parts) < 3:
+                continue
+            verdict, name = parts[1], parts[2]
+            if verdict == "OK":
+                ok_count += 1
+            elif verdict in {"BROKEN", "MISS"}:
+                broken_count += 1
+                broken_names.append(name)
+            # SKIP / WARNING are not counted (no verify marker).
+            continue
+        # Summary line: "[verify] 18 ok, 0 broken/missing"
+        if line.startswith("[verify]"):
+            tokens = line.split()
+            for i, tok in enumerate(tokens):
+                if tok == "ok," and i > 0:
+                    with suppress(ValueError):
+                        ok_count = int(tokens[i - 1])
+                if tok == "broken/missing" and i > 0:
+                    with suppress(ValueError):
+                        broken_count = int(tokens[i - 1])
+
+    return _VerifySummary(ok=ok_count, broken=broken_count, names=tuple(broken_names))
+
+
+class LobeHubService:
+    """LobeHub Next.js frontend.
+
+    Next on ``dev_port`` is the service. Vite SPA on ``spa_port`` is a
+    sidecar with an independent lifetime — its exit must not kill Next.
+    """
+
+    _SPA_NAME = "lobehub-spa"
+
+    def __init__(
+        self,
+        config: LobeHubConfig,
+        gateway: KernelServeConfig,
+        state_dir: Path,
+        root: Path,
+    ) -> None:
+        self.name = "lobehub"
+        self._config = config
+        self._kernel_serve = gateway
+        self._state = StateStore(state_dir)
+        self._root = root
+        self._dir = root / config.dir
+        # Verify subprocess is ~1s; cache 30s so status stays snappy.
+        self._verify_cache: _VerifyCache | None = None
+
+    # ── Lifecycle ─────────────────────────────────────────────────────
+
+    def start(self) -> ServiceState:
+        """Start Vite sidecar first, then Next (Next proxies SPA HTML from Vite).
+
+        Always runs ``ensure_ready()`` first so LCA patches and
+        ``.env.lca`` are re-applied. The previous ``if current.is_running:
+        return current`` short-circuit was dangerous: ``stop()`` only kills
+        the bun parent and the Next child stays HTTP-ready for a few
+        seconds, so ``ensure_ready()`` was being skipped on restart and
+        ``lca_runtime_agent_gateway.apply`` did not re-inject the
+        ``LCA_GATEWAY_PUBLIC_URL`` into the SPA bundle. We instead clear
+        the stored PIDs and force a fresh spawn — ``_ensure_spa`` and
+        ``_ensure_next`` already detect the running port and reuse it,
+        so the only behaviour change is that patches and env are
+        guaranteed to be applied.
+        """
+        self._state.remove_pid(self.name)
+        self._state.remove_pid(self._SPA_NAME)
+        if not self.ensure_ready():
+            verify = self._run_patch_verify()
+            broken_desc = (
+                f"broken patches: {', '.join(verify.names)}"
+                if verify.broken
+                else "prerequisites failed"
+            )
+            return ServiceState(
+                status=ServiceStatus.STOPPED,
+                detail=f"ensure_ready failed ({broken_desc})",
+                why=f"Frontend prerequisites failed: {broken_desc}",
+                next_action="python3 deploy/lobehub/patch_lobehub.py",
+            )
+        spa_pid = self._ensure_spa()
+        if spa_pid is None:
+            return ServiceState(status=ServiceStatus.STOPPED, detail="vite spawn failed")
+        if not self._spa_ready():
+            return ServiceState(
+                status=ServiceStatus.STOPPED,
+                pid=spa_pid,
+                detail="vite sidecar start timeout",
+            )
+        pid = self._ensure_next()
+        if pid is None:
+            return ServiceState(status=ServiceStatus.STOPPED, detail="spawn failed")
+        if not self._next_ready():
+            return ServiceState(
+                status=ServiceStatus.STOPPED,
+                pid=pid,
+                detail="dev server start timeout",
+            )
+        return ServiceState(
+            status=ServiceStatus.RUNNING,
+            pid=pid,
+            port=self._config.dev_port,
+            detail="dev server ready",
+        )
+
+    def stop(self) -> ServiceState:
+        """Stop Next and the Vite sidecar."""
+        pids = self._collect_pids()
+        for pid in pids:
+            kill_tree(pid)
+
+        time.sleep(0.5)
+        free_port(self._config.dev_port)
+        free_port(self._config.spa_port)
+        # Wait for the listeners to actually disappear before returning.
+        # Otherwise a heal triggered right after stop() spawns a fresh
+        # `next dev` that hits EADDRINUSE and corrupts the shared .next
+        # dev state (the redirect-loop outage on 2026-10-03).
+        self._wait_port_free(self._config.dev_port)
+        self._wait_port_free(self._config.spa_port)
+        self._state.remove_pid(self.name)
+        self._state.remove_pid(self._SPA_NAME)
+
+        return ServiceState(status=ServiceStatus.STOPPED)
+
+    def restart(self) -> ServiceState:
+        """Restart the dev server."""
+        self.stop()
+        return self.start()
+
+    # ── Setup (idempotent) ────────────────────────────────────────────
+
+    def ensure_ready(self) -> bool:
+        """Ensure all prerequisites: source, patches, env, deps.
+
+        Returns True when prerequisites are satisfied and patches verified.
+        Returns False if source cannot be ensured or patches are broken.
+        """
+        self._ensure_source()
+        if not self._ensure_patches():
+            return False
+        self._ensure_pnpm_patches()
+        self._ensure_env()
+        self._ensure_deps()
+        return True
+
+    # ── Health ────────────────────────────────────────────────────────
+
+    def state(self) -> ServiceState:
+        """Observe current state."""
+        stored_pid = self._state.read_pid(self.name)
+        checks: list[HealthCheck] = []
+
+        # Dev server responding? HTTP is the ground truth for "UI is up".
+        dev_ok = http_ready(f"{self._config.dev_url}/", timeout=2.0)
+        checks.append(HealthCheck("dev", dev_ok, f":{self._config.dev_port}"))
+
+        # Route integrity: /signin must answer 200. A 3xx here means the route
+        # table collapsed (every URL falls into not-found → redirect('/')), which
+        # root probes miss because they accept 3xx as "ready". 5xx/timeout (000)
+        # is left to the spa/dev checks so a compiling first request is not misread.
+        signin_code = http_code(f"{self._config.dev_url}/signin", timeout=2.0)
+        routes_ok = signin_code == 200
+        routes_redirect = signin_code in SIGNIN_REDIRECT_CODES
+        checks.append(HealthCheck("routes", routes_ok, f"/signin -> {signin_code}"))
+
+        spa_pid = pid_on_port(self._config.spa_port)
+        spa_ok = spa_pid is not None
+        stored_spa = self._state.read_pid(self._SPA_NAME)
+        if spa_ok and spa_pid and (stored_spa is None or not pid_alive(stored_spa)):
+            self._state.write_pid(self._SPA_NAME, spa_pid)
+        checks.append(HealthCheck("spa", spa_ok, f":{self._config.spa_port}" if spa_ok else "none"))
+
+        # Reconcile PID: next-server may outlive the recorded bun parent.
+        port_pid = pid_on_port(self._config.dev_port) if dev_ok else None
+        if dev_ok and port_pid and (stored_pid is None or not pid_alive(stored_pid)):
+            self._state.write_pid(self.name, port_pid)
+
+        pid = stored_pid if stored_pid and pid_alive(stored_pid) else port_pid
+        process_ok = pid is not None and pid_alive(pid)
+        checks.append(HealthCheck("process", process_ok, f"pid={pid}" if pid else "none"))
+
+        # Source synced?
+        source_ok = self._dir.exists() and (self._dir / "package.json").exists()
+        checks.append(HealthCheck("source", source_ok, str(self._dir)))
+
+        # Patches applied? — verify is the source of truth, not file counts.
+        # ``.lca-patched`` only proves *some* apply once ran; ``verify`` proves
+        # every patch marker is still present in the target file.
+        deploy_dir = self._root / "deploy" / "lobehub"
+        verify = self._run_patch_verify()
+        patch_drift = self._state.detect_changes("patches", [deploy_dir], "*")
+        if verify.error:
+            patch_detail = f"verify unavailable ({verify.error})"
+            patches_ok = False
+        elif verify.broken:
+            patch_detail = (
+                f"{verify.ok}/{verify.ok + verify.broken} verified, "
+                f"broken: {', '.join(verify.names)}"
+            )
+            patches_ok = False
+        elif patch_drift.has_changes:
+            patch_detail = (
+                f"{verify.ok} verified, patch source changed "
+                f"({patch_drift.summary}) — re-run `patch_lobehub.py`"
+            )
+            patches_ok = False
+        elif verify.ok == 0:
+            patch_detail = "no patches registered"
+            patches_ok = True
+        else:
+            patch_detail = f"{verify.ok}/{verify.ok} verified"
+            patches_ok = True
+        checks.append(HealthCheck("patches", patches_ok, patch_detail))
+
+        # Pnpm patchedDependencies check(ADR-0163). Marker encodes the
+        # last attempt: ``patched_count`` applied cleanly,
+        # ``failed`` names drift hunk(s) that no longer fit upstream.
+        pnpm_marker = self._state._dir / "lobehub-pnpm-patches.marker"
+        if pnpm_marker.exists():
+            try:
+                marker_payload = json.loads(pnpm_marker.read_text())
+            except (json.JSONDecodeError, OSError):
+                marker_payload = {}
+            applied = int(marker_payload.get("patched_count", 0) or 0)
+            failed_raw = marker_payload.get("failed") or []
+            if failed_raw:
+                failed_pkgs = ", ".join(f.split(":", 1)[0] for f in failed_raw)
+                # Drift = hunk(s) the upstream no longer matches. This is a
+                # upstream dependency bump, not an LCA misconfiguration —
+                # call it that so operators stop chasing it with `ensure`.
+                if applied > 0:
+                    pnpm_detail = (
+                        f"drift ({applied} applied, "
+                        f"{len(failed_raw)} drift: {failed_pkgs}) — "
+                        f"upstream patch hunk no longer fits; regenerate "
+                        f"`lobehub-ui/patches/*.patch` from upstream"
+                    )
+                else:
+                    pnpm_detail = (
+                        f"drift (0 applied, {len(failed_raw)} drift: "
+                        f"{failed_pkgs}) — regenerate "
+                        f"`lobehub-ui/patches/*.patch` from upstream"
+                    )
+                checks.append(HealthCheck("pnpm-patches", False, pnpm_detail))
+            elif applied > 0:
+                checks.append(
+                    HealthCheck(
+                        "pnpm-patches",
+                        True,
+                        f"{applied} pnpm patches applied",
+                    )
+                )
+
+        why = ""
+        next_action = ""
+        patches_drift = patch_drift.has_changes  # source changed since snapshot
+        patches_broken = verify.broken > 0  # markers missing in target files
+        if dev_ok and not spa_ok:
+            status = ServiceStatus.DEGRADED
+            detail = "Next up, Vite sidecar down"
+            why = (
+                f"SPA sidecar :{self._config.spa_port} is down; "
+                f"{self._config.dev_url} still answers"
+            )
+            next_action = "./scripts/lca-ops lobehub heal"
+        elif dev_ok and routes_redirect:
+            # Route table collapsed: /signin bounces back to /, every URL falls
+            # into not-found. http_ready still sees 3xx on "/" so restart must
+            # be forced here instead of letting heal reuse the broken listener.
+            status = ServiceStatus.DEGRADED
+            detail = "routes collapsed (/signin redirects)"
+            why = (
+                f"{self._config.dev_url}/signin answered {signin_code}; the dev route "
+                "table collapsed and every URL falls into not-found. A full restart "
+                "is required to rebuild the route table."
+            )
+            next_action = "./scripts/lca-ops lobehub restart"
+        elif dev_ok:
+            if patches_broken:
+                status = ServiceStatus.DEGRADED
+                detail = f"degraded ({patch_detail})"
+                why = (
+                    f"patch markers missing in target files ({', '.join(verify.names)}) — "
+                    "frontend routes will fail; run `python3 deploy/lobehub/patch_lobehub.py`"
+                )
+                next_action = "python3 deploy/lobehub/patch_lobehub.py"
+            else:
+                status = ServiceStatus.RUNNING
+                detail = "healthy"
+                if patches_drift:
+                    detail = f"healthy (patch source drifted — {patch_drift.summary})"
+                    why = "patch source changed since last apply"
+                    next_action = "./scripts/lca-ops lobehub ensure"
+        elif process_ok:
+            status = ServiceStatus.DEGRADED
+            detail = "process alive but dev server not responding"
+            why = f"{self._config.dev_url} is not answering yet"
+            next_action = "./scripts/lca-ops logs lobehub"
+        elif not source_ok:
+            status = ServiceStatus.STOPPED
+            detail = "source missing"
+            why = f"{self._dir} has no package.json — UI is not synced"
+            next_action = "./scripts/lca-ops lobehub ensure"
+        else:
+            status = ServiceStatus.STOPPED
+            detail = "not running"
+            why = f"UI is down — open {self._config.dev_url} will fail"
+            next_action = "./scripts/lca-ops lobehub start"
+
+        return ServiceState(
+            status=status,
+            checks=tuple(checks),
+            pid=pid if process_ok else None,
+            port=self._config.dev_port,
+            detail=detail,
+            why=why,
+            next_action=next_action,
+        )
+
+    def heal(self) -> ServiceState:
+        """Repair without a death pact: Next stays up if only the sidecar is missing."""
+        current = self.state()
+        if current.is_running and not current.next_action:
+            return current
+
+        spa_down = not any(c.name == "spa" and c.ok for c in current.checks)
+        next_up = any(c.name == "dev" and c.ok for c in current.checks)
+        patches_broken = any(c.name == "patches" and not c.ok for c in current.checks) or (
+            current.next_action.startswith("python3 ") or "broken" in current.detail
+        )
+
+        # Patch drift/broken → run the patch engine in place; do NOT stop Next.
+        # The dev server will HMR the patched files.
+        if (current.is_running or current.status == ServiceStatus.DEGRADED) and patches_broken:
+            patch_script = self._root / "deploy" / "lobehub" / "patch_lobehub.py"
+            if patch_script.exists():
+                with suppress(subprocess.SubprocessError, OSError):
+                    subprocess.run(
+                        ["python3", str(patch_script)],
+                        cwd=self._root,
+                        capture_output=True,
+                        timeout=60,
+                    )
+                self._verify_cache = None
+            if not spa_down:
+                return self.state()
+
+        if next_up and spa_down:
+            self._ensure_spa()
+            self._spa_ready()
+            return self.state()
+
+        # Route collapse: HTTP still answers (3xx), so `current.is_running` is
+        # False, but start() would reuse the broken listener via http_ready.
+        # Force a full stop so the port is released and the route table rebuilds.
+        if current.is_running or current.next_action == "./scripts/lca-ops lobehub restart":
+            self.stop()
+
+        self.ensure_ready()
+        return self.start()
+
+    # ── Setup Internals ───────────────────────────────────────────────
+
+    def _ensure_source(self) -> bool:
+        """Sync LobeHub source if not present or version mismatch."""
+        pkg = self._dir / "package.json"
+        if pkg.exists():
+            content = pkg.read_text()
+            if f'"version": "{self._config.release.lstrip("v")}"' in content:
+                return False
+
+        # Run sync script
+        sync_script = self._root / "scripts" / "sync_lobehub_ui.sh"
+        if not sync_script.exists():
+            return False
+
+        try:
+            subprocess.run(
+                ["bash", str(sync_script)],
+                env={"LOBEHUB_RELEASE": self._config.release},
+                cwd=self._root,
+                capture_output=True,
+                timeout=300,
+            )
+            return True
+        except Exception:
+            return False
+
+    def _run_patch_verify(self) -> _VerifySummary:
+        """Run ``patch_lobehub.py verify`` and return a structured summary.
+
+        Result is cached for 30s because ``state()`` may be called several
+        times in a single CLI invocation (e.g. status then heal). The cache
+        is invalidated by ``ensure_patches()`` after a successful apply.
+        """
+        now = time.monotonic()
+        if self._verify_cache and now - self._verify_cache.ts < 30:
+            return self._verify_cache.summary
+
+        patch_script = self._root / "deploy" / "lobehub" / "patch_lobehub.py"
+        if not patch_script.exists() or not self._dir.exists():
+            summary = _VerifySummary(0, 0, (), error="script or ui source missing")
+        else:
+            try:
+                proc = subprocess.run(
+                    ["python3", str(patch_script), "verify"],
+                    cwd=self._root,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+            except (subprocess.SubprocessError, OSError) as exc:
+                summary = _VerifySummary(0, 0, (), error=f"{type(exc).__name__}: {exc}")
+            else:
+                summary = _parse_verify_output(proc.stdout)
+
+        self._verify_cache = _VerifyCache(ts=now, summary=summary)
+        return summary
+
+    def _ensure_patches(self) -> bool:
+        """Apply LCA patches every restart.
+
+        The patch engine's ``reconcile()`` is idempotent: when on-disk
+        content already matches the source SHA, the apply pass is a no-op
+        (returns without writing). We therefore call it unconditionally
+        rather than gating on a state hash, which would otherwise miss
+        two cases:
+
+        - A previous apply ran without ``LCA_GATEWAY_PUBLIC_URL`` and
+          left ``client.ts`` holding the obvious placeholder
+          ``ws://lca-gateway-unset:0000``. The placeholder matches the
+          source SHA so ``has_changed`` returns False and the SPA bundle
+          ships with the broken URL even after restart.
+        - A developer (or ``deploy/lobehub`` automation) edited a patched
+          file under ``lobehub-ui/src/...`` directly. ``has_changed``
+          only watches ``deploy/lobehub/`` and misses this.
+
+        The unconditional call costs a few hundred milliseconds of
+        ``reconcile()`` wall time on the happy path (no drift) and
+        prevents the "looks healthy, chat does nothing" regression that
+        is otherwise invisible to ``lca-ops status``.
+        """
+        deploy_dir = self._root / "deploy" / "lobehub"
+        if not deploy_dir.exists():
+            return False
+
+        try:
+            # Pass LCA_GATEWAY_PUBLIC_URL via os.environ so the patch
+            # engine's ``lca_runtime_agent_gateway.apply`` can bake the
+            # WS URL into ``lcaGateway/client.ts`` as a build-time string
+            # literal (Vite dev mode does not expose
+            # ``process.env.NEXT_PUBLIC_*`` to the browser bundle by
+            # default). Call the engine in-process so we can surface
+            # apply results in ``lca-ops`` output instead of swallowing
+            # them through ``subprocess.run(capture_output=True)``.
+            os.environ["LCA_GATEWAY_PUBLIC_URL"] = self._client_gateway_base()
+
+            from deploy.lobehub.engine import apply_patches
+
+            # In-process call so stdout/stderr flows to ``lca-ops``
+            # output (subprocess.run swallows it). ``apply_patches``
+            # is the canonical entry point from ``patch_lobehub.py`` CLI.
+            results = apply_patches()
+            for r in results:
+                tag = "applied" if r.status == "applied" else r.status
+                print(f"[lca] patch {tag}: {r.name}", flush=True)
+            self._state.save_snapshot("patches", [deploy_dir], "*")
+            self._verify_cache = None
+
+            verify = self._run_patch_verify()
+            if verify.broken > 0:
+                print(
+                    f"[lca] patch verify FAILED after apply: {verify.broken} broken ({', '.join(verify.names)})",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                return False
+            return True
+        except Exception as exc:  # health check best-effort
+            print(f"[lca] patch ensure failed: {type(exc).__name__}: {exc}", flush=True)
+            return False
+
+    def _ensure_pnpm_patches(self) -> bool:
+        """Apply pnpm-style patchedDependencies to bun-installed node_modules.
+
+        LobeHub 上游声明 pnpm-workspace.yaml ``patchedDependencies``(如
+        ``@upstash/qstash``),LCA 用 ``bun install`` 但 bun 不读 pnpm-workspace.yaml,
+        导致上游 patch 永不 apply。本方法用 Python stdlib ``git apply`` 兼容风格
+        把 pnpm patch 文件 apply 到 bun-installed node_modules 的对应路径。
+
+        触发条件: ``lobehub-ui/package.json`` 含 ``patchedDependencies`` 字段 +
+        ``lobehub-ui/patches/*.patch`` 存在 + bun node_modules 含对应包。
+        No-op 条件: 已 apply(marker 文件存在)+ 无 patchedDependencies。
+        """
+        pkg_json = self._dir / "package.json"
+        if not pkg_json.exists():
+            return False
+        try:
+            data = json.loads(pkg_json.read_text())
+        except (json.JSONDecodeError, OSError):
+            return False
+        # patchedDependencies 位置:pnpm 子对象(标准 pnpm v10 风格)+ 顶层 fallback
+        patched = data.get("pnpm", {}).get("patchedDependencies") or data.get("patchedDependencies")
+        if not isinstance(patched, dict) or not patched:
+            return False
+
+        patches_dir = self._dir / "patches"
+        if not patches_dir.is_dir():
+            return False
+
+        # marker: 同一组 patched deps 全 apply 后写一次,避免每次 ensure 都全 apply
+        marker = self._state._dir / "lobehub-pnpm-patches.marker"
+        if marker.exists():
+            return False
+
+        worked = False
+        failed: list[str] = []
+        for pkg_name, rel_path in patched.items():
+            patch_file = self._dir / rel_path
+            if not patch_file.exists():
+                failed.append(f"{pkg_name}: patch file missing ({rel_path})")
+                continue
+            bun_pkg_root = _find_bun_pkg_root(self._dir, pkg_name)
+            if bun_pkg_root is None:
+                failed.append(f"{pkg_name}: bun pkg root not found")
+                continue
+            try:
+                import subprocess
+
+                # git apply 不接受绝对 --directory;必须 cwd=ui_dir + 相对路径
+                rel_dir = bun_pkg_root.resolve().relative_to(self._dir.resolve())
+                # --reject: 让 git 把 apply 不上的 hunk 写到 .rej 文件方便诊断
+                result = subprocess.run(
+                    [
+                        "git",
+                        "apply",
+                        "--reject",
+                        "--whitespace=nowarn",
+                        "--directory",
+                        str(rel_dir),
+                        str(patch_file),
+                    ],
+                    capture_output=True,
+                    cwd=str(self._dir),
+                    timeout=30,
+                )
+                stderr_text = result.stderr.decode(errors="replace")
+                # git apply 在 skip 不能 fit 的 hunk 时会输出 "Skipped patch '...'"
+                # 到 stderr 但 exit 仍为 0(设计如此)。必须显式检测。
+                skipped = "Skipped patch" in stderr_text
+                if result.returncode == 0 and not skipped:
+                    worked = True
+                else:
+                    # 清理可能的 .rej 文件(下个 ensure 会重试)
+                    with suppress(OSError):
+                        for rej in bun_pkg_root.glob("*.rej"):
+                            rej.unlink()
+                    detail = stderr_text.strip()[:200] or f"rc={result.returncode}"
+                    failed.append(f"{pkg_name}: git apply failed ({detail})")
+            except (subprocess.SubprocessError, FileNotFoundError, ValueError) as exc:
+                failed.append(f"{pkg_name}: {type(exc).__name__}: {exc}")
+
+        if worked:
+            marker_payload = {
+                "applied_at": datetime.now(UTC).isoformat(),
+                "patched_count": len(patched),
+            }
+            if failed:
+                # 部分失败:不写 marker,下次 ensure 重试;但记 failed 到 log
+                marker_payload["failed"] = failed
+            marker.write_text(json.dumps(marker_payload))
+        elif failed:
+            # 全部失败:写 marker 记录失败状态,避免无限 retry 噪音
+            marker.write_text(
+                json.dumps(
+                    {
+                        "applied_at": datetime.now(UTC).isoformat(),
+                        "patched_count": 0,
+                        "failed": failed,
+                    }
+                )
+            )
+        return worked
+
+    def _ensure_env(self) -> bool:
+        """Configure .env for LobeHub."""
+        env_file = self._dir / ".env"
+        template = self._root / self._config.env_template
+
+        if not template.exists():
+            return False
+
+        # Copy template if .env doesn't exist
+        if not env_file.exists():
+            env_file.write_text(template.read_text())
+
+        # Update kernel_serve proxy URLs (use LAN/public URL, not bind address 0.0.0.0)
+        gateway_base = self._client_gateway_base()
+        kernel_serve_url = f"{gateway_base}/v1"
+        lines = env_file.read_text().splitlines()
+        updated = []
+        changed = False
+        # ADR-0200 §1: the front-end SPA bundle needs NEXT_PUBLIC_LCA_GATEWAY_URL
+        # at vite DefinePlugin time. Writing to .env is a fallback for manual
+        # `bun run dev:*` (where process env may be empty); the primary path
+        # is _child_env() which carries the same value into subprocess env.
+        gateway_ws = gateway_base.replace("http://", "ws://", 1).replace("https://", "wss://", 1)
+
+        targets = {
+            "OPENAI_PROXY_URL=": kernel_serve_url,
+            "NEXT_PUBLIC_OPENAI_PROXY_URL=": kernel_serve_url,
+            "OPENAI_API_KEY=": "lca-local",
+            "QWEN_PROXY_URL=": kernel_serve_url,
+            "QWEN_API_KEY=": "lca-local",
+            "NEXT_PUBLIC_LCA_GATEWAY_URL=": gateway_ws,
+            "LCA_GATEWAY_PUBLIC_URL=": gateway_base,
+        }
+
+        for line in lines:
+            matched = False
+            for prefix, val in targets.items():
+                if line.startswith(prefix):
+                    new_line = f"{prefix}{val}"
+                    if line != new_line:
+                        changed = True
+                    updated.append(new_line)
+                    matched = True
+                    break
+            if not matched:
+                updated.append(line)
+
+        if changed:
+            env_file.write_text("\n".join(updated) + "\n")
+
+        return changed
+
+    def _client_gateway_base(self) -> str:
+        """Browser-reachable LCA gateway base (not the bind address)."""
+        template = self._root / self._config.env_template
+        if template.exists():
+            vite_host = ""
+            for line in template.read_text().splitlines():
+                if line.startswith("LCA_GATEWAY_PUBLIC_URL="):
+                    url = line.split("=", 1)[1].strip()
+                    if url:
+                        return url.rstrip("/")
+                if line.startswith("VITE_DEV_HOST="):
+                    vite_host = line.split("=", 1)[1].strip()
+            if vite_host:
+                return f"http://{vite_host}:{self._kernel_serve.port}"
+        bind = self._kernel_serve.host
+        if bind in {"0.0.0.0", "::"}:  # noqa: S104 -- comparison against bind-all, not a bind
+            return f"http://192.0.2.10:{self._kernel_serve.port}"
+        return self._kernel_serve.base_url.rstrip("/")
+
+    def _ensure_deps(self) -> bool:
+        """Install dependencies if node_modules missing."""
+        if (self._dir / "node_modules").exists():
+            return False
+
+        try:
+            subprocess.run(
+                ["bun", "install"],
+                cwd=self._dir,
+                capture_output=True,
+                timeout=300,
+            )
+            return True
+        except Exception:
+            return False
+
+    # ── Lifecycle Internals ───────────────────────────────────────────
+
+    def _next_ready(self) -> bool:
+        needed = 3
+        consec = 0
+        for _ in range(120):
+            time.sleep(0.5)
+            if http_ready(f"{self._config.dev_url}/", timeout=3.0):
+                consec += 1
+                if consec >= needed:
+                    return True
+            else:
+                consec = 0
+        return False
+
+    def _spa_ready(self) -> bool:
+        spa_url = f"http://192.0.2.10:{self._config.spa_port}/"
+        needed = 2
+        consec = 0
+        for _ in range(120):
+            time.sleep(0.5)
+            if http_ready(spa_url, timeout=1.0):
+                consec += 1
+                if consec >= needed:
+                    return True
+            else:
+                consec = 0
+        return False
+
+    def _spa_listening(self) -> bool:
+        return pid_on_port(self._config.spa_port) is not None
+
+    def _ensure_next(self) -> int | None:
+        if http_ready(f"{self._config.dev_url}/", timeout=1.0):
+            port_pid = pid_on_port(self._config.dev_port)
+            if port_pid:
+                self._state.write_pid(self.name, port_pid)
+                return port_pid
+            stored = self._state.read_pid(self.name)
+            if stored and pid_alive(stored):
+                return stored
+        pid = self._spawn_script("dev:next", self.name)
+        if pid is not None:
+            self._state.write_pid(self.name, pid)
+        return pid
+
+    def _ensure_spa(self) -> int | None:
+        if self._spa_listening():
+            port_pid = pid_on_port(self._config.spa_port)
+            if port_pid:
+                self._state.write_pid(self._SPA_NAME, port_pid)
+                return port_pid
+        pid = self._spawn_script("dev:spa", self._SPA_NAME)
+        if pid is not None:
+            self._state.write_pid(self._SPA_NAME, pid)
+        return pid
+
+    def _child_env(self) -> dict[str, str]:
+        import os
+
+        # ADR-0200 §1: LcaAgentStreamClient dials `<gatewayBase>/v1/runs/<id>/ws`.
+        # The frontend (lobehub SPA, vite dev) needs the base URL injected
+        # as a process env at spawn time — vite's DefinePlugin reads
+        # process.env.NEXT_PUBLIC_* once at start, so the value must travel
+        # through this dict rather than only into .env. Same for the host
+        # console gate, which must default off in any production-shaped
+        # deployment.
+        gateway_http = self._client_gateway_base()
+        gateway_ws = gateway_http.replace("http://", "ws://", 1).replace("https://", "wss://", 1)
+        no_proxy_hosts = "localhost,127.0.0.1,192.0.2.10,0.0.0.0"
+        return {
+            **os.environ,
+            "NO_PROXY": no_proxy_hosts,
+            "no_proxy": no_proxy_hosts,
+            "PORT": str(self._config.dev_port),
+            "SPA_PORT": str(self._config.spa_port),
+            "VITE_DEV_PORT": str(self._config.spa_port),
+            "OPENAI_PROXY_URL": f"{self._kernel_serve.base_url}/v1",
+            "OPENAI_API_KEY": "lca-local",
+            "ENABLED_OPENAI": "1",
+            "NEXT_PUBLIC_LCA_GATEWAY_URL": gateway_ws,
+            "NEXT_PUBLIC_LCA_HOST_CONSOLE": os.environ.get("NEXT_PUBLIC_LCA_HOST_CONSOLE", "0"),
+            "RAYON_NUM_THREADS": os.environ.get("RAYON_NUM_THREADS", "2"),
+            "NODE_OPTIONS": os.environ.get("NODE_OPTIONS", "--max-old-space-size=2048"),
+        }
+
+    def _spawn_script(self, script: str, log_name: str) -> int | None:
+        try:
+            log_path = self._state.log_file(log_name)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_handle = log_path.open("a")
+            proc = subprocess.Popen(
+                ["bun", "run", script],
+                cwd=self._dir,
+                stdin=subprocess.DEVNULL,
+                env=self._child_env(),
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+            return proc.pid
+        except OSError:
+            return None
+
+    def _collect_pids(self) -> list[int]:
+        """Collect Next and Vite pids from files and listening ports."""
+        pids: list[int] = []
+        for name in (self.name, self._SPA_NAME):
+            pid = self._state.read_pid(name)
+            if pid:
+                pids.append(pid)
+        for port in (self._config.dev_port, self._config.spa_port):
+            port_pid = pid_on_port(port)
+            if port_pid:
+                pids.append(port_pid)
+        return list(set(pids))
+
+    def _wait_port_free(self, port: int, timeout: float = 10.0) -> None:
+        """Poll until no process is LISTENING on ``port`` (best effort).
+
+        ``pid_on_listening_port`` only counts listening sockets, so a browser's
+        outbound connection to the dev server does not make the port look
+        occupied. If the listener does not disappear within ``timeout``, give
+        up silently — the subsequent start() will surface any real failure.
+        """
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if pid_on_listening_port(port) is None:
+                return
+            time.sleep(0.25)
+
+
+def _find_bun_pkg_root(ui_dir: Path, pkg_name: str) -> Path | None:
+    """Return the bun-installed package root for ``pkg_name``, or None.
+
+    Bun 解压 npm 包到 ``node_modules/.bun/<scope>+<name>@<version>/node_modules/<pkg_name>``。
+    Scope 形式(@scope/name))→ bun 目录前缀 ``@scope+name@<version>``;
+    无 scope(name 直接是 foo))→ ``foo@<version>``。
+    本函数扫一遍 ``.bun/`` 找到匹配的子目录。
+    """
+    bun_root = ui_dir / "node_modules" / ".bun"
+    if not bun_root.is_dir():
+        return None
+    # 把 pkg_name 归一化为前缀: "@scope/foo" -> "@scope+foo"; "foo" -> "foo"
+    if pkg_name.startswith("@"):
+        scope, name = pkg_name[1:].split("/", 1)
+        prefix = f"@{scope}+{name}@"
+    else:
+        prefix = f"{pkg_name}@"
+    for entry in bun_root.iterdir():
+        if entry.name.startswith(prefix):
+            # 包实际解压在 <entry>/node_modules/<pkg_name>
+            candidate = entry / "node_modules" / pkg_name
+            if candidate.is_dir():
+                return candidate
+    return None

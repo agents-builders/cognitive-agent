@@ -1,0 +1,747 @@
+# Run debug SOP (coding-agent workflow)
+
+> **This document is for the coding agent**, not for humans. When a user
+> asks "why did this run fail?", "show me the latest run", "what just
+> happened", or supplies a `run_id`, follow the 8-step procedure below.
+> Each step tells you **why / how / output / what next / fail mode**.
+>
+> Humans get readable views via the journal viewers the SOP names -
+> `journal trace --human`, `journal narrative`, `journal trajectory` -
+> not from this document.
+
+## Decision tree (new first step)
+
+`runs debug` is the recommended first command because it reads the spine
+directly and gives the agent a `next_layer_hint` (default layer `graph`,
+default output `json`). Pick a layer only when the hint tells you to.
+
+```sh
+./scripts/lca-ops runs debug <run_id>                                # default: graph layer, JSON
+./scripts/lca-ops runs debug <run_id> --layer <L> --output human    # specific layer, human-readable
+```
+
+Five layers, one sentence each:
+
+- `summary` - run-level counts and `terminal_outcome`; use when you only need to know whether the run reached terminal and whether anomalies exist.
+- `graph` - phase-graph skeleton with per-node real input/output payloads, reducer decisions, llm / tool_call responses, and automatic root-cause flags; use when the run looks wrong and you want one structured view.
+- `events` - raw spine rows sorted by `seq` with `payload_keys` per row; use when you need to grep a specific execution point or pivot on a key.
+- `diff` - expected blueprint nodes vs executed nodes (missing / unexpected); use when the run succeeded but produced an unexpected graph shape.
+- `explain` - first failed node plus its context and a follow-up hint; use after `summary` or `graph` flagged an anomaly and you want the root cause in one call.
+
+Specialist fall-back commands (still available; use them when `runs debug`
+is not enough or the user asked for a specific view):
+
+- `./scripts/lca-ops debug-graph <run_id>` - same projection as `runs debug --layer graph`, older entry point.
+- `./scripts/lca-ops timeline <run_id>` - alias for `observation run-replay --show-graph`, lightweight skeleton only.
+- `./scripts/lca-ops debug-run <run_id>` - 8-section diagnostic from `<run_id>.spine.jsonl` + `manifest.json`; useful for runs without observation facts.
+- `./scripts/lca-ops journal trace <run_id>` - full spine ledger dump, grep-friendly.
+- `./scripts/lca-ops journal trajectory <run_id>` - DSH-style HTML waterfall.
+- `./scripts/lca-ops observation trace-show <run_id>` - filtered observation facts (by node / kind / seq).
+- `./scripts/lca-ops observation run-replay <run_id>` - time-ordered observation replay with per-node inputs / outputs / decisions.
+- `./scripts/lca-ops observation run-explain <run_id>` - structured summary + `root_cause_chain` + `next_actions`.
+- `./scripts/lca-ops observation plan-show <ref>` - expected blueprint graph for a profile.
+- `./scripts/lca-ops explain <run_id>` - failure-path projection over `<run_id>.spine.jsonl`; exits non-zero when a failed run's ledger carries no failure event.
+
+> **Path convention.** All commands in this SOP are written as
+> `./scripts/lca-ops ...`. From anywhere else invoke it as
+> `<repo>/scripts/lca-ops ...`. The bare `lca-ops` on `$PATH` is the same
+> script; both work.
+>
+> **SSOT rule.** Commands listed here are kept in sync with the CLI by
+> `scripts/check_run_debug_sync.py`. That script asks
+> `./scripts/lca-ops --help` (the real registry) what commands exist
+> and diffs against every `lca-ops ...` path this SOP mentions. Run it
+> in CI; if it fails, this document is lying and you must fix it before
+> proceeding. See §Maintenance for details.
+
+---
+
+## When to enter this SOP
+
+Trigger phrases (run this immediately, do not ask for clarification):
+
+| User says | Enter SOP? |
+|---|---|
+| "最新一次 run" / "刚才那个" / "上次" / "最近一次" / "看看刚才发生了什么" | yes |
+| "为啥这次失败" / "这次出错了" / "分析一下这次" | yes |
+| "理解一下过程" / "走了一遍啥逻辑" / "DSH 风格轨迹" / "给我个 HTML" | yes |
+| "图跑的流程" / "phase graph timeline" / "运行轨迹" | yes (Step 1 first) |
+| supplies a `run_<id>` directly | yes |
+| "刚才服务挂了" / "kernel 不响应" | no — go to AGENTS.md §6 service matrix |
+| "POST /lca-api/runs 500" / "看起来 healthy 但调用挂" / "接口挂了但 status 正常" | no — go to **Step 0b** in this SOP |
+
+**Hard rule for run_id**: resolve it as the newest-mtime directory under
+`traces/runs/` (no pointer file exists):
+
+```sh
+LATEST=$(ls -1t traces/runs | head -1)
+```
+
+---
+
+## 30 秒速查(只回答"现在到底跑到哪了")
+
+不读这 SOP 也能用——99% 的"图跑的流程 / 哪一步出问题"问题,这一行就能答完:
+
+```sh
+LATEST=$(ls -1t traces/runs | head -1)
+./scripts/lca-ops debug-graph "$LATEST"
+```
+
+`debug-graph` 一次性输出:**图骨架 + 每节点真实 input/output payload + reducer 决策序列 + llm 响应 + tool_call 实际参数 + 自动根因标记**(`✗`)。直读 `<run_id>.spine.jsonl`,不依赖 journal.json / manifest.json 物化——`run_bc004d84ce51` 走 `lifecycle.finally` 但未触发 terminalize,`debug-graph` 出全图并自动标出根因(`apply_error → apply_stop → kernel.run.stop outcome=failure`);`explain` 读同一份 ledger,对该 run 报 `失败从 seq=113 的 kernel.run.stop 开始`。
+
+需要更轻量的纯图骨架 / 单挑细节:
+
+```sh
+./scripts/lca-ops timeline "$LATEST"                              # 仅 phase_graph 节点时序,≈50ms
+./scripts/lca-ops journal trace "$LATEST" | grep -E "llm\.|tool\.|gate\.|reducer\."  # spine 原始事件
+./scripts/lca-ops debug-run "$LATEST"                             # 8 段摘要(若 journal.json 存在)
+```
+
+---
+
+## The 8-step procedure (with timeline as Step 1)
+
+Each step has five labels you should expect to find in your own output:
+
+- **WHY** — what this step rules in / out
+- **DO** — exact command(s), JSON flag for you, human flag for the user
+- **OUTPUT** — what you'll see (success and failure)
+- **NEXT** — when to advance
+- **FAIL** — what to do if this command itself misbehaves
+
+### Step 0 — Confirm the failure surface
+
+**WHY.** Distinguish "service layer is broken" from "this run failed". The rest of the SOP assumes `kernel_serve` is up.
+
+**DO.**
+
+```sh
+./scripts/lca-ops status --json
+```
+
+**OUTPUT.** JSON with five services: `kernel_serve`, `infra`, `lobehub`, `daemon`, `onlyboxes`. Anything `unhealthy`/`missing`/`not running` → service problem, not run problem.
+
+**NEXT.** If any service is down: `./scripts/lca-ops heal --json`, then re-check. Once `kernel_serve: healthy`, advance to Step 1.
+
+**FAIL.** `./scripts/lca-ops` itself fails → check `which lca-ops`, run with `bash -x ./scripts/lca-ops status --json` to see where it dies.
+
+---
+
+### Step 0b — Backend 5xx ("service looks healthy but the call returns 500")
+
+**WHY.** `lca-ops status` may show `kernel_serve: healthy` because `/health` answers 200, yet `POST /lca-api/runs` (or any other handler) returns 500 with no obvious source. The 5xx can come from the kernel, from lobehub, or from a reverse proxy — and the log lives in a different file in each case. This step is the "I see the red square in the browser, where do I read" answer.
+
+**DO.**
+
+```sh
+# 1. Sanity: where is the error?
+curl -sS -i -X POST -H 'Content-Type: application/json' \
+     -d '{"messages":[{"role":"user","content":"hello"}]}' \
+     http://192.0.2.10:8765/runs | head -20
+
+# 2. Read the kernel process log (NOT traces/runs/<id>/kernel.log — that one
+#    is only for the post-run tail). The actual kernel stdout/stderr is at
+#    /tmp/lca-kernel.log; `lca-ops logs` (alias for `journal logs`) tails it.
+./scripts/lca-ops logs | tail -120
+
+# 3. If the error references a transport handler, also read the lobehub
+#    log (lobehub reverse-proxies /lca-api/* → 127.0.0.1:8765):
+./scripts/lca-ops journal logs lobehub | tail -80
+
+# 4. Filter the kernel log for the keyword shown in the user's screenshot
+#    or in the curl response body:
+grep -nE "POST /runs HTTP|InvalidTokenError|LcaContractError|CapabilityGrantExceededError|Traceback" \
+     /tmp/lca-kernel.log | tail -40
+
+# 5. If the failure mentions a run_id, hand off to the regular run-debrief
+#    flow (Step 1 onwards). For pure transport-layer 5xx with no run_id
+#    yet, jump straight to Step 0c below.
+```
+
+**OUTPUT.** A traceback pointing at one of:
+
+- `lca/plugins/transport/webserver/handlers/...` — handler logic bug or
+  contract gap (the file path tells you which handler; ADR-0122 §3 maps
+  paths to routes).
+- `lca_kernel/lifecycle.py` — K6 disposal / SIGTERM teardown.
+- `lca/cognition/...` or `lca/runtime/...` — Reducer or phase-graph
+  failure (rare; should appear in `traces/runs/<id>/kernel.log` too).
+- `ConnectionError` / `ECONNREFUSED 192.0.2.10:8765` in
+  `.lca-ops/lobehub.log` — lobehub is talking to the wrong kernel host;
+  check `LCA_GATEWAY_PUBLIC_URL` in lobehub's environment (the Next.js
+  rewrite base).
+
+**NEXT.** Three paths:
+
+- **Handler-layer bug** (e.g. `InvalidTokenError`,
+  `JwtSecretUnconfiguredError`, missing env var) → fix in the handler
+  or the Profile; restart kernel.
+- **Lobehub → kernel misrouting** → fix `LCA_GATEWAY_PUBLIC_URL` env;
+  restart lobehub.
+- **Reducer / cognitive failure inside an existing run** → `traces/runs/<id>/`
+  has the canonical record (see Step 3). Step 1 onwards applies.
+
+**FAIL.** `/tmp/lca-kernel.log` empty → the kernel PID is not writing
+there. Check `pid=$(pgrep -f 'lca_kernel serve' | head -1); ls -l /proc/$pid/fd/1`;
+the actual path follows the symlink at `/proc/<pid>/fd/1`. If the kernel
+was started outside `lca-ops` (e.g. `python -m lca_kernel serve` directly),
+stdout may instead point to a per-launch log; `grep -r 'Uvicorn running on'
+/tmp/` finds it.
+
+---
+
+### Step 0c — Read the traceback to file:line
+
+**WHY.** Once Step 0b surfaces the exception, you need the offending line.
+The kernel log is the only place that has the Python traceback — the
+HTTP response body is just `Internal Server Error` (Starlette default).
+
+**DO.**
+
+```sh
+# Most-recent traceback from /tmp/lca-kernel.log
+grep -nE "Traceback|Error|Exception|appended exception" /tmp/lca-kernel.log | tail -60
+
+# For a specific run_id: the run directory contains a sidecar
+# <run_id>.exceptions.jsonl (preferred) or, if that is missing, an inline
+# `kernel.log`. Both live under traces/runs/<id>/; do NOT confuse them
+# with /tmp/lca-kernel.log (process stdout/stderr).
+./scripts/lca-ops debug-run <run_id> --json | jq '.sections."3.kernel.log", ."5.error_ref"'
+```
+
+**OUTPUT.** Traceback frames with absolute file paths and line numbers;
+the bottom frame names the exception class
+(`InvalidTokenError`, `RuntimeError`, etc.).
+
+**NEXT.** Open the offending file:line in your editor. Cross-check
+against AGENTS §3 invariants (C2, C5, C10 — typical 5xx hotspots). Once
+the fix is in, jump to Step 7 (verify on the live system).
+
+---
+
+### Step 0d — SPA / Vite / patch injection ("backend works, front-end looks healthy but chat never reaches LCA")
+
+**WHY.** Distinct from Step 0b. The kernel is fine, the backend 5xx is gone, but `lca-ops status` says everything is up while the browser-side chat silently routes to lobehub's native `/webapi/chat/openai` provider — never touching the LCA gateway. Cause: `process.env.NEXT_PUBLIC_*` is **undefined** in the browser bundle because the lobehub-spa Vite dev server only whitelists `VITE_*` env, and the LCA patch that bakes the URL into the bundle has not been re-applied (or did not receive `LCA_GATEWAY_PUBLIC_URL`).
+
+**DO.**
+
+```sh
+# 1. Confirm the LCA gateway URL is baked into the SPA bundle (Vite serves it on the fly):
+curl -sS "http://192.0.2.10:9876/src/store/chat/agents/transports/lcaGateway/client.ts" \
+    | grep -E 'LCA_GATEWAY_WS_URL\s*='
+# Expect: const LCA_GATEWAY_WS_URL = "ws://<host>:<port>";
+# If you see "ws://lca-gateway-unset:0000", the patch apply did not inject the URL.
+
+# 2. Confirm isLcaGatewayMode() in agentDispatcher has the same URL:
+curl -sS "http://192.0.2.10:9876/src/store/chat/slices/agentRun/actions/dispatch/agentDispatcher.ts" \
+    | grep -A2 isLcaGatewayMode
+
+# 3. Re-run the patch engine with the env, then restart lobehub:
+LCA_GATEWAY_PUBLIC_URL=http://<host>:<port> python3 deploy/lobehub/patch_lobehub.py
+./scripts/lca-ops lobehub restart
+
+# 4. Verify (1) again — should now show the real URL.
+```
+
+**OUTPUT.** After step 3 the `LCA_GATEWAY_WS_URL` line in the bundle is the real URL. Confirm `isLcaGatewayMode()` returns `true` in the browser by opening DevTools console and checking that no chat attempt goes through `/webapi/chat/openai` (use the Network tab; LCA traffic goes to `/lca-api/runs` → `/v1/runs/{id}/ws-token` → `WS /v1/runs/{id}/ws`).
+
+**NEXT.** If the bundle is correct but the chat still goes to `/webapi/chat/openai`, the agent configuration on the lobehub side is overriding the gateway dispatch — check `lobehub-ui/.env` for `OPENAI_PROXY_URL` and `NEXT_PUBLIC_LCA_GATEWAY_URL`, and confirm the active agent config (`.lca-ops/runtime/state.db`) sets the agent to `solo`/`team`/`auto`, not `general`. Otherwise this is the JWT-key bug above; jump to Step 0b.
+
+**FAIL.** `curl http://192.0.2.10:9876/` returns connection refused → the Vite dev server is not running. `ss -ltn | grep 9876` confirms. `./scripts/lca-ops lobehub restart` brings it back. **Do not** `pkill -f vite` from inside an interactive bash that has `vite` in its argv; that self-kills the shell before it reaches the inner command. Use `kill $(ss -ltnp | grep 9876 | grep -oP 'pid=\\K[0-9]+')` or open a fresh shell.
+
+---
+
+### Step 0.5 — Cache invalidation: 改完代码后再 hard-refresh
+
+**WHY.** 上面三个 Step (0 / 0b / 0d) 都假设"刚改的代码已经在跑"。当 fix 看起来"没生效",**九成是缓存**:Vite 的 `.node_modules/.vite/`、Next dev 的 `.next/dev/cache/turbopack/`、lobehub-spa 的 `subprocess` 仍持有旧 module 句柄、浏览器 ETag 命中旧 module。本 Step 强制把"是不是缓存"和"是不是 bug"分开。
+
+**DO.** 按代码改动路径,挑对应命令跑(完整表见 [`docs/debug/README.md` "缓存何时清"](./README.md#缓存何时清-改完代码后必做的命令)):
+
+```sh
+# 改了 kernel / handler / profile / JWT seam
+./scripts/lca-ops kernel-restart
+
+# 改了 deploy/lobehub/patches/ 任何 .py / .ts
+./scripts/lca-ops lobehub restart
+
+# 改了 lca/infrastructure/cli/services/lobehub/lobehub.py(start / ensure_patches)
+./scripts/lca-ops lobehub restart
+
+# 浏览器 / React UI 仍 0 反应:
+rm -rf lobehub-ui/node_modules/.vite lobehub-ui/.next && \
+  ./scripts/lca-ops lobehub restart
+# 然后用户在浏览器硬刷新:macOS Cmd+Shift+R / Win Linux Ctrl+Shift+R
+# (DevTools → Network → Disable cache 是同等手段)
+
+# 确认 vite serve 的 bundle 已经是新版本(不是缓存里的旧 module)
+curl -sS http://192.0.2.10:9876/src/path/to/just/changed.ts | grep "你刚加的字符串"
+```
+
+**OUTPUT.** 如果 curl 看到新字符串但浏览器还显示旧行为,问题在浏览器;否则清缓存 + 重启。
+
+**FAIL.** `./scripts/lca-ops lobehub restart` 自己 exit 0 但 `ss -ltn | grep 9876` 还是没 port —— lobehub-spa 的 bun dev 死了。可能是 patch apply 期间(见 `_ensure_patches`)抛了 SystemExit 把 bun parent 干掉了。**别 `pkill -f vite`** 那个 self-kill(见 Step 0d FAIL 段),用 `kill $(ss -ltnp | grep 9876 | grep -oP 'pid=\\K[0-9]+')` 或者直接 `kill <bun_pid>` 然后 restart。
+
+---
+
+### Step 1 — Phase-graph timeline (observation run-replay --show-graph)
+
+**WHY.** When a run fails, the first thing an agent (or human) needs is **which phase-graph nodes actually ran and in what order** — not a flat 8-section summary. The `observation.event_hub` plugin fan-outs `phase_graph.node.start/end` and `runtime.reducer.apply` to the observation facts; `observation run-replay --show-graph` reads them back as a human-readable timeline. **This is the canonical first step.**
+
+**DO.**
+
+```sh
+# Top-level alias (preferred — same as below, easier to remember)
+./scripts/lca-ops timeline "$LATEST"
+
+# Equivalent canonical path
+./scripts/lca-ops observation run-replay "$LATEST" --show-graph
+
+# You (agent) — JSON for programmatic parsing
+./scripts/lca-ops observation run-replay "$LATEST" --show-graph --json
+```
+
+**Seam note.** `timeline` 和 `explain` 直接读 `<run_id>.spine.jsonl`(ADR-0167,每个 run 收尾必生成);`debug-run` 读同一份 ledger 加 `manifest.json`。三者都不再依赖 `journal.json` 物化(`RunTerminalizer.terminalize`)。Run 走 `lifecycle.finally` 但未触发 terminalize 时(典型:`think` 阶段后 reducer 直接 `agent_loop.iteration.end`),ledger 里可能只有 `phase_graph.*` 拓扑事件、没有任何失败载体:`explain` 以非零退出并写出缺什么,`debug-run [5/8]` 写出已搜过的载体,`timeline` 仍能出 phase_graph 全图。**所以 `timeline` 是第一选择**,不是 `debug-run`。
+
+**OUTPUT.** A phase-graph node/subgraph timeline from the spine ledger (ADR-0167):
+
+```
+phase_graph.subgraph.enter perceive
+  phase_graph.node.start perceive.main (run_id=run_x)
+  observation.node_enter perceive.main
+  phase_graph.node.end   perceive.main
+phase_graph.subgraph.exit perceive
+phase_graph.subgraph.enter think
+  phase_graph.node.start think.main
+  observation.node_enter think.main
+  ...
+```
+
+**NEXT.** If the timeline shows the run **terminated earlier than expected** (e.g. `act.main` never ran) → advance to Step 2 (spine event trace) to find the failure. If the timeline shows all expected nodes ran and exited → run probably succeeded; use Step 1a for confirmation. If `no facts for run_id=...` → the run predates the observation-9module bundle; fall back to Step 1a (`debug-run`).
+
+**FAIL.** `observation run-replay` returns `no facts for run_id=...` because the `observation-9module` bundle is not loaded in the active profile — add `bundles/observation-9module.yaml` to `profiles/<your-profile>.yaml: bundles:` and `kernel-restart`. If the timeline prints but `observation.node_enter/exit` lines are missing for an older run, the `observation.event_hub` plugin was not loaded when that run executed; older runs cannot be retro-fanned-out.
+
+### Step 1a — One-shot 8-section diagnostic (debug-run)
+
+**WHY.** `debug-run` is the canonical "tell me about this run" entry point (ADR-0122). It collects manifest, journal summary, error_ref, stack frames, and a suggested action in one shot. **It is the flat summary that complements Step 1's timeline view** — use it after Step 1 to read manifest status / error label / replay commands. For pre-observation-9module runs, it is the only first step available.
+
+**DO.**
+
+```sh
+# Human-readable (default)
+./scripts/lca-ops debug-run "$LATEST"
+
+# You (agent)
+./scripts/lca-ops debug-run "$LATEST" --json
+```
+
+**OUTPUT.** 8 sections. Important nuances:
+
+- `[1/8] manifest` shows `status` (failed/passed) and `broken_hop` (e.g. `H3` = the 3rd hop in the phase graph). Also `manifest.plan_ref` if present (16-hex stable ID; see `§按 plan 复现` below).
+- `[2/8] journal` shows spine event count and `missing_seqs` (gaps in seq numbers).
+- `[3/8] kernel.log` is a tail of `traces/runs/<id>/kernel.log`. **Most runs do not have this file** — its absence is *not* evidence of failure loss. (See sidecar step below.)
+- `[4/8] phase.cursor` — last completed phase.
+- `[5/8] error_ref` — a *typed label* like `node=think.main error_kind=internal attempts=1[1:permanent:ValueError]`, optionally followed by ` | <upstream root cause>` when the failing attempt captured provider error text (e.g. `… | Client error '429 Too Many Requests' for url '…'`). **The label is not the traceback** — the full traceback lives in the sidecar / exceptions index (Step 3). The label comes from `manifest.extra.doctor_report.hops.H6.error` when the doctor captured one; a deterministic tool failure records nothing there (no Python raise, so no `exception.caught`), and the label is then read from the ledger's last failure carrier — `step.tool_result.record` (`tool=… failure_kind=… seq=…`), `exception.caught`, or `phase_graph.node.end` with `outcome=failure`. On a run the manifest marks failed, `[5/8]` is never `(none)`: with no carrier anywhere it prints what was searched.
+- `[6/8] stack frames` — top 8 frames only. Empty means the ledger has no `exception.caught`, so no LCA stack was captured; the section says so and points at Step 3.
+- `[7/8] suggested_action` — human hint. Without a manifest `diagnostic` block it is derived from the closed-set `failure_kind`: `transient` is the only kind `SafeExecutor` retries, so anything else reads "not retryable".
+- `[8/8] plan_ref + replay commands` — `plan_ref` (16-hex from manifest) + multi-line **copy-paste-runnable** commands:
+  - `lca-ops journal replay <run_id> --step K --diff-only` (model-visible 重放)
+  - `grep -rl <plan_ref> traces/runs/*/manifest.json` (反查同 plan 所有 run)
+
+**NEXT.** If `status=passed` → done; the user is wrong about the failure. If `status=failed`, advance to Step 2. **Do not start here when an observation timeline is available — go back to Step 1.**
+
+**FAIL.** `debug-run` errors → Step 0 service problem is real; resolve first.
+
+---
+
+### Step 2 — Read the full spine event flow
+
+**WHY.** Step 1 gives you a label. You need the *evidence* — what the LLM actually saw, what tool calls fired, where the chain broke. There are two views; pick by use case.
+
+**DO.**
+
+```sh
+# Default human view (tree indent + payload text + Δms + auto-collapse
+# token/reducer noise). Pass this to the user when they ask "走了一遍啥逻辑".
+# No run_id = latest run (newest mtime under traces/runs).
+./scripts/lca-ops journal trace
+./scripts/lca-ops journal trace "$LATEST"   # explicit, equivalent here
+
+# Compact table — control points + channel + outcome. Fast to scan.
+./scripts/lca-ops journal logs -r "$LATEST"
+
+# Expand payloads (and surface sidecar traceback when -v finds an
+# offloaded event)
+./scripts/lca-ops journal logs -r "$LATEST" -v
+
+# You (agent). Pipe to jq, don't try to parse the human tree.
+./scripts/lca-ops journal trace "$LATEST" --json
+```
+
+**OUTPUT.**
+
+- `journal trace` (default `--human`): a tree with ▸/↳ markers, Δms relative to run start, and folded payload text. Auto-collapses `llm.stream.token`, `runtime.reducer.apply`, paired `transport.route.{enter,exit}`.
+- `journal logs` (default): one line per event, columns `time / channel / execution_point / outcome`.
+- Both read `traces/runs/<id>/events.jsonl` (spine SSOT, ADR-0167).
+
+**NEXT.** Look at the failure. Find the first event with `outcome=failure` (or the `broken_hop` from Step 1). Note its `seq` number and `execution_point`. Advance to Step 3 to find the exception itself — Step 2 alone won't give you a traceback because exceptions over 4 KB are offloaded.
+
+**FAIL.** `journal.jsonl events=0` but `events.jsonl events=N>0` → the run was early-fail, the step-tree never materialized. That's expected for early failures. Don't run `journal steps` (it'll say `journal.json not found`); go straight to sidecar. If the ledger itself is empty or a whole EP family is missing (e.g. no `brain.think.*` rows), check the bus delivery counters with `./scripts/lca-ops events-delivery --json` — per-category `published / persisted / delivered / dropped`, where `dropped > 0` means sent-but-neither-persisted-nor-dispatched (ADR-0184 D2; counters are EventBus in-process memory of the invoking process).
+
+---
+
+### Step 3 — Read the traceback from `<run_id>.exceptions.jsonl` (preferred) or sidecar
+
+**WHY.** Since ADR-2026-09-03 traceback-ssot-hook, every `exception.caught` event is double-written:
+- **Dedicated index**: `<run_id>.exceptions.jsonl` — one JSON line per exception, full payload. **Preferred** for grep.
+- **Spine ledger**: `<run_id>.spine.jsonl` — main event log, exception rows are placeholder `{execution_point, offloaded}` if > 4 KiB.
+- **Offloaded sidecar**: `<sha8>-<SafeClass>.json` (e.g. `1a2b3c4d-AttributeError.json`) — readable name, holds the full encoded event for offloaded exceptions.
+
+`debug-run [5/8] error_ref` only carries the label, not the traceback. If you skip this step, you're guessing.
+
+**DO.**
+
+```sh
+# Preferred: dedicated exceptions index (every exception EP, full payload).
+./scripts/lca-ops journal exceptions "$LATEST"
+
+# Or grep by class:
+./scripts/lca-ops journal exceptions "$LATEST" --grep AttributeError
+
+# Or agent-friendly JSON:
+./scripts/lca-ops journal exceptions "$LATEST" --json | jq '.records[0].payload'
+
+# Manual jq on the index file:
+jq -r 'select(.payload.exception_class=="AttributeError") | .payload.traceback_text' \
+  traces/runs/"$LATEST"/"$LATEST".exceptions.jsonl
+
+# Sidecars (readable names) — only for offloaded exceptions > 4 KiB.
+ls traces/runs/"$LATEST" | grep -E '^[0-9a-f]{8}-[A-Za-z]+\.json$'
+
+# Pick a sidecar and dump its traceback.
+SIDECAR=$(ls traces/runs/"$LATEST"/[0-9a-f]*-*.json 2>/dev/null | head -1)
+[ -n "$SIDECAR" ] && jq -r '
+  "exception_class:   \(.payload.exception_class // "-")",
+  "exception_message: \(.payload.exception_message // "-")",
+  "source_location:   \(.payload.source_location // "-")",
+  "---traceback---",
+  (.payload.traceback_text // "(no traceback_text)")
+' "$SIDECAR"
+
+# Last-resort: FALLBACK.log fires only when main ledger AND exceptions index both failed.
+# Its presence indicates a serious I/O problem (disk full / perms / FS gone).
+[ -f traces/runs/"$LATEST"/FALLBACK.log ] && cat traces/runs/"$LATEST"/FALLBACK.log
+```
+
+**OUTPUT.** The exact `ValueError` / `RuntimeError` / etc., the file:line where it raised, and the full Python traceback.
+
+**NEXT.** You now have the exception class + message + source. Advance to Step 4.
+
+**FAIL.** No exceptions file and no sidecar → the failure was a control-point failure (outcome=failure, no Python traceback). Read the event payload from `<run_id>.spine.jsonl` directly: `jq -r 'select(.seq==N) | .payload' traces/runs/"$LATEST"/"$LATEST".spine.jsonl`.
+
+---
+
+### Step 4 — Fail-path projection
+
+**WHY.** Step 3 gives you *what* threw. Step 4 gives you *why the system decided to stop* — the causal chain from leaf cause up to the StopDecision.
+
+**DO.**
+
+```sh
+./scripts/lca-ops explain "$LATEST"           # human
+./scripts/lca-ops explain "$LATEST" --json    # you (agent)
+```
+
+**OUTPUT.** A `FailureExplanation` projection over `<run_id>.spine.jsonl`: first failure event, its causal ancestors (parent_seq chain), a same-run context window ending at the terminal `kernel.run.stop`, and bottleneck candidates. `--jsonl <path>` overrides the ledger.
+
+**NEXT.** If the traceback points at a code path and `explain` shows the calling phase → Step 5 (read code).
+
+**FAIL.** Exit code 1 with `explain: run '<id>' failed (…) but no failure event was projected from <ledger>. Missing: …` means the run is durably recorded as failed (ledger `kernel.run.stop outcome`, else `manifest.session_status` / `doctor_report.status`) while the ledger holds no failure-carrying event — typically a run that died mid-graph leaving only `phase_graph.*` topology. Read `timeline` (Step 1) and the sidecar (Step 3) instead. A missing ledger also exits 1 and names the expected path. `explain` itself crashing is separate (there is one known `AttributeError: 'int' object has no attribute 'get'` path in `minimal-repro`); if it dies, you have the sidecar traceback anyway, proceed to Step 5.
+
+---
+
+### Step 4b — Observation-plane diagnostic (preferred when observation facts are present)
+
+**WHY.** Observation facts (PlanBlueprint / NodeEnter / NodeExit / DecisionTrace /
+ControlTrace / ToolCallTrace / LLMCallTrace / ArtifactSnapshot / SubgraphResolve /
+BundleLoad + diagnosis diff/explanation/replay) are emitted by
+`observation-9module` bundle plugins. When present, they let you skip Steps 2–4
+manual work and get a typed, structured diagnosis in one call.
+
+**DO.**
+
+```sh
+# Like a human-written diagnostic: summary → root_cause → graph → next_actions
+./scripts/lca-ops observation run-explain "$LATEST"           # human
+./scripts/lca-ops observation run-explain "$LATEST" --json    # you (agent)
+
+# Show every observation / phase_graph fact, filter by node or kind
+./scripts/lca-ops observation trace-show "$LATEST"
+./scripts/lca-ops observation trace-show "$LATEST" --node act.main
+./scripts/lca-ops observation trace-show "$LATEST" --kind visit_end
+./scripts/lca-ops observation trace-show "$LATEST" --filter phase_graph.subgraph
+./scripts/lca-ops observation trace-show "$LATEST" --seq 16 --human --full
+
+# Time-ordered replay with per-node inputs / outputs / decisions
+./scripts/lca-ops observation run-replay "$LATEST"
+./scripts/lca-ops observation run-replay "$LATEST" --json
+./scripts/lca-ops observation run-replay "$LATEST" --show-graph
+
+# Show plan blueprint (expected graph)
+./scripts/lca-ops observation plan-show profiles/web-standard.yaml
+```
+
+**OUTPUT.** Structured JSON (default): `summary` + `root_cause_chain[]` +
+`graph_overview` + `next_actions[]` + `details_available`. Each root cause step
+points at a fact kind, a node id, and a contract clause. `next_actions` are
+copy-paste-runnable commands.
+
+**NEXT.** If `run-explain` summary is empty (`outcome=success`) → run passed;
+verify with user. If it identifies a missing node / denied control / failed
+artifact → use `trace-show --node <id>` to inspect that node's inputs / outputs
+(`--json` carries the untruncated payload; `--human` prints one compact line per
+lifecycle event with outcome, elapsed, route and port names), then Step 5 to read
+code. `run-replay --show-graph` prints the same lines for the whole run in order.
+
+**FAIL.** No observation facts present → the `observation-9module` bundle is
+not loaded in the active profile. Add `bundles/observation-9module.yaml` to
+`profiles/<your-profile>.yaml` and re-run.
+
+---
+
+### Step 5 — Locate the failure in code
+
+**WHY.** Now you read the actual code path. The traceback told you `path/to/file.py:line`. Find that line. Read the surrounding 30 lines and the docstring.
+
+**DO.**
+
+```sh
+# Read the file:line from the traceback.
+# Use rg / read_file / your tool of choice.
+```
+
+**NEXT.** You now classify the failure into one of:
+
+| Pattern | Likely fix surface |
+|---|---|
+| New execution_point not in `EXECUTION_POINTS` whitelist | observability whitelist constant (e.g. `event_record.py`) |
+| Missing capability/dependency in plugin Manifest | `lca/plugins/<plugin>/manifest.py` |
+| Reducer wrote state outside `apply_*` | `lca/cognition/<area>/reducer.py` |
+| Tool bypassed Body (sandbox/transport direct import) | audit with `./scripts/lca-ops audit-direct-commands` |
+| Hook re-introduced where forbidden | `./scripts/lca-ops audit-hook-attach` |
+| Side effect without reducer first | Body / SafeExecutor |
+| Profile topology missing a provides/requires | `./scripts/lca-ops inspect-tree <profile>` then `./scripts/lca-ops why-plugin <id>` |
+
+If you find the failure root cause is *not* a single missing line (e.g. protocol mismatch, missing ADR) → escalate to Step 6 (diff against a passing run).
+
+**FAIL.** Code is unclear → Step 6.
+
+---
+
+### Step 6 — Diff against a passing run (optional, for non-obvious bugs)
+
+**WHY.** When the traceback is "obvious" but the *reason* isn't (the code path always ran before; why did it fail now?), the fastest disambiguation is a passing run from yesterday.
+
+```sh
+./scripts/lca-ops diff-runs <failing_id> <passing_id>
+./scripts/lca-ops diff-context <failing_id> --step N
+```
+
+For narrower comparisons, `optimize <run_id>` ranks candidates by latency/token/retries; `cost <run_id>` shows the LLM spend.
+
+**NEXT.** If diff reveals a profile/prompt/bundle change → that change is the regression. If diff is empty → random non-determinism (LLM, network); not a code fix.
+
+---
+
+### Step 6.5 — Acknowledge the live-kernel invariant (READ BEFORE Step 7)
+
+**WHY.** LCA 的 kernel 是常驻 Python 进程(`uv run lca_kernel serve`,
+PID/port 用 `./scripts/lca-ops status` 查)。所有 spine deriver、LLM adapter、
+facade、命令 handler 都是 kernel 进程内 import 的对象 —— **修改 `lca/` /
+`lca_kernel/` 任何文件不重启,对线上 run 不生效**。`pytest` 跑的是隔离逻辑,
+绕开 kernel,不等于"线上生效"。
+
+**何时一定要 kernel-restart:**
+
+- 修改 `lca/` 内任何 `.py`(除纯 `tests/` + CLI 单文件测试)。
+- 修改 `lca_kernel/` 内任何 `.py`。
+- 修改 Profile / Bundle / Plugin / Manifest 配置。
+- 修改 spine 的 deriver / sink / sundry reflective plugins —— 这些是
+  runtime-loaded,改了不重启不会重新 import。
+
+**何时不需要 kernel-restart:**
+
+- 改 docs / Agent Notes / tests:`pytest` 验证即可。
+- 改 CLI 单文件测试:`pytest tests/cli/...` 已能验证。
+- 改 Profile YAML:`kernel-restart` 还是会重新加载它。
+
+**DO.**
+
+```sh
+# Step 6.5 在 Step 7 之前的状态核查
+./scripts/lca-ops status --json | jq '.services[] | select(.name=="kernel_serve") | .pid'
+# 记下 PID;kernel-restart 后 PID 会变,PID 不变 ⇒ 老进程仍在跑。
+```
+
+**FAIL.** PID 不变 ⇒ restart 没生效。运行 `lca-ops logs` 看 boot 摘要,
+确认 `<pid>` 与新 spawn 一致。
+
+---
+
+### Step 7 — Verify the fix on the live system (do not skip)
+
+**WHY.** Debugging is read-only. *Verifying* the fix requires a new run. Don't tell the user "fixed" until you've reproduced.
+
+**DO.**
+
+```sh
+# If you changed code:
+./scripts/lca-ops kernel-restart --json
+
+# Then re-trigger the run via the same path the user used.
+# (Run via API / scenario file / curl — whatever the user's flow is.)
+
+# Then re-enter this SOP at Step 1 with the new run_id.
+LATEST2=$(ls -1t traces/runs | head -1)
+./scripts/lca-ops debug-run "$LATEST2" --json
+```
+
+**OUTPUT.** `status=passed`, no exception class matching the prior bug.
+
+**NEXT.** If passed, report. If still failing with same exception class → the surface is wrong, go back to Step 3 with the new run's sidecar.
+
+**FAIL.** `kernel-restart` itself fails → Step 0.
+
+---
+
+### Step 8 — Report to the user
+
+**WHY.** A coding agent that says "I fixed it" without reporting the *evidence trail* is not finished. The user wants the human-readable view.
+
+**DO.** Produce a report with this exact three-part structure:
+
+1. **Facts** — what `debug-run` / sidecar / `explain` actually printed.
+   Quote the exception class, message, and the exact `file:line`.
+   Do not paraphrase.
+2. **Inferred** — your classification of the bug (which row of the
+   Step-5 table it matches) and the causal chain in 2–3 sentences.
+3. **Fix** — which file(s) you intend to change and why, and the
+   verification result (Step 7). If you did not run Step 7, say so
+   explicitly — do not claim a fix is done until you have.
+
+Then offer the user the human-readable view(s):
+
+```sh
+# Tree with payloads + Δms (default --human).
+# No run_id = latest run; pass $LATEST to be explicit.
+./scripts/lca-ops journal trace
+./scripts/lca-ops journal trace "$LATEST"
+
+# narrative.md story
+./scripts/lca-ops journal narrative "$LATEST"
+
+# DSH-style HTML trajectory
+./scripts/lca-ops journal trajectory "$LATEST"        # → traces/runs/<id>/journal.trajectory.html
+```
+
+Pick whichever the user actually asked for. Never hand the user raw `jq` output as a "human view".
+
+---
+
+## Bug-report writing rules
+
+When you (the agent) write the bug summary for the user:
+
+- **Lead with the evidence**, not the diagnosis. Show the sidecar traceback first.
+- **Cite paths and seqs**, never vague references like "look at the journal".
+- **Distinguish what you verified from what you inferred.** "Sidecar says X" is verified; "I think this caused Y" is inferred.
+- **Never claim fixed without Step 7.** If you only changed code and ran no run, the report says "code changed; verification pending".
+- **One bug per report.** If the traceback shows two unrelated exceptions, file them separately.
+
+---
+
+## Don'ts (also enforced by sync check)
+
+- ❌ `lca-ops replay <run_id>` — that is not a top-level command. Use `./scripts/lca-ops journal replay <run_id> --step N` (`--step` is required). There is no `--no-llm` flag because journal replay only dumps messages + actions and never calls the LLM — that mode is already the default.
+- ❌ `/v1/chat/completions` to "trigger a run" — it's a LobeHub UI proxy (ADR-0099) that streams OpenAI-compatible chunks **without** registering a run_id or writing `traces/runs/<id>/`. If you want a debuggable run, use `lca-ops runs create` (CLI) or `POST /runs` (HTTP).
+- ❌ `lca-ops diagnose phase-error` — alias removed.
+- ❌ `LCA_DEBUG=1` — env var does not exist (replaced by fail-loud).
+- ❌ `cat traces/lca_journal.jsonl` — dead path; the journal SSOT is `traces/runs/<id>/events.jsonl`.
+- ❌ `cat traces/runs/<id>/kernel.log` and concluding "no kernel log = bug": see Step 1 — most runs don't write one.
+- ❌ Patching source + restart as the *first* move. ADR-0122 says one command should locate any bug; if it doesn't, that's a missing ADR, not a missing grep.
+- ❌ Skipping Step 1 (timeline) and going straight to `debug-run`. The timeline is the canonical first read; `debug-run` is the flat summary that complements it. For pre-observation-9module runs the timeline returns `no facts`, then `debug-run` is the fallback.
+
+## How to trigger a run (canonical entry point)
+
+The LCA carrier has exactly **one** run-creation seam: `POST /runs`
+(`handlers/runs/api/command_endpoints.create_run`). It allocates the
+`run_id`, registers the session, and starts the agent loop. Everything
+else in `traces/runs/<id>/` (manifest, profile_snapshot, spine.jsonl,
+sidecars) is downstream of that one call.
+
+```sh
+# CLI (preferred for coding agents):
+lca-ops runs create --user-text "请把昨日的 csv 按 region 汇总"
+
+# HTTP (for shell scripts / external integrations):
+# 等价于浏览器 LobeHub 会发的请求 —— 走 Next rewrite `/lca-api/runs` → gateway `/runs`。
+curl -X POST "${LCA_FRONTEND_URL:-http://192.0.2.10:3010}/lca-api/runs" \
+  -H "Authorization: Bearer ${LCA_TOKEN:-lca-local}" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "messages": [{"role": "user", "content": "..."}],
+    "mode": "solo",
+    "agent": {"id": "agt_aVxY6ag9MbMc", "name": "..."},
+    "profile": "web-standard"
+  }'
+# → {"run_id": "...", "trace_id": "...", "live_url": "/runs/<id>/live"}
+```
+
+After dispatch, immediately query the terminal state with
+`lca-ops debug-run <run_id>` (8 sections, including the new
+`plan_ref` + runnable replay commands in `[8/8]`) or stream
+`lca-ops journal trace <run_id>` for the human-readable tree view.
+
+> **Why this is not `/v1/chat/completions`:** that endpoint exists for
+> the LobeHub Next.js UI (ADR-0099). It accepts OpenAI-shaped payloads
+> and returns OpenAI-shaped chunks, but **does not** write any
+> `traces/runs/<id>/` artifact. Hitting it as if it were "the run API"
+> silently produces zero debug evidence — the most common
+> "I asked the kernel to do X and got nothing" failure. If you need a
+> run you can debug-run, you must go through `POST /runs`.
+
+---
+
+## Files in `traces/runs/<run_id>/` (what may or may not exist)
+
+| File | | When present |
+|---|---|---|
+| `events.jsonl` | spine SSOT (ADR-0167) | every run |
+| `manifest.json` | `ManifestMaterializer` | every run |
+| `profile_snapshot.json` | profile snapshot | every run |
+| `journal.json` | step-tree (`lca.journal/3.1`) | only if run reached step tree (early-fail runs lack it) |
+| `journal.narrative.md` | `StepNarrativeWriter` | same as `journal.json` |
+| `<sha256>.json` | I10 size-offload sidecar (≥ 4 KB event) | only if any event exceeded `_ATOMIC_THRESHOLD` (typical for exception-bearing events) |
+| `<run_id>.system-prompt.txt` | `FileSink` copy of each `llm.request.header` `system` field | when the run published at least one request header |
+| `kernel.log` | `record_run_failure` (terminal failure fallback) | **mostly absent** — written only when the run's finishing path itself failed; a single best-effort line, not an internals log |
+
+> **Two "kernel logs" — do not confuse them.**
+>
+> | Path | Owner | What it holds | When to read |
+> |---|---|---|---|
+> | `/tmp/lca-kernel.log` | kernel process stdout/stderr (written by `lca-ops kernel_serve` spawn) | Every Python `Traceback`, every `INFO: POST /runs HTTP/1.1 500`, every `anomaly_detector:` line, across **all** requests | **First place to look** when `lca-ops status` says `kernel_serve: healthy` but a specific endpoint returns 5xx. `lca-ops logs` is an alias for `journal logs` which tails this file. |
+> | `traces/runs/<id>/kernel.log` | `record_run_failure()` | A single `run_failure_observed ...` line, only if the run's finishing path itself failed | Use the run-debug SOP Step 3 after you already have a `run_id`. |
+>
+> The trace you need for "POST returns 500" almost always lives in `/tmp/lca-kernel.log`, **not** in any `traces/runs/` directory.
+
+---
+
+## Maintenance (must be respected when editing CLI or this doc)
+
+- **This SOP must not lie.** Run `uv run python scripts/check_run_debug_sync.py` after any change to either the CLI or this document. CI should wire this script; if not, wire it.
+- **One-directional sync.** New CLI commands are *not* a failure — they appear in `./scripts/lca-ops --help` and agents discover them. SOP references to commands that no longer exist *are* a failure.
+- **Sync mechanism.** The script invokes `./scripts/lca-ops --help` (and `<group> --help` for groups) to read the live command registry, parses the `Commands:` block, and diffs against every `` `lca-ops …` `` backtick path this SOP contains. The path prefix `./scripts/` is optional in the SOP — both `` `./scripts/lca-ops debug-run` `` and `` `lca-ops debug-run` `` are matched. CI cost: ~30 s.
+- **When you add a command** here, also update `AGENTS.md` §6 if it's a high-frequency command. Don't duplicate the matrix in both files.
+- **When you remove/rename a CLI command**, search this SOP for the old name; the sync check will tell you which lines to fix.
+- **Sidecar rules and I10 threshold** live in `lca/infrastructure/observability/spine/sinks/file_sink.py:_ATOMIC_THRESHOLD` — if that constant moves or the threshold changes, update Step 3 here.
+- **Do not hand-write the command matrix.** If you find yourself listing commands and their arguments here, push back: that's SSOT duplication and the sync check will go stale.

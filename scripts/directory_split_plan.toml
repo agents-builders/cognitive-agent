@@ -1,0 +1,36 @@
+# Semantic directory split plan — see scripts/split_oversized_directories.py
+
+max_per_dir = 5
+
+[lca.contracts.observability]
+journal = ["journal_format_errors.py", "journal_formatter.py", "journal_store.py", "run_journal.py", "ledger.py"]
+event = ["event_descriptor.py", "event_descriptor_registry.py", "event_identity.py", "meta_event_taxonomy.py", "session_events.py"]
+cursor = ["loop_cursor.py", "loop_cursor_payloads.py", "loop_projection.py", "writable_matrix.py"]
+trace = ["w3c_trace_context.py", "trace_tool.py", "genai_semantic.py", "exception_capture.py"]
+evidence = ["evidence.py", "fsync.py", "outcome.py", "replay.py"]
+registry = ["named_registry.py", "run_locator.py", "run_manifest.py", "status.py", "resume.py"]
+cost = ["cost.py", "token_meter.py"]
+closure = ["assistant_ep_closure.py", "composio_ep_closure.py", "skill_meta_ep_closure.py"]
+infra = ["close_barrier.py", "cli_debug_command.py", "coding_agent_tools.py", "cordis_event_table.py"]
+core = ["error_codes.py", "incarnation.py", "ports.py", "ssot.py"]
+
+[lca.cognition.body]
+executor = ["safe_executor.py", "pipeline_safe_executor.py", "simple_body.py", "cursor_record.py"]
+tools = ["tool_registry.py", "tool_batch_execution.py", "tool_batch_executor.py", "tool_result_preview.py", "tool_wire_gate.py"]
+actions = ["action_catalog.py", "action_handlers.py", "action_registry.py", "team_message_tool.py"]
+delegation = ["delegation_cache.py", "delegation_target.py"]
+internal = ["_retry_classification.py", "tool_journal_emit.py"]
+
+[lca.cognition.brain]
+pipeline = ["cognitive_pipeline.py", "modular_brain.py", "default_factory.py", "context_manifest.py"]
+reasoner = ["reasoner.py", "critic.py", "synthesizer.py", "null_critic.py", "null_synthesizer.py"]
+prompt = ["conversation_prompt.py", "sandbox_prompt.py", "skill_router.py", "tool_call_stream.py", "leaked_tool_call.py"]
+gate = ["gate_service.py", "hook_registry.py"]
+
+[lca.contracts.atoms]
+artifact = ["artifact_state.py"]
+control = ["control_slot.py"]
+functional = ["functional_group.py"]
+plan = ["plan_template.py"]
+misc = ["enums.py", "exhaustive.py", "ids.py", "relation.py", "scope.py"]
+telemetry_group = ["semantic_keys.py", "telemetry.py"]

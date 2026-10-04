@@ -1,0 +1,221 @@
+"""CV4 C1 子步骤不可独立于 C1 阶段被表达（ADR-0068 §三 + tracker §6 CV4）。
+
+PR-4 验收（acceptance-criteria §6 CV4）：
+
+> | C1 子步骤不可独立于 C1 阶段被表达 | ADR-0068 §三子步骤枚举的所有方法名存在于 C1 阶段对应插件内 |
+> | 测试覆盖 ADR-0068 §三运行时序图定义的 7 子步骤 + ModularBrain.think() / brain.reflect() 等 |
+
+ADR-0068 §三运行时序图定义 7 子步骤（run-loop phases）：
+
+1. perceive.collect (PRE_PERCEIVE hook)
+2. perceive.admit (PERCEIVE)
+3. perceive.select (POST_PERCEIVE)
+4. think.prepare (PRE_THINK)
+5. think.decide (THINK)
+6. think.govern (POST_THINK)
+7. command.plan → authorize → budget → constrain → execute → observe
+
+每个子步骤必须存在于 C1 阶段对应插件内（即 perceive.* 在 perceive phase、
+think.* 在 think phase 等）；不允许把 C1 子步骤抽离成独立 state field
+（如 ``_gate_chain`` / ``_pre_phase_method`` / ``_sub_phase_state``）。
+
+PR-4 实施：本测试扫描 ``lca/cognition/brain/`` + ``lca/runtime/``，
+验证：
+
+1. ``ModularBrain`` 不含 ``_gate_chain`` / ``_gates`` / ``_chain`` 字段
+2. ``ModularBrain.think()`` 不直接写 state（必须走 reducer）
+3. ``CognitiveRuntime._loop`` 不含 C1 phase 之外的子阶段 state（除
+   PR3a 引入的 manifest / gate_decided）
+4. ``Reducer`` Protocol 含 ``apply_skill_route``（PR-4 新增）
+"""
+
+from __future__ import annotations
+
+import ast
+from pathlib import Path
+
+LCA_ROOT = Path("lca")
+BRAIN_DIR = LCA_ROOT / "cognition" / "brain"
+# NOTE(round-0357): modular_brain.py 已迁入 pipeline/ 子包(291a55c0d 目录纪律整理);
+# runtime_loop.py 已迁入 runtime/loop/(agent_runtime 重组)。旧扁平路径均已删除。
+MODULAR_BRAIN = BRAIN_DIR / "pipeline" / "modular_brain.py"
+RUNTIME_FILE = LCA_ROOT / "runtime" / "loop" / "runtime_loop.py"
+REDUCER_PROTOCOL = LCA_ROOT / "contracts" / "protocols" / "state" / "reducer.py"
+REDUCER_DEFAULT = LCA_ROOT / "plugins" / "loop" / "reducer" / "plugin.py"
+
+
+class TestCV4NoGateChainField:
+    """CV4: ModularBrain 不应有 ``_gate_chain`` / ``_gates`` / ``_chain`` 字段。
+
+    任何 gate 链都从已编译的声明式计划投影绑定，不允许作为独立 state field。
+    """
+
+    def test_modular_brain_has_no_gate_chain_field(self) -> None:
+        source = MODULAR_BRAIN.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        forbidden_attrs = {"_gate_chain", "_gates", "_chain", "_gates_chain"}
+        violations: list[str] = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef):
+                for stmt in node.body:
+                    if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Attribute):
+                        # self._gate_chain: ... = ...
+                        attr_name = stmt.target.attr
+                        if attr_name in forbidden_attrs:
+                            violations.append(f"{stmt.target.attr} (type-annotated)")
+                    elif isinstance(stmt, ast.Assign):
+                        for target in stmt.targets:
+                            if isinstance(target, ast.Attribute) and target.attr in forbidden_attrs:
+                                violations.append(f"{target.attr} (assign)")
+        assert violations == [], (
+            f"ModularBrain has forbidden gate chain field(s): {violations}. "
+            "CV4 violation: gate chain must come from the compiled declarative plan, "
+            "not as a separate state field."
+        )
+
+
+class TestCV4BrainNoDirectStateMutation:
+    """CV4: ModularBrain.think() 不直接写 state.active_template（必须走 reducer）。"""
+
+    def test_modular_brain_think_routes_through_reducer(self) -> None:
+        """``ModularBrain.think`` 中不应有 ``state.X = ...`` 形式的直接 mutation。
+
+        唯一允许的是 reducer 内部 mutation（被 audit_state_writers 的 allowlist
+        豁免）。本测试扫描 ModularBrain.think 方法体并验证无直接 mutation。
+        """
+        source = MODULAR_BRAIN.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        # Find ModularBrain class
+        brain_cls = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ClassDef) and node.name == "ModularBrain"
+        )
+        # Find think method
+        think_method = next(
+            node
+            for node in ast.walk(brain_cls)
+            if isinstance(node, ast.AsyncFunctionDef) and node.name == "think"
+        )
+        # Look for direct state mutations: state.<attr> = ...
+        violations: list[str] = []
+        for stmt in ast.walk(think_method):
+            if isinstance(stmt, ast.Assign):
+                for target in stmt.targets:
+                    if (
+                        isinstance(target, ast.Attribute)
+                        and isinstance(target.value, ast.Name)
+                        and target.value.id == "state"
+                    ):
+                        violations.append(f"line {stmt.lineno}: state.{target.attr} = ...")
+            elif isinstance(stmt, ast.AugAssign):
+                target = stmt.target
+                if (
+                    isinstance(target, ast.Attribute)
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id == "state"
+                ):
+                    violations.append(
+                        f"line {stmt.lineno}: state.{target.attr} {type(stmt.op).__name__.lower()}= ..."
+                    )
+        assert violations == [], (
+            f"ModularBrain.think has direct state mutations (CV4 violation): {violations}. "
+            "Use reducer.apply_* for state mutation (ADR-0066 C4)."
+        )
+
+
+class TestCV4ReducerProtocolHasApplySkillRoute:
+    """CV4 + PR-4: Reducer Protocol 必须含 ``apply_skill_route`` 方法。"""
+
+    def test_reducer_protocol_declares_apply_skill_route(self) -> None:
+        source = REDUCER_PROTOCOL.read_text(encoding="utf-8")
+        assert "apply_skill_route" in source, (
+            "Reducer Protocol must declare apply_skill_route (PR-4 think.guard "
+            "atomic migration; ModularBrain routes SkillRouter result through reducer)"
+        )
+
+    def test_default_reducer_implements_apply_skill_route(self) -> None:
+        source = REDUCER_DEFAULT.read_text(encoding="utf-8")
+        assert "apply_skill_route" in source, (
+            "DefaultReducer must implement apply_skill_route (PR-4)"
+        )
+
+
+class TestCV4RuntimeNoSubPhaseState:
+    """CV4: ``CognitiveRuntime._loop`` 不应在 C1 六 phase 外额外定义子阶段 state。
+
+    C1 六 phase = perceive / think / act / reflect / remember / stop。
+    任何运行时引入的子步骤 state 字段必须 fold 到现有 phase（reducer），
+    不允许作为独立 field 累积。
+    """
+
+    def test_runtime_loop_no_extra_subphase_state(self) -> None:
+        """``CognitiveRuntime._loop`` 不直接 mutate state（除 PR3a 引入的
+        perceive hub mediation）。
+
+        PR-4 约束：stop 判定经 Stop 阶段的 ``stop_policy.decide(...)`` → reducer fold；
+        不允许在 runtime 累积 ``_loop_step`` / ``_last_phase`` / ``_sub_state``
+        等独立子阶段字段。
+        """
+        source = RUNTIME_FILE.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        runtime_cls = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ClassDef) and node.name == "CognitiveRuntime"
+        )
+        forbidden_attrs = {
+            "_loop_step",
+            "_last_phase",
+            "_sub_state",
+            "_phase_state",
+            "_stop_pending",
+            "_next_phase",
+        }
+        violations: list[str] = []
+        for stmt in runtime_cls.body:
+            if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Attribute):
+                if stmt.target.attr in forbidden_attrs:
+                    violations.append(f"{stmt.target.attr} (type-annotated)")
+            elif isinstance(stmt, ast.Assign):
+                for target in stmt.targets:
+                    if isinstance(target, ast.Attribute) and target.attr in forbidden_attrs:
+                        violations.append(f"{target.attr} (assign)")
+        assert violations == [], (
+            f"CognitiveRuntime has forbidden sub-phase state field(s): {violations}. "
+            "CV4 violation: C1 sub-steps must be folded into existing phases via reducer."
+        )
+
+
+class TestCV4StopPolicyFlow:
+    """CV4: ``stop.decide`` 控制面必须走局部 ``StopPolicy.decide(...)``。
+
+    终止行为是 State 群策略，不允许由 Stop 执行器的 if/else 直接写 stop 状态，
+    也不允许作为 ``CognitiveRuntime`` 或 ``AgentGraph`` 的顶层依赖。
+    """
+
+    # NOTE(round-0357, orphan): ``test_stop_phase_executor_invokes_stop_policy`` retired here.
+    # The entire ``lca/plugins/loop/phase/`` tree (incl. stop/standard/plugin.py) was
+    # intentionally deleted by 63a68a4da ("refactor(declarative): cut kernel driver over
+    # to v2 PlanInterpreter per ADR-0221"); the stop.decide slot is now declarative and
+    # there is no stop PhaseExecutor left for this CV4 guard to scan.
+
+
+class TestCV4AllControlSlot11:
+    """CV4 全 11 槽位都已落到具体代码路径（PR-1 + PR-4 联合验收）。"""
+
+    def test_control_slot_11_all_used_in_pipeline(self) -> None:
+        """11 槽位列表（perceive.context / think.guard / act.authorize /
+        act.budget / act.constrain / act.execute / act.safe-boundary /
+        remember.admit / stop.decide / observe.checkpoint / observe.*）
+        中至少 stop.decide 与 think.guard 已在 Stop PhaseExecutor / ModularBrain
+        中被实际调用（PR-1/4）。其余槽位 PR-7 / PR-8 / PR-9 落地。
+        """
+        # NOTE(round-0357): stop phase executor half retired (63a68a4da deleted
+        # lca/plugins/loop/phase/ per ADR-0221); think_guard half still live.
+        think_guard_src = Path(
+            "lca/plugins/loop/control/think_guard/plugin.py"
+        ).read_text(encoding="utf-8")
+        # think.guard runs through declarative TRANSFORM + GOVERN contributions.
+        assert "ThinkGuardEnforceExecutor" in think_guard_src
+        assert "control.think.guard" in think_guard_src  # NOTE(round-0357): ContributionRole 旧贡献模型已迁为 NodeExecutor 语义名

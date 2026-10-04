@@ -1,0 +1,545 @@
+"""契约协议包 —— 全量 re-export，保持 ``from lca.contracts.protocols import X`` 兼容。
+子模块按层拆分：
+infra / cognition / embodiment / memory / runtime / agent / orchestration
+跨层机制见 ``lca.contracts.mechanisms``，跨层纯类型见 ``lca.contracts.models.core``。
+
+This module is a re-export barrel: every ``from X import Y`` below is a
+deliberate public re-export, not an unused import. ``__all__`` is the
+explicit sorted list at the bottom of this file — adding a new symbol
+requires appending both the import and an ``__all__`` entry.
+"""
+
+from __future__ import annotations
+
+# ── 跨层机制（re-exported from mechanisms for convenience）──
+from lca.contracts.mechanisms import (
+    ComponentRegistryProtocol,
+    EventBus,
+    Hook,
+    HookRegistry,
+    NamedRegistryProtocol,
+    OrchestrationRegistryProtocol,
+)
+
+# ── ActionHandler（ADR-0074 插件化行动处理器）────────
+from lca.contracts.protocols.act.action.handler import ActionHandler, ActionHandlerRegistry
+
+# ── CommandEnvelope + RunFact (ADR-0068 §五 + ADR-0074 PR-7 V4) ─────────
+from lca.contracts.protocols.act.command.envelope import (
+    BudgetReservation,
+    CapabilityGrant,
+    CommandEnvelope,
+    DecisionRef,
+    EnvelopeVerdict,
+    RunDelta,
+    RunFact,
+    Verdict,
+    command_envelope_to_dict,
+    envelope_aggregate_verdict,
+    envelope_is_authorized,
+    mint_envelope,
+    warn_deprecated_envelope_constructor,
+)
+
+# ── EffectHandler 与 EffectHandlerRegistry（ADR-0074 / ADR-0068）──────
+from lca.contracts.protocols.act.effect.handler import (
+    EffectCapabilities,
+    EffectHandler,
+    EffectHandlerRegistry,
+)
+
+# ── L1 Body / 行动执行协议 ───────────────────────────────
+from lca.contracts.protocols.act.embodiment.embodiment import Body
+
+# ── 工具执行管线（五阶段可拦截管线）────────────
+from lca.contracts.protocols.act.tool.pipeline import (
+    ToolDefinition,
+    ToolExecutionContext,
+    ToolExecutionPipeline,
+    ToolExecutionResult,
+    ToolPostDecision,
+    ToolPreDecision,
+    ToolProvider,
+    ToolRenderer,
+)
+
+# ── Agent client protocol (PR-6; pure add) ─────
+from lca.contracts.protocols.agent import (
+    AgentClient,
+    AgentRequest,
+    AgentResponse,
+)
+
+# ── L3 Agent / Team 入口 ──────────────────────────────────
+from lca.contracts.protocols.collaboration.agent.agent import AgentUnit
+
+# ── 自动组队（角色库与选角契约，ADR-0042）────────
+from lca.contracts.protocols.collaboration.casting.casting import RoleLibrary, TeamCaster
+
+# ── L3 团队编排协议 ──────────────────────────────────────
+from lca.contracts.protocols.collaboration.graph.node_executor import (
+    GraphNodeExecutionContext,
+    GraphNodeExecutor,
+    GraphNodeExecutorRegistryProtocol,
+)
+from lca.contracts.protocols.collaboration.orchestration.orchestration import (
+    MemberInvoker,
+    SharedMemoryStore,
+    Synthesizer,
+    TeamAssembly,
+    TeamStage,
+    TeamStrategy,
+)
+from lca.contracts.protocols.collaboration.team.seam import TeamSeamFactoryProtocol
+from lca.contracts.protocols.collaboration.team.unit import TeamUnit
+
+# ── LogicAddress 6 维（ADR-0069 §二 + ADR-0074 V9）────────────────
+from lca.contracts.protocols.composition.logic_address import (
+    LogicAddress,
+    LogicAddressScore,
+    canonical_scope_of,
+    declared_dim_count,
+    is_complete_address,
+    score_logic_address,
+)
+from lca.contracts.protocols.composition.relation import (
+    TypedRelation,
+    typed_relation_to_dict,
+    typed_relations_from_iter,
+)
+from lca.contracts.protocols.declarative.declarative_1.declarative_execution import (
+    DeltaReducer,
+    EffectDispatcher,
+    JournalCommitter,
+)
+
+# ADR-0221: ``NodeExecutor`` is the sole node-level executor Protocol
+# (replaces ``PhaseExecutor``). Re-exported alongside
+# ``GraphNodeExecutor`` (the orchestration-graph variant) for callers
+# that distinguish them.
+from lca.contracts.protocols.declarative.declarative_1.node_executor import (
+    NodeContext as PhaseNodeContext,
+)
+from lca.contracts.protocols.declarative.declarative_1.node_executor import (
+    NodeExecutor,
+)
+from lca.contracts.protocols.declarative.declarative_1.node_executor import (
+    NodeInput as PhaseNodeInput,
+)
+from lca.contracts.protocols.declarative.declarative_1.node_executor import (
+    NodeOutput as PhaseNodeOutput,
+)
+from lca.contracts.protocols.declarative.declarative_2.declarative_phase_graph import (
+    DECLARATIVE_PLAN_VERSION,
+    PLUGIN_SPEC_VERSION,
+    ActionAuthorityPlan,
+    ActionScopeAuthority,
+    CapabilityBinding,
+    CapabilityDeclaration,
+    CognitivePhaseGraphPlan,
+    DeclarativeValidationError,
+    EffectPolicyPlan,
+    PhaseEdge,
+    PhaseNode,
+    PlanProvenance,
+    PluginConfiguration,
+    PluginImplementation,
+    PluginRelation,
+    PluginSpec,
+    PluginSpecKind,
+    RelationType,
+    ReplacementDecision,
+    SemanticPhase,
+    ValidationIssue,
+    ValidationReport,
+)
+
+# ControlEntry retired in ADR-0221; phase control surfaces are now
+# additional NodeExecutor nodes in each phase subgraph bundle.
+from lca.contracts.protocols.gate.budget_policy import BudgetPolicy
+
+# ── 控制面单一入口（ADR-0066 + tracker §19）─────────────────────
+from lca.contracts.protocols.gate.control_verdict import ControlVerdict, ControlVerdictKind
+
+# ── Lead 预算策略解析接缝 ─────────────────────────────────
+from lca.contracts.protocols.gate.lead_budget_policy import LeadBudgetPolicyResolver
+from lca.contracts.protocols.gate.loop_guard import LoopGuardEvaluator, LoopGuardVerdict
+
+# ── Graph kernel protocols (PR-1 foundation; pure add) ─────
+from lca.contracts.protocols.graph import (
+    BindingKind,
+    DispatchDecision,
+    NodeInput,
+    NodeIOSchema,
+    NodeOutput,
+    NodeSchemaError,
+    NodeStrategy,
+    Plan,
+    PlanEdge,
+    PlanNode,
+    PortSpec,
+    StrategyContext,
+    VisitRecord,
+)
+from lca.contracts.protocols.graph import (
+    SubgraphReference as GraphSubgraphReference,
+)
+
+# ── ArtifactClosure（ADR-0074 可定制 loop exit 闭合文本）────────
+from lca.contracts.protocols.journal.artifact.closure import ArtifactClosure
+
+# ── Durable effect idempotency（ADR-0075 / full-plugin-remediation §5）────
+from lca.contracts.protocols.journal.idempotency.idempotency import (
+    IdempotencyClaim,
+    IdempotencyStore,
+)
+
+# ── 执行日志投影协议（ADR-0037 Journal-as-Truth）────────
+from lca.contracts.protocols.journal.journal.journal import JournalProjector
+
+# ── 可观测性协议（业务层唯一发射门面）──────────────────
+from lca.contracts.protocols.journal.observability.observability import (
+    ObservabilityBackend,
+    Telemetry,
+)
+
+# ── ScopePlan + CompiledRunPlan（ADR-0068 §一 + ADR-0074 PR-3）──────
+from lca.contracts.protocols.journal.phase.observation import (
+    PhaseBudgetSnapshot,
+    PhaseObserver,
+    PhaseObserverContribution,
+    PhaseObserverRegistry,
+    PhaseStateSnapshot,
+)
+
+# ── L1 Memory 协议 ───────────────────────────────────────
+from lca.contracts.protocols.memory.memory import MemorySystem, RetrievalPolicy, TemporalMemoryStore
+
+# ── 操作技能库（与角色库平行，ADR-0048）────────────
+from lca.contracts.protocols.memory.operational_skills import (
+    SANDBOX_SKILL_MOUNT_PREFIX,
+    SkillImporter,
+    SkillImportError,
+    SkillIndexEntry,
+    SkillNotFoundError,
+    SkillPackage,
+    SkillPackageInstaller,
+    SkillPackageStore,
+    SkillSearchResult,
+)
+
+# ── 可选能力（无 bind/install 组装面）────────────
+from lca.contracts.protocols.perceive.capabilities import HasHooks
+
+# ── CapabilityPlan + 11 关系代数（ADR-0068 §一 + ADR-0069 §三）──────
+from lca.contracts.protocols.perceive.capability_plan import (
+    CapabilityPlan,
+    ProviderBinding,
+    capability_plan_hash,
+    capability_plan_to_dict,
+    relations_from_plugin,
+    relations_of_kind,
+    relations_to_plugin,
+)
+
+# ── L0 基础设施协议 ──────────────────────────────────────
+from lca.contracts.protocols.runtime.infra.infra import (
+    AgentTransport,
+    AttachmentIdentity,
+    LLMAdapter,
+    SafeExecutor,
+    Sandbox,
+    SandboxRuntime,
+    StateStore,
+    Tool,
+    ToolRegistry,
+    TransportRegistryProtocol,
+)
+from lca.contracts.protocols.runtime.runtime.composition import (
+    CheckpointStateResolver,
+    CheckpointStateResolverFactory,
+    DeclarativeInterpreter,
+    DeclarativeInterpreterFactory,
+    DeltaReducerFactory,
+    EffectDispatcherFactory,
+    ResultFinalizer,
+    ResultFinalizerFactory,
+    RuntimeFactory,
+    RuntimeJournal,
+    RuntimeJournalFactory,
+)
+from lca.contracts.protocols.runtime.runtime.lifecycle import (
+    RuntimeBudgetSnapshot,
+    RuntimeLifecycleEvent,
+    RuntimeLifecycleEventType,
+    RuntimeLifecyclePublisher,
+    RuntimeLifecycleSubscriber,
+    RuntimeLifecycleSubscriberContribution,
+    RuntimeLifecycleSubscriberRegistry,
+)
+from lca.contracts.protocols.runtime.runtime.runtime import Runtime
+from lca.contracts.protocols.session.run.mode import (
+    ModeAdapter,
+    RegisteredMode,
+    RunModeRegistryProtocol,
+)
+from lca.contracts.protocols.state.plan import COMPILED_RUN_PLAN_VERSION, CompiledRunPlan
+
+# ── CommandEnvelope + RunFact (ADR-0068 §五 + ADR-0074 PR-7 V4) ─────────
+# ── L2 Runtime 协议 ──────────────────────────────────────
+from lca.contracts.protocols.state.reducer import Reducer
+from lca.contracts.protocols.state.scope_plan import (
+    BudgetCeiling,
+    ScopePlan,
+    scope_plan_from_iter,
+    scope_plan_hash,
+    scope_plan_to_dict,
+)
+
+# ── L1 认知 / Brain 协议 ─────────────────────────────────
+from lca.contracts.protocols.think.cognition import (
+    Brain,
+    BrainFactory,
+    BrainPromptCatalog,
+    BrainPromptCatalogFactory,
+    Critic,
+    DecisionGate,
+    DecisionGateAssembler,
+    MissingPromptSectionError,
+    MissingSectionKindError,
+    PerceiveHub,
+    PerceiveHubAssembler,
+    PromptAssembler,
+    PromptSectionRegistry,
+    PromptTemplate,
+    PromptTemplateConfig,
+    PromptTemplateProvider,
+    PromptTemplateSelector,
+    PureSection,
+    Reasoner,
+    SectionKind,
+    SectionManifest,
+    SectionOutput,
+    SectionReference,
+    Sensor,
+    SensorDisabledError,
+    SkillRouter,
+    StatefulSection,
+    SupportsShortcut,
+)
+from lca.contracts.protocols.think.cognitive_pipeline import (
+    CognitiveReflectionPipeline,
+    CognitiveThinkPipeline,
+)
+
+__all__ = [
+    "COMPILED_RUN_PLAN_VERSION",
+    "DECLARATIVE_PLAN_VERSION",
+    "PLUGIN_SPEC_VERSION",
+    "SANDBOX_SKILL_MOUNT_PREFIX",
+    "ActionAuthorityPlan",
+    "ActionHandler",
+    "ActionHandlerRegistry",
+    "ActionScopeAuthority",
+    "AgentClient",
+    "AgentRequest",
+    "AgentResponse",
+    "AgentTransport",
+    "AgentUnit",
+    "ArtifactClosure",
+    "AttachmentIdentity",
+    "BindingKind",
+    "Body",
+    "Brain",
+    "BrainFactory",
+    "BrainPromptCatalog",
+    "BrainPromptCatalogFactory",
+    "BudgetCeiling",
+    "BudgetPolicy",
+    "BudgetReservation",
+    "CapabilityBinding",
+    "CapabilityDeclaration",
+    "CapabilityGrant",
+    "CapabilityPlan",
+    "CheckpointStateResolver",
+    "CheckpointStateResolverFactory",
+    "CognitivePhaseGraphPlan",
+    "CognitiveReflectionPipeline",
+    "CognitiveThinkPipeline",
+    "CommandEnvelope",
+    "CompiledRunPlan",
+    "ComponentRegistryProtocol",
+    "ControlVerdict",
+    "ControlVerdictKind",
+    "Critic",
+    "DecisionGate",
+    "DecisionGateAssembler",
+    "DecisionRef",
+    "DeclarativeInterpreter",
+    "DeclarativeInterpreterFactory",
+    "DeclarativeValidationError",
+    "DeltaReducer",
+    "DeltaReducerFactory",
+    "DispatchDecision",
+    "EffectCapabilities",
+    "EffectDispatcher",
+    "EffectDispatcherFactory",
+    "EffectHandler",
+    "EffectHandlerRegistry",
+    "EffectPolicyPlan",
+    "EnvelopeVerdict",
+    "EventBus",
+    "GraphNodeExecutionContext",
+    "GraphNodeExecutor",
+    "GraphNodeExecutorRegistryProtocol",
+    "GraphSubgraphReference",
+    "HasHooks",
+    "Hook",
+    "HookRegistry",
+    "IdempotencyClaim",
+    "IdempotencyStore",
+    "JournalCommitter",
+    "JournalProjector",
+    "LLMAdapter",
+    "LeadBudgetPolicyResolver",
+    "LogicAddress",
+    "LogicAddressScore",
+    "LoopGuardEvaluator",
+    "LoopGuardVerdict",
+    "MemberInvoker",
+    "MemorySystem",
+    "MissingPromptSectionError",
+    "MissingSectionKindError",
+    "ModeAdapter",
+    "NamedRegistryProtocol",
+    "NodeExecutor",
+    "NodeIOSchema",
+    "NodeInput",
+    "NodeOutput",
+    "NodeSchemaError",
+    "NodeStrategy",
+    "ObservabilityBackend",
+    "OrchestrationRegistryProtocol",
+    "PerceiveHub",
+    "PerceiveHubAssembler",
+    "PhaseBudgetSnapshot",
+    "PhaseEdge",
+    "PhaseNode",
+    "PhaseNodeContext",
+    "PhaseNodeInput",
+    "PhaseNodeOutput",
+    "PhaseObserver",
+    "PhaseObserverContribution",
+    "PhaseObserverRegistry",
+    "PhaseStateSnapshot",
+    "Plan",
+    "PlanEdge",
+    "PlanNode",
+    "PlanProvenance",
+    "PluginConfiguration",
+    "PluginImplementation",
+    "PluginRelation",
+    "PluginSpec",
+    "PluginSpecKind",
+    "PortSpec",
+    "PromptAssembler",
+    "PromptSectionRegistry",
+    "PromptTemplate",
+    "PromptTemplateConfig",
+    "PromptTemplateProvider",
+    "PromptTemplateSelector",
+    "ProviderBinding",
+    "PureSection",
+    "Reasoner",
+    "Reducer",
+    "RegisteredMode",
+    "RelationType",
+    "ReplacementDecision",
+    "ResultFinalizer",
+    "ResultFinalizerFactory",
+    "RetrievalPolicy",
+    "RoleLibrary",
+    "RunDelta",
+    "RunFact",
+    "RunModeRegistryProtocol",
+    "Runtime",
+    "RuntimeBudgetSnapshot",
+    "RuntimeFactory",
+    "RuntimeJournal",
+    "RuntimeJournalFactory",
+    "RuntimeLifecycleEvent",
+    "RuntimeLifecycleEventType",
+    "RuntimeLifecyclePublisher",
+    "RuntimeLifecycleSubscriber",
+    "RuntimeLifecycleSubscriberContribution",
+    "RuntimeLifecycleSubscriberRegistry",
+    "SafeExecutor",
+    "Sandbox",
+    "SandboxRuntime",
+    "ScopePlan",
+    "SectionKind",
+    "SectionManifest",
+    "SectionOutput",
+    "SectionReference",
+    "SemanticPhase",
+    "Sensor",
+    "SensorDisabledError",
+    "SharedMemoryStore",
+    "SkillImportError",
+    "SkillImporter",
+    "SkillIndexEntry",
+    "SkillNotFoundError",
+    "SkillPackage",
+    "SkillPackageInstaller",
+    "SkillPackageStore",
+    "SkillRouter",
+    "SkillSearchResult",
+    "StateStore",
+    "StatefulSection",
+    "StrategyContext",
+    "SupportsShortcut",
+    "Synthesizer",
+    "TeamAssembly",
+    "TeamCaster",
+    "TeamSeamFactoryProtocol",
+    "TeamStage",
+    "TeamStrategy",
+    "TeamUnit",
+    "Telemetry",
+    "TemporalMemoryStore",
+    "Tool",
+    "ToolDefinition",
+    "ToolExecutionContext",
+    "ToolExecutionPipeline",
+    "ToolExecutionResult",
+    "ToolPostDecision",
+    "ToolPreDecision",
+    "ToolProvider",
+    "ToolRegistry",
+    "ToolRenderer",
+    "TransportRegistryProtocol",
+    "TypedRelation",
+    "ValidationIssue",
+    "ValidationReport",
+    "Verdict",
+    "VisitRecord",
+    "canonical_scope_of",
+    "capability_plan_hash",
+    "capability_plan_to_dict",
+    "command_envelope_to_dict",
+    "declared_dim_count",
+    "envelope_aggregate_verdict",
+    "envelope_is_authorized",
+    "is_complete_address",
+    "mint_envelope",
+    "relations_from_plugin",
+    "relations_of_kind",
+    "relations_to_plugin",
+    "scope_plan_from_iter",
+    "scope_plan_hash",
+    "scope_plan_to_dict",
+    "score_logic_address",
+    "typed_relation_to_dict",
+    "typed_relations_from_iter",
+    "warn_deprecated_envelope_constructor",
+]

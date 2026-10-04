@@ -1,0 +1,57 @@
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+.env*
+!.env.example
+.venv/
+*.egg
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.coverage
+.import_linter_cache/
+traces/
+repomix-output.xml
+repomix.config.json
+.qwen/tmp/
+lobehub-ui/
+.lobehub-upstream/
+.lobehub-stack/
+.lca-state/
+
+# Runtime artifacts
+output/
+.coverage.*.pid*
+web/
+.lca/
+
+# Node modules
+packages/*/node_modules/
+node_modules/
+
+# Runtime state (daemon manifests, logs, pids)
+.lca-ops/
+
+# Git worktrees (per superpowers:using-git-worktrees)
+.worktrees/
+worktrees/
+
+# Creator scenario scratch dirs (test output, regenerated on run).
+# Tests resolve SCRATCH next to themselves under tests/scenario/cordis/.
+tests/scenario/cordis/.scratch_cordis_creator/
+tests/scenario/cordis/.scratch_cordis_creator_real/
+.records/
+.archify-out/
+# vim swap files
+*.swp
+.lca-run/
+
+# Per-run spine JSONL artifacts (<run_id>.spine.jsonl) written relative to process cwd
+*.spine.jsonl
+
+# External tool artifact (CopilotKit) - not part of LCA
+.copilotkit/

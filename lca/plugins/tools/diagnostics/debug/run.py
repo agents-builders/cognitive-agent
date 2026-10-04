@@ -1,0 +1,644 @@
+"""``lca-ops debug run <run_id>`` — one-shot 8-section diagnostic — ADR-0122.
+
+The previous debug workflow required:
+
+1. ``cat traces/runs/<run_id>/manifest.json``
+2. ``cat traces/runs/<run_id>/journal.jsonl``
+3. ``tail kernel.log`` (often missing — written only by the run-failure
+   fallback in ``record_run_failure``, not a general kernel log)
+4. ``ps`` + ``/proc/<pid>/fd/1`` to locate kernel stdout
+5. grep through several logs
+
+This adapter collapses all of the above into one invocation that prints:
+
+    [1] manifest            path / summary
+    [2] journal             event counts / missing-seq report
+    [3] kernel.log          tail of per-run kernel.log (empty when absent)
+    [4] phase.cursor        last completed phase + failure node
+    [5] error_ref           StopDecision.failure → typed RunDiagnostic
+    [6] stack frames        top frames from the diagnostic
+    [7] suggested_action    human-readable next step
+    [8] replay commands    `lca-ops journal replay <run_id> --step K` (model-visible)
+                            + ``grep <plan_ref> traces/runs/*/manifest.json`` (plan 复现)
+
+Both the agent and a human can consume the output directly. JSON mode is
+available via ``--json`` for downstream tooling.
+
+Note on ``lca-ops replay``: the legacy ``lca-ops replay <run_id> --no-llm`` command
+is **not** a top-level command. Real replay lives at
+``lca-ops journal replay <run_id> --step K`` (ADR-0167 D10);--step is required,
+and ``--no-llm`` is the default (it only dumps model-visible + actions, never
+calls the LLM). See ``docs/debug/run-debug-guide.md`` for the canonical reference.
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, cast
+
+from lca.contracts.atoms.semantic.keys import FAILURE_KIND_TRANSIENT
+from lca.contracts.observability.observability.failure_reason_map import (
+    FAILURE_KIND_TO_ERROR_REASON,
+)
+from lca.contracts.observability.registry.run_locator import RunLocator
+
+
+@dataclass(frozen=True, slots=True)
+class DebugRunReport:
+    """8-section diagnostic for one run (ADR-0122).
+
+    ADR-0068 §决策二 + ADR-0167 D10:``[8/8]`` 现在输出**多行真实可跑命令**
+    —— journal replay(模型可见)+ 按 plan_ref 反查(plan 复现)。
+    旧的 ``replay_command`` 单字段已弃用,改成 ``replay_commands: tuple[str, ...]``
+    + 新增 ``plan_ref: str``(从 manifest 顶层读,空串 = 旧 manifest 或 solo
+    未走 declarative 路径)。
+    """
+
+    run_id: str
+    manifest_path: str
+    manifest_summary: dict[str, Any]
+    spine_events_path: str
+    spine_event_count: int
+    spine_missing_seqs: tuple[int, ...]
+    spine_execution_points: tuple[str, ...]
+    spine_meta_families: tuple[tuple[str, int], ...]
+    kernel_log_path: str
+    kernel_log_tail: str
+    phase_cursor: str | None
+    failure_node_id: str | None
+    error_message: str | None
+    error_type: str | None
+    stack_frames: tuple[dict[str, Any], ...]
+    attempts: tuple[dict[str, Any], ...]
+    suggested_action: str | None
+    # ADR-0068 §决策二:plan_ref 是 CompiledRunPlan 的 16-hex 稳定 ID,
+    # 从 ``manifest.plan_ref`` 顶层字段读(declarative 路径)或空串。
+    plan_ref: str = ""
+    # ADR-0167 D10:replay 是多命令组合——dump messages、grep 同 plan、复现骨架。
+    replay_commands: tuple[str, ...] = ()
+    # Graph trajectory: phase-graph node/subgraph execution trace from spine.
+    graph_trajectory: tuple[dict[str, Any], ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "run_id": self.run_id,
+            "manifest_path": self.manifest_path,
+            "manifest_summary": self.manifest_summary,
+            "spine_events_path": self.spine_events_path,
+            "spine_event_count": self.spine_event_count,
+            "spine_missing_seqs": list(self.spine_missing_seqs),
+            "spine_execution_points": list(self.spine_execution_points),
+            "spine_meta_families": list(self.spine_meta_families),
+            "kernel_log_path": self.kernel_log_path,
+            "kernel_log_tail": self.kernel_log_tail,
+            "phase_cursor": self.phase_cursor,
+            "failure_node_id": self.failure_node_id,
+            "error_message": self.error_message,
+            "error_type": self.error_type,
+            "stack_frames": list(self.stack_frames),
+            "attempts": list(self.attempts),
+            "suggested_action": self.suggested_action,
+            "plan_ref": self.plan_ref,
+            "replay_commands": list(self.replay_commands),
+            "graph_trajectory": list(self.graph_trajectory),
+        }
+
+    def render_text(self) -> str:
+        lines: list[str] = []
+        lines.append(f"[1/8] manifest            {self.manifest_path}")
+        summary = (
+            self.manifest_summary.get("extra", {}).get("doctor_report", {}).get("status", "unknown")
+        )
+        broken = self.manifest_summary.get("extra", {}).get("doctor_report", {}).get("broken_hop")
+        lines.append(f"      status={summary}" + (f" broken_hop={broken}" if broken else ""))
+        lines.append(f"[1b/8] doctor.viewport     {self.manifest_path}")
+        viewport_lines = _render_doctor_viewport(self.manifest_summary)
+        if viewport_lines:
+            for vl in viewport_lines:
+                lines.append(f"      {vl}")
+        else:
+            lines.append("      (no doctor_report present — likely legacy run)")
+        lines.append(
+            f"[2/8] journal             {self.spine_events_path} "
+            f"events={self.spine_event_count}"
+            + (f" missing_seqs={list(self.spine_missing_seqs)}" if self.spine_missing_seqs else "")
+        )
+        lines.append(
+            f"      spine.events        {self.spine_events_path} events={self.spine_event_count}"
+        )
+        if self.spine_execution_points:
+            lines.append(
+                "      spine.points        " + " → ".join(self.spine_execution_points[-8:])
+            )
+        if self.spine_meta_families:
+            summary = ", ".join(f"{name}={count}" for name, count in self.spine_meta_families)
+            lines.append(f"      spine.meta          {summary}")
+        lines.append(f"[3/8] kernel.log          {self.kernel_log_path}")
+        for line in self.kernel_log_tail.splitlines()[-5:]:
+            lines.append(f"      {line}")
+        lines.append(f"[4/8] phase.cursor        {self.phase_cursor}")
+        lines.append(f"[5/8] error_ref           {self.error_message or '(none)'}")
+        lines.append(f"      error_type:        {self.error_type or '(none)'}")
+        lines.append("[6/8] stack frames")
+        if not self.stack_frames:
+            lines.append(
+                "      (none — the ledger has no exception.caught, so no LCA stack was "
+                "captured; `lca-ops journal exceptions <run_id>` is the traceback index)"
+            )
+        for frame in self.stack_frames[:8]:
+            lines.append(
+                f"      {frame.get('filename', '?')}:{frame.get('lineno', '?')} "
+                f"in {frame.get('name', '?')}"
+            )
+        lines.append(f"[7/8] suggested_action    {self.suggested_action or '(none)'}")
+        # [8/8] 复现命令:journal replay (model-visible) + plan_ref grep (图复现)。
+        # ADR-0068 §决策二:plan_ref 是 run 的 16-hex 稳定 ID,可一锤定音反查。
+        lines.append(
+            f"[8/8] plan_ref            {self.plan_ref or '(no plan_ref on this manifest)'}"
+        )
+        if self.replay_commands:
+            for idx, cmd in enumerate(self.replay_commands):
+                prefix = "      └─" if idx == len(self.replay_commands) - 1 else "      ├─"
+                lines.append(f"{prefix} {cmd}")
+        else:
+            lines.append("      (no replay commands)")
+        # [9/9] graph trajectory — phase-graph node/subgraph execution trace.
+        lines.append("[9/9] graph.trajectory")
+        if not self.graph_trajectory:
+            lines.append("      (no phase_graph events in spine)")
+        else:
+            node_count = sum(1 for e in self.graph_trajectory if e.get("kind") == "node")
+            subgraph_count = sum(1 for e in self.graph_trajectory if e.get("kind") == "subgraph")
+            failure_nodes = [
+                e
+                for e in self.graph_trajectory
+                if e.get("kind") == "node" and e.get("outcome") == "failure"
+            ]
+            lines.append(f"      nodes={node_count} subgraphs={subgraph_count}")
+            # Node trajectory summary (visited node IDs in order)
+            visited = [
+                e.get("node_id", "?")
+                for e in self.graph_trajectory
+                if e.get("kind") == "node" and e.get("event") == "end"
+            ]
+            if visited:
+                lines.append("      trajectory          " + " → ".join(visited))
+            # Subgraph entries
+            for e in self.graph_trajectory:
+                if e.get("kind") == "subgraph" and e.get("event") == "enter":
+                    lines.append(
+                        f"      subgraph            plan_ref={e.get('plan_ref', '?')} "
+                        f"entry={e.get('entry_node', '?')} depth={e.get('depth', 0)}"
+                    )
+            # Failures
+            for e in failure_nodes:
+                lines.append(
+                    f"      FAILURE             node={e.get('node_id', '?')} "
+                    f"error={e.get('error', '(unknown)')}"
+                )
+        return "\n".join(lines)
+
+
+class DebugRunToolAdapter:
+    """``DebugRunToolAdapter(path).debug_run(run_id)`` → DebugRunReport."""
+
+    def __init__(self, locator: RunLocator) -> None:
+        self._locator = locator
+
+    @classmethod
+    def from_locator_root(cls, root: str | Path) -> DebugRunToolAdapter:
+        from lca.infrastructure.observability.backends.run_locator_fs import (
+            FilesystemRunLocator,
+        )
+
+        return cls(FilesystemRunLocator(Path(root)))
+
+    def debug_run(self, run_id: str) -> DebugRunReport:
+        run_dir = self._locator.run_dir(run_id)
+        manifest_path = self._locator.manifest_path(run_id)
+        spine_events_path = self._locator.events_path(run_id)
+        kernel_log_path = run_dir / "kernel.log"
+
+        manifest_summary = _safe_json(manifest_path)
+        if not manifest_summary:
+            journal_summary = _safe_json(run_dir / "journal.json")
+            journal_outcome = str(journal_summary.get("metadata", {}).get("outcome") or "").strip()
+            if not journal_outcome:
+                steps = journal_summary.get("steps") or []
+                if steps and isinstance(steps, list):
+                    journal_outcome = str(steps[-1].get("outcome") or "").strip()
+            if journal_outcome == "paused":
+                manifest_summary = {
+                    "extra": {
+                        "doctor_report": {
+                            "status": "paused",
+                            "outcome": "paused",
+                            "summary": "run paused (waiting for human input/approval)",
+                        }
+                    }
+                }
+
+        spine_events = _safe_lines(spine_events_path)
+        seqs: list[int] = sorted(
+            run_seq for e in spine_events if isinstance((run_seq := e.get("run_seq")), int)
+        )
+        max_seq = seqs[-1] if seqs else 0
+        missing_seqs = tuple(s for s in range(1, max_seq + 1) if s not in set(seqs))
+        spine_points = tuple(
+            str(e.get("execution_point"))
+            for e in spine_events
+            if isinstance(e.get("execution_point"), str)
+        )
+        spine_meta = _spine_meta_family_counts(spine_events)
+
+        failure_node_id, error_message, error_type = _extract_failure(
+            manifest_summary, spine_events
+        )
+        phase_cursor = _extract_phase_cursor(spine_events)
+        attempts = _extract_attempts(manifest_summary)
+        stack_frames, suggested = _extract_diagnostic(manifest_summary)
+        if suggested is None:
+            doctor_st = manifest_summary.get("extra", {}).get("doctor_report", {}).get("status")
+            if doctor_st == "paused":
+                suggested = (
+                    "Run is paused awaiting user input/approval. "
+                    "Resume via POST /runs with resume_tool_result or approve via client UI."
+                )
+            elif _run_failed(manifest_summary, spine_events):
+                suggested = _suggest_action_from_failure_kind(error_type, error_message)
+
+        tail = _tail_lines(kernel_log_path)
+
+        # ADR-0068 §决策二:plan_ref 从 manifest 顶层字段读,SSOT,16-hex。
+        # ADR-0167 D10:replay 是多命令组合 —— journal replay 走 model-visible
+        # 重放;``grep plan_ref`` 走 plan 拓扑反查。``lca-ops replay --no-llm``
+        # 这个旧命令**不存在**(曾误写在 AGENTS.md / ADR-0122 / debug-run 输出
+        # 里);真实命令是 ``lca-ops journal replay <run_id> --step K``,且
+        # 默认就是 --no-llm 模式(只 dump messages + actions,不调 LLM)。
+        plan_ref = str(manifest_summary.get("plan_ref", "") or "").strip()
+        replay_commands: list[str] = [
+            f"lca-ops journal replay {run_id} --step 1 --diff-only",
+        ]
+        if plan_ref:
+            replay_commands.append(
+                f"grep -rl {plan_ref} traces/runs/*/manifest.json  # 找同 plan 的所有 run"
+            )
+
+        graph_trajectory = _extract_graph_trajectory(spine_events)
+
+        return DebugRunReport(
+            run_id=run_id,
+            manifest_path=str(manifest_path),
+            manifest_summary=manifest_summary,
+            spine_events_path=str(spine_events_path),
+            spine_event_count=len(spine_events),
+            spine_missing_seqs=missing_seqs,
+            spine_execution_points=spine_points,
+            spine_meta_families=spine_meta,
+            kernel_log_path=str(kernel_log_path),
+            kernel_log_tail=tail,
+            phase_cursor=phase_cursor,
+            failure_node_id=failure_node_id,
+            error_message=error_message,
+            error_type=error_type,
+            stack_frames=stack_frames,
+            attempts=attempts,
+            suggested_action=suggested,
+            plan_ref=plan_ref,
+            replay_commands=tuple(replay_commands),
+            graph_trajectory=graph_trajectory,
+        )
+
+
+def _extract_graph_trajectory(
+    spine_events: list[dict[str, Any]],
+) -> tuple[dict[str, Any], ...]:
+    """Extract phase-graph node and subgraph execution trace from spine events.
+
+    Reads ``phase_graph.node.start``, ``phase_graph.node.end``,
+    ``phase_graph.subgraph.enter``, and ``phase_graph.subgraph.exit``
+    events from the spine JSONL and returns a flat timeline.
+    """
+    result: list[dict[str, Any]] = []
+    for event in spine_events:
+        ep = event.get("execution_point", "")
+        payload = event.get("payload") or event.get("data") or {}
+        if ep == "phase_graph.node.start":
+            result.append(
+                {
+                    "kind": "node",
+                    "event": "start",
+                    "node_id": payload.get("node_id", ""),
+                }
+            )
+        elif ep == "phase_graph.node.end":
+            result.append(
+                {
+                    "kind": "node",
+                    "event": "end",
+                    "node_id": payload.get("node_id", ""),
+                    "outcome": payload.get("outcome", ""),
+                    "error": payload.get("exception_message", ""),
+                }
+            )
+        elif ep == "phase_graph.subgraph.enter":
+            result.append(
+                {
+                    "kind": "subgraph",
+                    "event": "enter",
+                    "plan_ref": payload.get("plan_ref", ""),
+                    "entry_node": payload.get("entry_node", ""),
+                    "depth": payload.get("depth", 0),
+                }
+            )
+        elif ep == "phase_graph.subgraph.exit":
+            result.append(
+                {
+                    "kind": "subgraph",
+                    "event": "exit",
+                    "plan_ref": payload.get("plan_ref", ""),
+                    "entry_node": payload.get("entry_node", ""),
+                    "outcome": payload.get("outcome", ""),
+                    "depth": payload.get("depth", 0),
+                    "error": payload.get("error", ""),
+                }
+            )
+    return tuple(result)
+
+
+def _spine_event_key(event: dict[str, Any]) -> str:
+    for field in ("execution_point", "category", "event_type", "type"):
+        raw = event.get(field)
+        if isinstance(raw, str) and raw:
+            return raw
+    return ""
+
+
+def _spine_meta_family_counts(events: list[dict[str, Any]]) -> tuple[tuple[str, int], ...]:
+    from lca.contracts.observability.event.meta_event_taxonomy import classify_spine_event_key
+
+    counts: dict[str, int] = {}
+    for event in events:
+        key = _spine_event_key(event)
+        if not key:
+            continue
+        family = classify_spine_event_key(key)
+        if family is None:
+            continue
+        counts[family] = counts.get(family, 0) + 1
+    return tuple(sorted(counts.items()))
+
+
+def _safe_json(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        return cast("dict[str, Any]", json.loads(path.read_text()))
+    except Exception:
+        return {}
+
+
+def _safe_lines(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    out: list[dict[str, Any]] = []
+    decoder = json.JSONDecoder()
+    text = path.read_text()
+    idx = 0
+    while idx < len(text):
+        while idx < len(text) and text[idx].isspace():
+            idx += 1
+        if idx >= len(text):
+            break
+        try:
+            obj, end = decoder.raw_decode(text, idx)
+            if isinstance(obj, dict):
+                out.append(obj)
+            idx = end
+        except Exception:
+            break
+    return out
+
+
+def _run_failed(manifest: dict[str, Any], spine_events: list[dict[str, Any]]) -> bool:
+    """Whether the run is durably recorded as failed.
+
+    Reads the two artifacts that disagree differently: the manifest's
+    ``session_status`` survives a run that died before the kernel wrote
+    its stop event, and the ledger's last ``kernel.run.stop`` outcome is
+    the fact-stream record. Gates the ledger-derived ``error_ref``
+    fallback so a *successful* run that recovered from an intermediate
+    tool failure does not grow an error label.
+    """
+    failure_words = {"fail", "failed", "failure", "error"}
+    status = str(manifest.get("session_status") or "").lower()
+    if status in failure_words:
+        return True
+    doctor = (manifest.get("extra") or {}).get("doctor_report") or {}
+    if isinstance(doctor, dict) and str(doctor.get("status") or "").lower() in failure_words:
+        return True
+    for event in reversed(spine_events):
+        if event.get("execution_point") != "kernel.run.stop":
+            continue
+        payload = event.get("payload") or {}
+        outcome = payload.get("outcome") if isinstance(payload, dict) else None
+        if isinstance(outcome, str) and outcome.lower() in failure_words:
+            return True
+        break
+    return False
+
+
+def _ledger_failure_carrier(
+    spine_events: list[dict[str, Any]],
+) -> tuple[str, str, str | None] | None:
+    """The last failure-carrying ledger event as ``(label, error, kind)``.
+
+    These are the spine carriers that actually hold a failure:
+    ``step.tool_result.record`` (typed tool failure with
+    ``failure_kind``), ``exception.caught``, and ``phase_graph.node.end``
+    with ``outcome="failure"``. The last one wins because it is the
+    failure the terminal decision saw; the label carries its ledger seq
+    so ``lca-ops explain`` can be pointed at the same event.
+    """
+    for event in reversed(spine_events):
+        ep = event.get("execution_point")
+        payload = event.get("payload") or event.get("data") or {}
+        if not isinstance(payload, dict):
+            continue
+        outcome = str(payload.get("outcome") or "").lower()
+        seq = str(event.get("event_id") or "").rpartition(":")[2]
+        if ep == "step.tool_result.record" and outcome in {"failure", "failed", "error"}:
+            error = str(payload.get("error") or "").strip()
+            kind = str(payload.get("failure_kind") or "").strip() or None
+            tool = str(payload.get("tool_name") or "").strip() or "?"
+            return f"tool={tool} failure_kind={kind or '?'} seq={seq}", error, kind
+        if ep == "exception.caught":
+            error = str(payload.get("message") or payload.get("error") or "").strip()
+            kind = str(payload.get("error_type") or payload.get("exception_class") or "").strip()
+            node = str(payload.get("node_id") or "").strip() or "?"
+            return f"node={node} error_kind={kind or '?'} seq={seq}", error, kind or None
+        if ep == "phase_graph.node.end" and outcome == "failure":
+            error = str(payload.get("error") or "").strip()
+            node = str(payload.get("node_id") or "").strip() or "?"
+            return f"node={node} dispatch={payload.get('dispatch') or '?'} seq={seq}", error, None
+    return None
+
+
+def _extract_failure(
+    manifest: dict[str, Any], spine_events: list[dict[str, Any]]
+) -> tuple[str | None, str | None, str | None]:
+    """失败节点 + 错误信息:manifest doctor 优先,spine ledger 兜底。
+
+    The manifest carries the authoritative error when the doctor hop
+    captured one. When it did not — the common case for a deterministic
+    tool failure, where nothing raised and ``H6`` only records
+    ``outcome=failed`` — the ledger is the only artifact that names the
+    failure, so a failed run reads its carrier from there instead of
+    reporting ``(none)``.
+    """
+    extra = manifest.get("extra", {}) or {}
+    doctor = extra.get("doctor_report", {}) or {}
+    h6 = doctor.get("hops", {}).get("H6", {}) or {}
+    error_message = (
+        h6.get("error") or manifest.get("session_error") or extra.get("session_error") or None
+    )
+    if isinstance(error_message, str) and not error_message.strip():
+        error_message = None
+    error_type: str | None = None
+    failure_node: str | None = None
+    flush_errors = extra.get("flush_errors", []) or []
+    if isinstance(flush_errors, list) and flush_errors:
+        last = flush_errors[-1] if isinstance(flush_errors[-1], dict) else {}
+        if last.get("node_id"):
+            failure_node = str(last["node_id"])
+        if last.get("exception_class"):
+            error_type = str(last["exception_class"])
+    # 兜底:spine 流里的 exception.caught EP(出现时附 payload.error_type)
+    for event in reversed(spine_events):
+        if event.get("execution_point") != "exception.caught":
+            continue
+        data = event.get("payload") or event.get("data") or {}
+        error_type = error_type or data.get("error_type")
+        node = data.get("node_id")
+        if node:
+            failure_node = failure_node or str(node)
+        break
+
+    if error_message is None and _run_failed(manifest, spine_events):
+        carrier = _ledger_failure_carrier(spine_events)
+        if carrier is not None:
+            label, error, kind = carrier
+            error_message = f"{label} | {error}" if error else label
+            error_type = error_type or kind
+        else:
+            error_message = (
+                "run failed but no error carrier found — searched "
+                "manifest.extra.doctor_report.hops.H6.error, manifest.session_error, "
+                "extra.flush_errors, and the spine ledger for step.tool_result.record / "
+                "exception.caught / phase_graph.node.end with outcome=failure"
+            )
+    return failure_node, error_message, error_type
+
+
+def _extract_phase_cursor(spine_events: list[dict[str, Any]]) -> str | None:
+    """从 spine execution_point 序列推 phase cursor(粗粒度:最后一个 phase.* EP)。"""
+    phase_eps = (
+        "phase.perceive.fold",
+        "phase.think.fold",
+        "phase.act.fold",
+        "phase.reflect.fold",
+        "phase.remember.fold",
+        "phase.stop.fold",
+    )
+    for event in reversed(spine_events):
+        ep = event.get("execution_point")
+        if isinstance(ep, str) and ep in phase_eps:
+            return ep
+    return None
+
+
+def _extract_attempts(manifest: dict[str, Any]) -> tuple[dict[str, Any], ...]:
+    attempts = (
+        manifest.get("extra", {})
+        .get("doctor_report", {})
+        .get("hops", {})
+        .get("H6", {})
+        .get("attempts", [])
+    )
+    if isinstance(attempts, list):
+        return tuple(a for a in attempts if isinstance(a, dict))
+    return ()
+
+
+def _extract_diagnostic(
+    manifest: dict[str, Any],
+) -> tuple[tuple[dict[str, Any], ...], str | None]:
+    diag = manifest.get("extra", {}).get("doctor_report", {}).get("diagnostic")
+    if not isinstance(diag, dict):
+        return (), None
+    return (
+        tuple(f for f in diag.get("stack", []) if isinstance(f, dict)),
+        diag.get("suggested_action"),
+    )
+
+
+def _suggest_action_from_failure_kind(
+    error_type: str | None, error_message: str | None
+) -> str | None:
+    """Next step derived from the failure's closed-set ``failure_kind``.
+
+    ``SafeExecutor`` retries only ``FAILURE_KIND_TRANSIENT``; every other
+    kind is terminal for that attempt. A failed run whose manifest
+    carries no ``diagnostic`` block still has the classification in the
+    ledger, so the section can state which side of that rule the
+    operator is on instead of printing ``(none)``.
+    """
+    if not error_type and not error_message:
+        return None
+    kind = (error_type or "").strip().lower()
+    if kind == FAILURE_KIND_TRANSIENT:
+        return f"failure_kind={kind} — retryable; SafeExecutor backs off and retries"
+    if kind in FAILURE_KIND_TO_ERROR_REASON:
+        return f"failure_kind={kind} — not retryable per SafeExecutor; fix the cause named in [5/8]"
+    return "run failed — read the error_ref above and `lca-ops journal exceptions <run_id>`"
+
+
+def _tail_lines(path: Path, max_lines: int = 50) -> str:
+    if not path.exists():
+        return ""
+    try:
+        text = path.read_text()
+    except Exception:
+        return ""
+    return "\n".join(text.splitlines()[-max_lines:])
+
+
+def _render_doctor_viewport(manifest_summary: dict[str, Any]) -> list[str]:
+    """Project the ``extra.doctor_report`` block as a 1-line-per-key view.
+
+    The viewport reads from the manifest JSON (no RunManifest schema
+    change). Format: ``key: <value>`` per line, sorted for stable diffs.
+    """
+    doctor = manifest_summary.get("extra", {}).get("doctor_report", {}) or {}
+    if not doctor:
+        return []
+    keys_of_interest = (
+        "status",
+        "broken_hop",
+        "mode",
+        "outcome",
+        "factory",
+        "consistency",
+        "summary",
+        "trace_id",
+        "journal_path",
+        "schema",
+    )
+    rendered: list[str] = []
+    for key in keys_of_interest:
+        if key in doctor:
+            value = doctor[key]
+            rendered.append(f"{key}: {value}")
+    return rendered

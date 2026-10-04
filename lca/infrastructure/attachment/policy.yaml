@@ -1,0 +1,38 @@
+# Attachment identity policy — SSOT for files_info + machine inbox.
+# Env overrides: LCA_ATTACHMENT_* (see settings.py).
+
+system_context_open: "<!-- SYSTEM CONTEXT (NOT PART OF USER QUERY) -->"
+system_context_close: "<!-- END SYSTEM CONTEXT -->"
+system_context_open_prefix: "<!-- SYSTEM CONTEXT"
+inbox_dir: ".lca/inbox"
+inline_max_bytes: 8192
+inline_mime_prefixes:
+  - "text/"
+  - "application/json"
+  - "application/xml"
+inline_name_suffixes:
+  - ".md"
+  - ".txt"
+  - ".csv"
+  - ".json"
+  - ".yaml"
+  - ".yml"
+  - ".xml"
+  - ".html"
+  - ".htm"
+files_instruction: |
+  following part contains context information injected by the system. Please follow these instructions:
+
+  1. Always prioritize handling user-visible content.
+  2. the context is only required when user's queries rely on it.
+machine_policy: |
+  User uploads are declared in the user message <files_info> (identity only — name, type, size).
+  Staged copies for this run are listed below with exact paths.
+  Use those paths for read/edit commands. Do not assume files sit at the working root by filename alone.
+  Deliverables still go under outputs/.
+machine_uploaded_files_list_header: "This turn's staged copies (run-scoped inbox):"
+sandbox_policy: |
+  User uploads are declared in the user message <files_info> (identity only).
+  Session copies are synced into the workspace root by filename and listed below.
+  If unsure, run listFiles on the workspace root first.
+sandbox_uploaded_files_list_header: "These user-uploaded files are pre-loaded and ready to use:"

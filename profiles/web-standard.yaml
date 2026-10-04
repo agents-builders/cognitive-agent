@@ -1,0 +1,61 @@
+# web-standard profile — default deployment configuration.
+# Bundles: base (Tier-1 services + Tier-2 providers) + web-app (Tier-3 behaviors)
+# + scenario-cordis-creator（Creator §13.3 工具集注册到全局 tools 服务，
+# 但启用受 model=cordis-creator 请求触发 + RoleProfile.tool_permission_manifest 闸控）
+# + loop_cursor.spine_default (PR-8 §7.6.6 — 19-plugin EventSpine composition with
+# source-level introspection **mandatory**; ADR-2026-09-02 §D3; ADR-0174 profile 装配).
+# + observability-default (PR-7 五缝 plugin 装配 — LoopCursor / ProjectionHost /
+# ModelVisibleCapture / CloseBarrier / Persistence seam + provider).
+# + session-runtime (ADR-0186 Session SSOT: session.store before event-bus so
+#   the capability is live when publishers/sinks boot; RunSessionBuilder binds
+#   a per-run Session onto publish/observe slots).
+# + think + act + perceive + reflect + remember + stop subgraph bundles
+#   (ADR-0217/0220; six-phase subgraph cutover 2026-09-12).
+# LLM secrets are owned by lca-llm-resolver (loads project .env at setup).
+
+bundles:
+  - bundles/base.yaml
+  - bundles/observability-default.yaml
+  - bundles/observation-9module.yaml
+  - bundles/web-app.yaml
+  - bundles/scenario-cordis-creator.yaml
+  - bundles/loop_cursor.spine_default.yaml
+  - bundles/session-runtime.yaml
+  - bundles/event-bus-components.yaml
+  - bundles/outer/phase_main.yaml
+  - bundles/think/think_subgraph.yaml
+  - bundles/act/act_subgraph.yaml
+  - bundles/perceive/perceive_subgraph.yaml
+  - bundles/reflect/reflect_subgraph.yaml
+  - bundles/remember/remember_subgraph.yaml
+
+patch:
+  # EventSpine file sink — boot events process-local; run events under
+  # traces/runs/<run_id>/<run_id>.spine.jsonl (ADR-0165.1 layout / PR-27 L10 / PR-4).
+  - id: spine.sink.file
+    config:
+      boot_path: .lca/spine/boot-spine.jsonl
+      runs_root: traces/runs
+
+  # EventSpine console sink — web-standard is the profile operators watch a
+  # live run through, so the console opts into ``graph_timeline`` here while
+  # the bundle default stays ``jsonl`` for machine consumers that ingest the
+  # default config unchanged.
+  - id: spine.sink.console
+    config:
+      format: graph_timeline
+
+  # Patch topology to add PR-C (ADR-0214 §6.3) PG-007 preconditions and
+  # Outer plan topology is declared declaratively in
+  # ``bundles/outer/phase_main.yaml`` (added above); no Cordis
+  # topology-provider patch is needed on this profile anymore.
+  # The legacy ``phase.topology.standard`` patch was removed as part
+  # of the outer-plan cutover (ADR-0221 P3 + topology-provider
+  # retirement).
+
+  # Disable base.yaml's deny-by-default ``permission_manifest.default``
+  # so the web-app-installed allowlist (body.act + memory.update) wins
+  # as the first ``require_matching("permission_manifest.")`` entry
+  # consumed by ``effect.pre_dispatch.envelope_check``.
+  - id: lca-effect-permission-manifest-default
+    disabled: true
