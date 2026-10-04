@@ -7,13 +7,51 @@
 
 **Cognitive Agent** is a Python framework for building *layered cognitive agents* — agents with a real cognitive architecture (memory, planning, reflection, tool use), not just an LLM wrapped in a chat loop.
 
-Most agent frameworks give you a prompt loop and call it an agent. This project starts from a different premise: durable, trustworthy agency needs **structure** — separated concerns, explicit contracts between layers, and cognition you can inspect, test, and evolve.
+## ✨ Why it's different
 
-## Why another agent framework?
+Most agent frameworks give you a prompt loop and call it an agent. Here, every turn of the loop is a **typed, inspectable cognitive pipeline** — six phases, each a graph node with declared inputs, outputs, and guard predicates:
 
-- **Persistence over prompts.** Agents that keep memory, state, and goals across sessions — not goldfish chatbots that forget everything on restart.
-- **Proactivity over reactivity.** The architecture supports agents that act on their own initiative (hooks, schedulers, standing goals) — not just responders waiting for input.
-- **Engineering discipline over demos.** Strict layering (L0–L4), an architecture decision record (ADR) for every major choice, contract tests, and import-linter-enforced boundaries. Built to be maintained, not just demoed.
+```mermaid
+graph LR
+    P["🧭 perceive<br/>observe · retrieve · fold"] --> T["🧠 think<br/>shortcut · reason · gate"]
+    T -->|"use_tool"| A["🔧 act<br/>validate · dispatch"]
+    T -->|"respond"| C(["✅ terminal<br/>commit"])
+    A --> T
+    A --> R["🪞 reflect<br/>score · recover"]
+    R --> M["💾 remember<br/>write · fold"]
+    M --> C
+```
+
+### Perception is architecture, not an afterthought
+
+A dedicated **perceive phase** runs before every thought: profile-selected sensors are assembled into a `PerceiveHub`, raw observations are folded together with retrieved memories into a single typed `observation` port that downstream phases consume by contract.
+
+```mermaid
+graph LR
+    S["Sensors<br/>profile-selected"] --> H["PerceiveHub<br/>assemble manifest"]
+    H --> MR["memory_retrieve<br/>context memories"]
+    MR --> F["fold<br/>manifest → observation"]
+    F -->|typed port| T["think"]
+```
+
+### Cognition computes — it never writes
+
+A hard separation of thinking from doing: cognitive phases compute decisions; only the loop performs side effects, through typed ports. No hidden state mutations inside "reasoning" code. Everything a phase reads and writes is declared upfront and statically checkable.
+
+### Memory is a phase, not a plugin
+
+`remember` is a first-class phase of every loop turn — decisions, observations, and reflections are folded into memory with a `memory_receipt`. Persistence isn't bolted on afterwards; it's in the topology.
+
+### Declarative profiles compile to graphs
+
+Agents are defined in YAML profiles and bundles, compiled into executable phase graphs with typed ports and predicate-guarded edges — not imperative spaghetti. Swap a profile, get a different agent:
+
+```mermaid
+graph LR
+    Y["📝 YAML profile<br/>bundles · regions"] --> G["🕸️ Phase graph<br/>typed ports · predicates"]
+    G --> L["🔁 Cognitive loop"]
+    L --> S["📦 Session facts<br/>append-only"]
+```
 
 ## Architecture
 
