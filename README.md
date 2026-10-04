@@ -1,15 +1,21 @@
-# Cognitive Agent
+<p align="center">
+  <img src="docs/assets/hero.png" width="100%" alt="Cognitive Agent — From chatbots to proactive, persistent agents"/>
+</p>
 
-> From chatbots to proactive, persistent agents.
+<h1 align="center">Cognitive Agent</h1>
 
-[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+<p align="center">
+  <b>A Python framework for building agents with real cognitive architecture — memory, planning, reflection — not just an LLM wrapped in a chat loop.</b>
+</p>
 
-**Cognitive Agent** is a Python framework for building *layered cognitive agents* — agents with a real cognitive architecture (memory, planning, reflection, tool use), not just an LLM wrapped in a chat loop.
+<p align="center">
+  <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-3.11%2B-blue?style=flat-square&logo=python&logoColor=white" alt="Python 3.11+"/></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-yellow?style=flat-square" alt="License: MIT"/></a>
+  <a href="docs/adr/README.md"><img src="https://img.shields.io/badge/ADRs-200%2B-orange?style=flat-square" alt="200+ ADRs"/></a>
+  <a href="docs/adr/0194-cognitive-loop-architecture-convergence.md"><img src="https://img.shields.io/badge/cognitive%20loop-6--phase-purple?style=flat-square" alt="6-phase cognitive loop"/></a>
+</p>
 
-## ✨ Why it's different
-
-Most agent frameworks give you a prompt loop and call it an agent. Here, every turn of the loop is a **typed, inspectable cognitive pipeline** — six phases, each a graph node with declared inputs, outputs, and guard predicates:
+<div align="center">
 
 ```mermaid
 graph LR
@@ -22,9 +28,21 @@ graph LR
     M --> C
 ```
 
-### Perception is architecture, not an afterthought
+</div>
 
-A dedicated **perceive phase** runs before every thought: profile-selected sensors are assembled into a `PerceiveHub`, raw observations are folded together with retrieved memories into a single typed `observation` port that downstream phases consume by contract.
+<p align="center">
+  📖 Start with the <a href="docs/adr/README.md">architecture decisions</a> or jump to <a href="#quickstart">quickstart</a>
+</p>
+
+<br>
+
+---
+
+## Why not just a prompt loop?
+
+Most agent frameworks give you a prompt loop and call it an agent. Here, every turn is a **typed, inspectable cognitive pipeline** — six phases, each a graph node with declared inputs, outputs, and guard predicates.
+
+**Perception is architecture, not an afterthought.** A dedicated perceive phase runs before every thought: profile-selected sensors assemble into a `PerceiveHub`, observations fold with retrieved memories into one typed `observation` port.
 
 ```mermaid
 graph LR
@@ -34,17 +52,11 @@ graph LR
     F -->|typed port| T["think"]
 ```
 
-### Cognition computes — it never writes
+**Cognition computes — it never writes.** Thinking and doing are strictly separated: phases compute decisions, only the loop performs side effects through typed ports. No hidden state mutations inside "reasoning" code.
 
-A hard separation of thinking from doing: cognitive phases compute decisions; only the loop performs side effects, through typed ports. No hidden state mutations inside "reasoning" code. Everything a phase reads and writes is declared upfront and statically checkable.
+**Memory is a phase, not a plugin.** `remember` runs every turn — decisions, observations, and reflections fold into memory with a `memory_receipt`. Persistence is in the topology, not bolted on.
 
-### Memory is a phase, not a plugin
-
-`remember` is a first-class phase of every loop turn — decisions, observations, and reflections are folded into memory with a `memory_receipt`. Persistence isn't bolted on afterwards; it's in the topology.
-
-### Declarative profiles compile to graphs
-
-Agents are defined in YAML profiles and bundles, compiled into executable phase graphs with typed ports and predicate-guarded edges — not imperative spaghetti. Swap a profile, get a different agent:
+**Profiles compile to graphs.** Agents are declared in YAML profiles and compiled into executable phase graphs with typed ports and predicate-guarded edges. Swap a profile, get a different agent:
 
 ```mermaid
 graph LR
@@ -53,19 +65,27 @@ graph LR
     L --> S["📦 Session facts<br/>append-only"]
 ```
 
+<br>
+
+---
+
 ## Architecture
 
-Five layers with strict one-way dependencies — a lower layer never depends on an upper one:
+Five layers, strict one-way dependencies — a lower layer never depends on an upper one:
 
 | Layer | Responsibility | Examples |
 |---|---|---|
-| L4 Application / Orchestration | Minimal developer API; the composition root — the only place allowed to reference all lower layers for DI assembly | `Agent`, `Team`, `TeamLead` |
+| L4 Application / Orchestration | Minimal developer API; the composition root | `Agent`, `Team`, `TeamLead` |
 | L3 Agent Abstraction | Agent lifecycle & team orchestration | `BaseAgent`, `Supervisor`, `TeamOrchestrator` |
 | L2 Cognitive Runtime | The core loop | `CognitiveRuntime`, `StrategyRegistry`, Hooks |
 | L1 Cognitive Components | Independently testable cognitive modules | Brain / Body / Memory / EventBus |
 | L0 Infrastructure | LLM adapters, tool protocols, state management | `LLMAdapter`, `ToolProtocol`, `StateStore` |
 
-The runtime kernel lives in `lca_kernel/`; the framework itself in `lca/`. The full rationale is recorded in [ADR-0001](docs/adr/0001-five-layer-separation.md).
+Runtime kernel in `lca_kernel/`, framework in `lca/`. Rationale: [ADR-0001](docs/adr/0001-five-layer-separation.md).
+
+<br>
+
+---
 
 ## Quickstart
 
@@ -79,38 +99,45 @@ pip install -e .   # or: uv sync
 
 ```python
 from lca import Agent, Team  # facade API, resolved lazily
-
-# See docs/ and AGENTS.md for the current API surface and examples —
-# the framework is under active development.
 ```
 
-Run the test suite:
+Run the tests:
 
 ```bash
 pytest tests/ -q
 ```
 
+> [!NOTE]
+> The framework is under active development — `docs/` and `AGENTS.md` describe the current API surface.
+
+<br>
+
+---
+
 ## Documentation
 
-| You are looking for | Where to go |
+| Looking for | Where |
 |---|---|
-| Architecture Decision Records (index) | [docs/adr/README.md](docs/adr/README.md) |
-| Repository contract for coding agents (read first) | [AGENTS.md](AGENTS.md) |
+| Architecture Decision Records | [docs/adr/README.md](docs/adr/README.md) |
+| Repo contract for coding agents (read first) | [AGENTS.md](AGENTS.md) |
 | Documentation map | [docs/specs/documentation-map.md](docs/specs/documentation-map.md) |
 | Engineering guardrails | [docs/agent-contract/coding-guardrails.md](docs/agent-contract/coding-guardrails.md) |
-| Framework source | `lca/` · runtime kernel `lca_kernel/` |
-| Tests | `tests/` |
+| Framework source | `lca/` · kernel `lca_kernel/` · tests `tests/` |
 
-Every significant design choice in this repo has a corresponding ADR under `docs/adr/`. If you're wondering *why* something is built the way it is, start there.
+Every significant design choice has an ADR. If you're wondering *why* something is built the way it is, start there.
 
-## Project status
+<br>
 
-Under active development. APIs may change; ADRs are the source of truth for design intent, and the test suite is the source of truth for behavior.
+---
 
 ## Contributing
 
-Issues and pull requests are welcome. Please read [AGENTS.md](AGENTS.md) first — it documents the layering rules, commit conventions, and quality bars (including: no test watering-down, green tests as the definition of done).
+Issues and pull requests are welcome. Read [AGENTS.md](AGENTS.md) first — layering rules, commit conventions, and quality bars (green tests are the definition of done).
 
-## License
+<br>
 
-MIT — see [LICENSE](LICENSE).
+---
+
+<p align="center">
+  <sub>MIT — see <a href="LICENSE">LICENSE</a></sub>
+</p>
